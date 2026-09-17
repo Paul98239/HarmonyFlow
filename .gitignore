@@ -1,0 +1,10 @@
+.DS_Store
+Thumbs.db
+desktop.ini
+*.log
+# 個人參考用文件，只在本機看，不進 git／不備份
+docs/
+# .vscode 只納入 settings.json／extensions.json（Live Server 的專案設定），其餘個人設定不進 git
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json

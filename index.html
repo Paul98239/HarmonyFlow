@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Harmony Flow</title>
+
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎹</text></svg>">
+
+  <!-- 全域樣式：唯一的樣式來源。 -->
+  <link rel="stylesheet" href="./src/styles.css">
+
+  <!-- ── 開場資源背景預先載入（瀏覽器原生機制，不經任何自訂 JS）──
+       preload 在 HTML 解析階段就把請求發出去；之後 MediaPipe（modelAssetPath）與 SpessaSynth
+       （fetch soundfont）載入同一個 URL 時直接沿用背景下載好的回應，不會重抓。
+       modulepreload 讓本地 module graph 平行下載而不是逐層瀑布。 -->
+  <link rel="preload" as="fetch" href="./src/assets/pose_landmarker_lite.task" crossorigin>
+  <link rel="preload" as="fetch" href="./src/assets/GeneralUserGS.sf3" crossorigin>
+
+  <link rel="modulepreload" href="./src/main.js">
+  <link rel="modulepreload" href="./src/ui.js">
+  <link rel="modulepreload" href="./src/midi/synth.js">
+  <link rel="modulepreload" href="./src/midi/midiPlayer.js">
+  <link rel="modulepreload" href="./src/midi/midiParser.js">
+  <link rel="modulepreload" href="./src/midi/humanPerformer.js">
+  <link rel="modulepreload" href="./src/midi/midiApi.js">
+  <link rel="modulepreload" href="./src/vision/vision.js">
+  <link rel="modulepreload" href="./src/vision/tracking.js">
+  <link rel="modulepreload" href="./src/vision/gesture.js">
+</head>
+<body>
+  <video id="webcam" playsinline></video>
+
+  <!-- 版面骨架（HTML-first：所有靜態 UI 都寫在這裡，JS 只綁行為與填動態清單）：
+       #app-shell 佔滿視窗，flex 置中一個 #camera-frame（視窗裝得下的最大 16:9 方框，見 src/styles.css），
+       攝影機畫面永久蓋著黑幕（#stage-blackout，見 src/styles.css）、進度細線在框內；頂端置中疊
+       一欄 #top-center-stack（position:fixed，不受 #camera-frame 的 overflow:hidden 裁切）：
+       播放 pill（#toolbar-playback）在上，系統控制／選歌控制列（#control-row）在下，兩者垂直
+       分層、水平都置中，結構上就不會互相遮蔽。
+       panel-system 是常駐系統控制 bar，panel-song 是觸發鈕＋彈出面板
+       （面板釘在整排控制列正下方置中，見 src/styles.css 的 .tl-popup）。
+       鎖定 16:9 而非滿版：F11 進出全螢幕時方框只是等比例縮放，裁切一致就穩定。
+       攝影機容器不能用 JS 在執行期搬動（vision.js 在模組頂層就抓 #webcam／#gl-canvas／#overlay-canvas／
+       #stage-hint）。#stage-hint 是舞台中央的提示，absolute 定位、不佔 #stage 的 grid 格。
+       唯一會重複的結構「分譜列」放在 <template id="tpl-part-row">，由 JS clone 後填聲部名。
+       #app-shell 的 inert：開機期間整個 app 惰性（點不到、Tab 不到），src/ui.js 收起載入畫面時解除。
+       控制項的行為經 data-action（click）／data-field（change／input）委派到 #top-center-stack（src/ui.js）。 -->
+  <div id="app-shell" inert>
+    <div id="top-center-stack">
+      <!-- 播放 pill：一顆播放／暫停切換鈕（狀態靠顏色＋圖示）＋歌名（完整顯示、不用省略號截斷）。
+           沒有進度條／seek：指派聲部靠拋物線手勢逐步觸發，沒有一條可以拖曳的時間軸。 -->
+      <div id="toolbar-playback" class="toolbar-playback">
+        <button id="btnPlayPause" class="btn tb-toggle" type="button" data-action="play-pause" disabled aria-label="播放／暫停">
+          <span class="tb-toggle-icon" aria-hidden="true"></span>
+        </button>
+        <div id="midiStatusText" class="player-status-bar">等待選擇歌曲...</div>
+      </div>
+      <div class="control-row" id="control-row">
+        <!-- 系統控制：鏡頭開關／現場人數／重置骨架 ID。人數同時是 MediaPipe 的 numPoses 與追蹤槽位數（1~4），
+             沒有預設值；還沒選之前 vision.js 不推論。 -->
+        <div id="panel-system" class="tl-widget tl-bar">
+          <button id="btn-camera-toggle" class="btn tl-text-btn" type="button" data-action="camera-toggle" aria-label="鏡頭開關">鏡頭</button>
+          <select id="poseCountSelect" class="tl-select" data-field="pose-count" aria-label="現場人數">
+            <option value="" selected disabled>人數</option>
+            <option value="1">1 人</option>
+            <option value="2">2 人</option>
+            <option value="3">3 人</option>
+            <option value="4">4 人</option>
+          </select>
+          <button id="btn-reset-pose" class="btn tl-text-btn" type="button" data-action="reset-pose" title="重置骨架 ID" aria-label="重置骨架 ID">重置</button>
+          <div id="system-note" class="tl-note" hidden></div>
+        </div>
+        <div class="tl-widget">
+          <button id="song-toggle" class="btn tl-trigger" type="button" data-action="toggle-panel" data-panel="song">選歌</button>
+          <!-- 選歌面板：選曲＋分譜。#scorePartSection 預設隱藏，只有選到的 MIDI 被偵測出一個以上聲部時才浮現。
+               .tl-scroll 是面板內真正捲動的那一層；✕ 是外殼的 absolute 子元素，不會跟著內容捲走。 -->
+          <div id="panel-song" class="tl-popup" hidden>
+            <button class="btn tl-close" type="button" data-action="close-panel" aria-label="關閉">✕</button>
+            <div class="tl-scroll">
+              <div class="player-input-group">
+                <div class="file-picker">
+                  <label for="localMidiInput" class="btn file-picker-btn">選擇檔案</label>
+                  <input type="file" id="localMidiInput" accept=".mid,.midi" class="file-picker-input" data-field="local-file">
+                  <span id="localMidiFileName" class="file-picker-name">未選擇檔案</span>
+                </div>
+                <div class="player-row">
+                  <select id="midiCategory" class="player-input" data-field="category"></select>
+                  <input type="text" id="midiSongQuery" class="player-input" data-field="song-query" placeholder="搜尋歌曲" autocomplete="off">
+                </div>
+                <!-- 原生 <select>：展開後的選項清單寬度由瀏覽器自己決定，刻意不做自訂下拉。 -->
+                <select id="midiSongSelect" class="player-input" data-field="song" disabled>
+                  <option value="">請選擇歌曲</option>
+                </select>
+              </div>
+              <div id="scorePartSection" hidden>
+                <div id="scoreInfoText" class="score-info-text"></div>
+                <div id="scorePartList" class="score-part-list"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="camera-frame">
+      <div id="stage">
+        <div id="canvas-container">
+          <canvas id="gl-canvas"></canvas>
+          <canvas id="overlay-canvas"></canvas>
+          <!-- 永久黑幕：攝影機畫面刻意不顯示，鏡頭與追蹤照常在背景運作（見 vision.js），
+               這裡純粹是視覺遮蓋，沒有任何切換方式。 -->
+          <div id="stage-blackout"></div>
+        </div>
+        <div id="stage-hint" role="status" aria-live="polite" hidden></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 分譜清單的一列：聲部名（GM 繁中音色名）＋「指派演奏者」下拉（無／演奏者 1~N，N ＝ 現場人數）。
+       src/midi/midiPlayer.js clone 這個 template，用 textContent 填名字、new Option 填選項。 -->
+  <template id="tpl-part-row">
+    <div class="score-part-row">
+      <span class="score-part-name"></span>
+      <select class="score-part-id player-input" data-field="part-assign" aria-label="指派演奏者"></select>
+    </div>
+  </template>
+
+  <div id="loading-overlay">
+    <div class="spinner"></div>
+    <div id="loading-status">正在初始化⋯</div>
+  </div>
+
+  <div id="error-overlay">
+    <div id="error-message">發生錯誤</div>
+    <div class="detail" id="error-detail"></div>
+  </div>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

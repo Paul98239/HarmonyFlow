@@ -1,0 +1,158 @@
+<!doctype html>
+<!--
+  test-midi-parser.html — 分譜正確性驗證（開發用，不是 app 的一部分）
+
+  比對 src/midi/midiParser.js 從總譜（canon-violin-cello.mid）解析出來的聲部，
+  是否跟 MuseScore 各自匯出的小提琴／大提琴分譜（canon-violin-cello-Violin.mid／
+  -Violoncello.mid）完全一致——用來驗證 (track, channel, program) 分譜邏輯對不對。
+
+  用法：跟 index.html 一樣要用 Live Server（http(s)://，不能 file://），開
+  http://127.0.0.1:5500/test-midi-parser.html。
+
+  要測別的檔案：改下面 REFERENCES 陣列的路徑即可，不用動比對邏輯。
+-->
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MIDI 分譜驗證</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2em auto; padding: 0 1em; background: #0c0c10; color: #fff; }
+  h1 { font-size: 1.3em; }
+  h2 { font-size: 1.05em; margin-top: 2em; border-bottom: 1px solid #5a5a68; padding-bottom: 0.3em; }
+  table { border-collapse: collapse; width: 100%; margin: 0.8em 0; font-size: 0.92em; }
+  th, td { border: 1px solid #5a5a68; padding: 0.4em 0.6em; text-align: left; }
+  th { background: #1a1a20; }
+  .pass { color: #51cf66; font-weight: 700; }
+  .fail { color: #ff6b6b; font-weight: 700; }
+  .warn { color: #ffd43b; }
+  code { background: #1a1a20; padding: 0.1em 0.4em; border-radius: 0.3em; }
+  pre { background: #1a1a20; padding: 0.8em; border-radius: 0.4em; overflow-x: auto; font-size: 0.85em; }
+</style>
+</head>
+<body>
+<h1>MIDI 分譜驗證：總譜解析 vs MuseScore 個別匯出</h1>
+<div id="output">解析中…</div>
+
+<script type="module">
+import { parseMidi } from './src/midi/midiParser.js';
+
+const SCORE_PATH = './src/assets/canon-violin-cello.mid';
+const REFERENCES = [
+  { label: '小提琴', path: './src/assets/canon-violin-cello-Violin.mid' },
+  { label: '大提琴', path: './src/assets/canon-violin-cello-Violoncello.mid' },
+];
+const TIME_TOLERANCE_SEC = 0.01; // 浮點重算的容許誤差，不是真的判斷寬鬆
+
+const out = document.getElementById('output');
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+
+async function loadParsed(path) {
+  const res = await fetch(path);
+  if (!res.ok) throw new Error(`抓不到 ${path}（HTTP ${res.status}）`);
+  const buf = await res.arrayBuffer();
+  return parseMidi(buf);
+}
+
+// 把兩份音符清單當 multiset 比對：pitch／velocity 完全相同，起始時間在容許誤差內即算配對成功。
+function compareNotes(refNotes, candidateNotes) {
+  const pool = candidateNotes.map((n) => ({ n, used: false }));
+  let matched = 0;
+  const misses = [];
+  for (const r of refNotes) {
+    const hit = pool.find((p) => !p.used
+      && p.n.note === r.note
+      && p.n.velocity === r.velocity
+      && Math.abs(p.n.startSeconds - r.startSeconds) <= TIME_TOLERANCE_SEC);
+    if (hit) { hit.used = true; matched++; }
+    else misses.push(r);
+  }
+  const extras = pool.filter((p) => !p.used).map((p) => p.n);
+  return { matched, total: refNotes.length, misses, extras };
+}
+
+function renderPartsTable(parts) {
+  const rows = parts.map((p) => `
+    <tr>
+      <td><code>${esc(p.id)}</code></td>
+      <td>${esc(p.name)}</td>
+      <td>${p.program}</td>
+      <td>${p.noteCount}</td>
+      <td>${p.clef ?? '—'}</td>
+      <td>${p.role ?? '—'}</td>
+    </tr>`).join('');
+  return `<table>
+    <tr><th>id</th><th>名稱</th><th>program</th><th>音符數</th><th>clef</th><th>role</th></tr>
+    ${rows}
+  </table>`;
+}
+
+async function run() {
+  const html = [];
+  let score;
+  try {
+    score = await loadParsed(SCORE_PATH);
+  } catch (err) {
+    out.innerHTML = `<p class="fail">總譜載入失敗：${esc(err.message)}</p>`;
+    return;
+  }
+
+  html.push(`<h2>總譜解析結果（${esc(SCORE_PATH)}）</h2>`);
+  if (score.warnings.length) {
+    html.push(`<p class="warn">⚠️ ${score.warnings.length} 則警告：</p><pre>${esc(score.warnings.join('\n'))}</pre>`);
+  } else {
+    html.push('<p>沒有警告。</p>');
+  }
+  html.push(renderPartsTable(score.parts));
+
+  html.push('<h2>比對結果</h2>');
+  let allPass = true;
+  for (const ref of REFERENCES) {
+    let refParsed;
+    try {
+      refParsed = await loadParsed(ref.path);
+    } catch (err) {
+      allPass = false;
+      html.push(`<p class="fail">✕ ${esc(ref.label)}：參考檔載入失敗（${esc(err.message)}）</p>`);
+      continue;
+    }
+    const refNotes = refParsed.notes;
+
+    // 對總譜裡每個候選聲部都比一次，取配對數最高的當最佳匹配。
+    let best = null;
+    for (const part of score.parts) {
+      const candidateNotes = score.notes.filter((n) => n.partId === part.id);
+      const result = compareNotes(refNotes, candidateNotes);
+      if (!best || result.matched > best.result.matched) best = { part, result, candidateNotes };
+    }
+
+    if (!best) {
+      allPass = false;
+      html.push(`<p class="fail">✕ ${esc(ref.label)}：總譜裡沒有任何聲部</p>`);
+      continue;
+    }
+
+    const { part, result, candidateNotes } = best;
+    const isExact = result.matched === result.total && candidateNotes.length === refNotes.length;
+    if (isExact) {
+      html.push(`<p class="pass">✓ ${esc(ref.label)}：完全對應總譜的 <code>${esc(part.id)}</code>（${esc(part.name)}），${result.total} 個音符全部一致。</p>`);
+    } else {
+      allPass = false;
+      html.push(`<p class="fail">✕ ${esc(ref.label)}：最接近的是 <code>${esc(part.id)}</code>（${esc(part.name)}）——參考檔 ${refNotes.length} 音符、該聲部 ${candidateNotes.length} 音符，配對成功 ${result.matched}／${result.total}。</p>`);
+      if (result.misses.length) {
+        html.push(`<p>參考檔裡沒配對到的前幾個音符：</p><pre>${esc(result.misses.slice(0, 10).map((n) => `pitch=${n.note} vel=${n.velocity} t=${n.startSeconds.toFixed(3)}s`).join('\n'))}</pre>`);
+      }
+      if (result.extras.length) {
+        html.push(`<p>該聲部裡參考檔沒有的前幾個音符：</p><pre>${esc(result.extras.slice(0, 10).map((n) => `pitch=${n.note} vel=${n.velocity} t=${n.startSeconds.toFixed(3)}s`).join('\n'))}</pre>`);
+      }
+    }
+  }
+
+  html.push(`<h2>${allPass ? '<span class="pass">整體結果：全部通過</span>' : '<span class="fail">整體結果：有不一致</span>'}</h2>`);
+  out.innerHTML = html.join('\n');
+}
+
+run().catch((err) => { out.innerHTML = `<p class="fail">執行時發生錯誤：${esc(err.message)}</p><pre>${esc(err.stack || '')}</pre>`; });
+</script>
+</body>
+</html>

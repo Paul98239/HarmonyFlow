@@ -1,0 +1,6 @@
+{
+  // Live Server（ritwickdey.liveserver）：以專案根目錄為 root 從 http://127.0.0.1:5500/ 服務。
+  "liveServer.settings.port": 5500,
+  "liveServer.settings.host": "127.0.0.1",
+  "liveServer.settings.ignoreFiles": [".vscode/**", ".git/**"]
+}
