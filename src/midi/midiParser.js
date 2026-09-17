@@ -8,8 +8,8 @@
 //  典型用法：
 //    const parsed = parseMidi(await file.arrayBuffer());
 //    parsed.parts   // → 這份總譜有哪些聲部（細到 track × channel × program，即「樂器」）
-//    parsed.notes   // → humanPerformer.js 直接拿這份（連同 parts）分組成逐步觸發用的資料，
-//                   //   不需要先用 extractParts 切成 Blob 再解碼一次。
+//    parsed.notes   // → humanPerformer.js 直接拿這份（連同 parts、buildMeasureGrid()）
+//                   //   建立聲部，不需要先用 extractParts 切成 Blob 再解碼一次。
 //    extractParts()／splitByTrack()／splitByPart() 目前只有 test-midi-parser.html（分譜驗證頁）
 //    在用，拿來跟 MuseScore 個別匯出的分譜比對正確性。
 //
@@ -1171,6 +1171,59 @@ export function parseMidi(input) {
     tickToSeconds,
     warnings,
   };
+}
+
+/* ═══════════════════════════════════════════
+   小節格線：多人合奏共用同步用（humanPerformer.js）。不塞進 parseMidi() 的回傳值，
+   避免影響 test-midi-parser.html 的分譜比對基準。
+   ═══════════════════════════════════════════ */
+
+/**
+ * @typedef {{index:number, startTick:number, endTick:number, startSeconds:number,
+ *   endSeconds:number, numerator:number, denominator:number, beatTicks:number}} Measure
+ */
+
+/**
+ * 依拍號（timeSignatures）與 ticksPerQuarter 推算全曲的小節線。拍號中途變更處強制斷一條
+ * 小節線，該段落最後一小節可能因此不是完整長度；樂曲真正結尾的最後一小節不截短，保留完整
+ * 名目長度（讓演奏者仍有整小節的揮手窗口）。SMPTE division 沒有「四分音符」這個概念，
+ * ticksPerQuarter 為 null，回傳空陣列——呼叫端退回沒有格線的路徑。弱起拍（anacrusis）
+ * 目前不處理，格線一律從 tick 0 起算。
+ * @param {ParsedMidi} parsed  parseMidi() 的結果
+ * @returns {Measure[]}
+ */
+export function buildMeasureGrid(parsed) {
+  const tpq = parsed.ticksPerQuarter;
+  if (!tpq) return [];
+  const sigs = parsed.timeSignatures; // 保證至少一筆、且第一筆在 tick 0
+  const pieceEnd = Math.max(parsed.durationTicks, sigs[sigs.length - 1].tick + 1);
+
+  const grid = [];
+  let tick = 0;
+  for (let i = 0; i < sigs.length; i++) {
+    const sig = sigs[i];
+    const isLastSection = i + 1 >= sigs.length;
+    const sectionEnd = isLastSection ? pieceEnd : sigs[i + 1].tick;
+    const measureTicks = Math.round((tpq * 4 * sig.numerator) / sig.denominator);
+    const beatTicks = Math.round((tpq * 4) / sig.denominator);
+
+    while (tick < sectionEnd) {
+      const full = tick + measureTicks;
+      const endTick = isLastSection ? full : Math.min(full, sectionEnd);
+      grid.push({
+        index: grid.length,
+        startTick: tick,
+        endTick,
+        startSeconds: parsed.tickToSeconds(tick),
+        endSeconds: parsed.tickToSeconds(endTick),
+        numerator: sig.numerator,
+        denominator: sig.denominator,
+        beatTicks,
+      });
+      tick = endTick;
+    }
+  }
+  return grid;
 }
 
 /* ═══════════════════════════════════════════

@@ -47,6 +47,11 @@ const POSE_COLORS = ["#00FFFF", "#FF6B6B", "#51CF66", "#FFD43B"]; // 4 人的代
 const BONE_WIDTH = 2;      // 骨架連線寬度（px）
 const JOINT_RADIUS = 2;    // 關節圓點半徑（px）
 const TAU = Math.PI * 2;
+// 嘴巴中點正下方的虛擬「下巴」節點偏移量：以肩寬為單位（跟 ArcDetector 門檻、ID 標籤字級
+// 同一套慣例），人離鏡頭遠近不同時偏移比例才會一致，不用固定 px。
+const CHIN_OFFSET_RATIO = 0.18;
+// 慣用手鎖定：連續這麼久沒有新觸發（毫秒）才放開鎖定，讓使用者能換手。
+const HAND_LOCK_RELEASE_MS = 3000;
 
 const FRAME_ERROR_THRESHOLD = 90; // 連續幾幀處理失敗才判定為持續性錯誤並顯示錯誤畫面（約 1.5~3 秒）
 
@@ -69,10 +74,14 @@ const arcDetectors = Array.from({ length: CONFIG.maxUsers },
 // 合成雙手 ArcDetector 時需要「上一幀各手的 triggerSeq」才能判斷有沒有新觸發（見
 // combineArcTriggers()）；ArcDetector 本身的 triggerSeq 是累加值，不是「這一幀有沒有觸發」的旗標。
 const arcLastSeqBySlot = Array.from({ length: CONFIG.maxUsers },
-  () => ({ left: 0, right: 0, combinedSeq: 0 }));
+  () => ({ left: 0, right: 0, combinedSeq: 0, lockedHand: null, lastTriggerMs: undefined }));
+// 注意：combinedSeq 刻意不在這裡歸零。humanPerformer.js 靠它「有沒有變」判斷有沒有新觸發，
+// 歸零會讓下一次比對誤判成一次新事件、平白多彈一個音（實測發現：走出鏡頭超過 SLOT_RELEASE_MS、
+// 按重置骨架 ID、改現場人數都會呼叫到這裡）。combinedSeq 單調遞增、永不重置。
 const resetSlotDetectors = (arcSlot, lastSeq) => {
   arcSlot.left.reset(); arcSlot.right.reset();
-  lastSeq.left = 0; lastSeq.right = 0; lastSeq.combinedSeq = 0;
+  lastSeq.left = 0; lastSeq.right = 0;
+  lastSeq.lockedHand = null; lastSeq.lastTriggerMs = undefined;
 };
 // 一次歸位所有槽位的手勢偵測器（重置骨架 ID、關閉攝影機、人數改變重建追蹤器時共用）。
 const resetAllSlotDetectors = () => {
@@ -318,29 +327,67 @@ function mergedHandPoint(sm, wristIdx, handIdxs) {
   return { x: sx / n, y: sy / n };
 }
 
-// 把一個在場槽位的骨架餵給它那對 ArcDetector（拋物線手勢 → 換音符觸發）。
+// 兩肩中點當虛擬「脖子」節點——MediaPipe Pose 沒有脖子 landmark。
+function virtualNeckPoint(lm) {
+  const ls = lm[MP_LEFT_SHOULDER], rs = lm[MP_RIGHT_SHOULDER];
+  if (!(ls.visible ?? true) || !(rs.visible ?? true)) return null;
+  return { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
+}
+
+// 嘴巴兩節點中點下方的虛擬「下巴」節點，供骨架畫成倒三角形（見 renderSkeletonOverlay()）。
+function virtualChinPoint(lm, shoulderWidth) {
+  const left = lm[9], right = lm[10];
+  if (!(left.visible ?? true) || !(right.visible ?? true)) return null;
+  return {
+    x: (left.x + right.x) / 2,
+    y: (left.y + right.y) / 2 + CHIN_OFFSET_RATIO * shoulderWidth,
+  };
+}
+
+// 把一個在場槽位的骨架餵給它那對 ArcDetector（拋物線手勢 → 換音符觸發）。回傳的
+// leftVisible／rightVisible 供 combineArcTriggers() 判斷鎖定的手是否該放開。
 function updateSlotArc(arcDet, track, nowMs) {
   const sm = track.smoothed;
   const ls = sm[MP_LEFT_SHOULDER], rs = sm[MP_RIGHT_SHOULDER];
   const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
+  const leftPoint = mergedHandPoint(sm, MP_LEFT_WRIST, MP_LEFT_HAND);
+  const rightPoint = mergedHandPoint(sm, MP_RIGHT_WRIST, MP_RIGHT_HAND);
   return {
-    left: arcDet.left.update({ point: mergedHandPoint(sm, MP_LEFT_WRIST, MP_LEFT_HAND), shoulderWidth }, nowMs),
-    right: arcDet.right.update({ point: mergedHandPoint(sm, MP_RIGHT_WRIST, MP_RIGHT_HAND), shoulderWidth }, nowMs),
+    left: arcDet.left.update({ point: leftPoint, shoulderWidth }, nowMs),
+    right: arcDet.right.update({ point: rightPoint, shoulderWidth }, nowMs),
+    leftVisible: !!leftPoint,
+    rightVisible: !!rightPoint,
   };
 }
 
-// 合成雙手的 ArcDetector 結果：ArcDetector 的 triggerSeq 是單手的累加計數，這裡逐幀跟「上一次
-// 看到的計數」比較，任一手變了就算一次新觸發（先求單手穩定：多半只有一隻手在做手勢，另一手
-// 閒置不影響結果；兩手剛好同一幀都觸發時算兩次，不特別處理）。combinedSeq 是槽位自己的累加
-// 計數，供 midi/humanPerformer.js 判斷「有沒有新事件」。state 就是 arcLastSeqBySlot[slot]，
-// 逐幀被這個函式直接改動（歸位見 resetSlotDetectors）。
-function combineArcTriggers(state, left, right) {
-  if (left.triggerSeq !== state.left) {
-    state.left = left.triggerSeq;
-    state.combinedSeq = (state.combinedSeq || 0) + 1;
+// 合成雙手的 ArcDetector 結果，並套用「自動鎖定慣用手」：哪隻手先做出有效拋物線就鎖定它，
+// 之後只認那隻手的觸發——避免另一隻閒置手被模型猜出來後在畫面上飄移、湊出假拋物線造成誤觸發
+// （實測發現的問題）。鎖定的手連續不可見、或連續 HAND_LOCK_RELEASE_MS 沒有新觸發，才放開讓
+// 使用者換手。combinedSeq 是槽位自己的累加計數，供 midi/humanPerformer.js 判斷「有沒有新事件」。
+// state 就是 arcLastSeqBySlot[slot]，逐幀被這個函式直接改動（歸位見 resetSlotDetectors）。
+function combineArcTriggers(state, arc, nowMs) {
+  const { left, right, leftVisible, rightVisible } = arc;
+
+  if (state.lockedHand === "left" && !leftVisible) state.lockedHand = null;
+  if (state.lockedHand === "right" && !rightVisible) state.lockedHand = null;
+  if (state.lockedHand && nowMs - (state.lastTriggerMs ?? nowMs) > HAND_LOCK_RELEASE_MS) {
+    state.lockedHand = null;
   }
-  if (right.triggerSeq !== state.right) {
-    state.right = right.triggerSeq;
+
+  const leftChanged = left.triggerSeq !== state.left;
+  const rightChanged = right.triggerSeq !== state.right;
+  state.left = left.triggerSeq;
+  state.right = right.triggerSeq;
+
+  if (!state.lockedHand) {
+    if (leftChanged) state.lockedHand = "left";
+    else if (rightChanged) state.lockedHand = "right";
+  }
+
+  const triggered = (state.lockedHand === "left" && leftChanged)
+    || (state.lockedHand === "right" && rightChanged);
+  if (triggered) {
+    state.lastTriggerMs = nowMs;
     state.combinedSeq = (state.combinedSeq || 0) + 1;
   }
   return { triggerSeq: state.combinedSeq || 0 };
@@ -354,22 +401,10 @@ const ARM_CONNECTIONS = [
   { start: MP_LEFT_SHOULDER, end: MP_LEFT_ELBOW },
   { start: MP_RIGHT_SHOULDER, end: MP_RIGHT_ELBOW },
 ];
-// 臉部簡化輪廓：把 Pose 現有 11 個臉部點依五官順序連成一條橫向弧線＋嘴角一條線。
-// 這不是精細臉型（Pose 沒有下顎/臉頰輪廓點，那要另一個 478 點的 Face Landmarker 模型），
-// 只是現有點位能做到的最大化。
-const FACE_BROW_CHAIN = [7, 3, 2, 1, 0, 4, 5, 6, 8]; // 左耳→左眼外/中/內→鼻→右眼內/中/外→右耳
-const FACE_MOUTH_PAIR = [9, 10];
+// 臉部只標關鍵五官：雙眼（2/5）、鼻子（0）各畫一個獨立節點、不連線；嘴巴兩節點（9/10）
+// 加上下方的虛擬下巴節點（virtualChinPoint()）連成一個倒三角形。
+const MOUTH_PAIR = [9, 10];
 const HAND_DOT_RADIUS = JOINT_RADIUS * 2.2; // 手腕＋手掌合併後的大點，比一般關節明顯
-
-// 依序把 indices 連成一條折線加進 path（跳過任一端不可見的區段）。
-function appendChain(path, lm, indices, W, H) {
-  for (let i = 0; i + 1 < indices.length; i++) {
-    const p = lm[indices[i]], q = lm[indices[i + 1]];
-    if (!(p.visible ?? true) || !(q.visible ?? true)) continue;
-    path.moveTo(p.x * W, p.y * H);
-    path.lineTo(q.x * W, q.y * H);
-  }
-}
 
 /* ═══════════════════════════════════════════
    🖊️ 2D 覆蓋層繪製骨架（依鎖定槽位上色，同一人跨幀顏色不變）
@@ -392,10 +427,20 @@ function renderSkeletonOverlay(activeTracks) {
     // 再套遲滯門檻），這裡不自己比門檻，否則邊緣關節會逐幀閃爍。
     // 骨架累積成 Path2D 後一次畫完，不用 DrawingUtils 逐條逐點畫。
     const lm = track.smoothed;
+    const ls = lm[MP_LEFT_SHOULDER], rs = lm[MP_RIGHT_SHOULDER];
+    const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
+
+    // 只畫目前鎖定的那隻手（未鎖定時兩隻都畫，讓使用者看得到還沒決定）：另一隻閒置手在畫面上
+    // 消失，使用者才看得出系統現在認哪隻手（見 combineArcTriggers() 的自動鎖定慣用手邏輯）。
+    const lockedHand = arcLastSeqBySlot[track.slot]?.lockedHand;
+    const showLeftHand = lockedHand !== "right";
+    const showRightHand = lockedHand !== "left";
     // 手腕＋手掌合併點要先算出來：畫肘→手掌那一段連線、跟畫手掌大點都要用同一個座標，
     // 兩處對不齊就會看起來中間有空隙。
-    const leftHand = mergedHandPoint(lm, MP_LEFT_WRIST, MP_LEFT_HAND);
-    const rightHand = mergedHandPoint(lm, MP_RIGHT_WRIST, MP_RIGHT_HAND);
+    const leftHand = showLeftHand ? mergedHandPoint(lm, MP_LEFT_WRIST, MP_LEFT_HAND) : null;
+    const rightHand = showRightHand ? mergedHandPoint(lm, MP_RIGHT_WRIST, MP_RIGHT_HAND) : null;
+    const neck = virtualNeckPoint(lm);
+    const chin = virtualChinPoint(lm, shoulderWidth);
 
     const bones = new Path2D();
     for (const c of ARM_CONNECTIONS) {
@@ -414,26 +459,40 @@ function renderSkeletonOverlay(activeTracks) {
       bones.moveTo(rElbow.x * W, rElbow.y * H);
       bones.lineTo(rightHand.x * W, rightHand.y * H);
     }
-    appendChain(bones, lm, FACE_BROW_CHAIN, W, H);
-    appendChain(bones, lm, FACE_MOUTH_PAIR, W, H);
+    // 兩肩到虛擬脖子節點的連線。
+    if (neck) {
+      bones.moveTo(ls.x * W, ls.y * H); bones.lineTo(neck.x * W, neck.y * H);
+      bones.moveTo(rs.x * W, rs.y * H); bones.lineTo(neck.x * W, neck.y * H);
+    }
+    // 嘴巴兩節點＋虛擬下巴節點連成倒三角形。
+    if (chin) {
+      const mLeft = lm[MOUTH_PAIR[0]], mRight = lm[MOUTH_PAIR[1]];
+      bones.moveTo(mLeft.x * W, mLeft.y * H); bones.lineTo(mRight.x * W, mRight.y * H);
+      bones.moveTo(mRight.x * W, mRight.y * H); bones.lineTo(chin.x * W, chin.y * H);
+      bones.moveTo(chin.x * W, chin.y * H); bones.lineTo(mLeft.x * W, mLeft.y * H);
+    }
     ctx2d.strokeStyle = color;
     ctx2d.lineWidth = BONE_WIDTH;
     ctx2d.stroke(bones);
 
-    // 關節點：肩／肘＋臉部各點正常大小；手腕與手掌（拇指/食指/小指）合併畫成一個較大的點，
-    // 跟 updateSlotArc() 的 mergedHandPoint() 用同一套合併邏輯，畫面跟手勢追蹤的點位一致。
+    // 關節點：肩／肘／脖子／下巴正常大小；雙眼與鼻子各畫一個獨立節點、不連線；手腕與手掌
+    // （拇指/食指/小指）合併畫成一個較大的點，跟 updateSlotArc() 的 mergedHandPoint() 用
+    // 同一套合併邏輯，畫面跟手勢追蹤的點位一致。
     const joints = new Path2D();
     const addJoint = (x, y, radius) => {
       // arc 從角度 0（圓的右端）起筆，先 moveTo 過去，否則會從上一個圓拉一條線過來
       joints.moveTo(x + radius, y);
       joints.arc(x, y, radius, 0, TAU);
     };
+    // 0=鼻子、2=左眼中心、5=右眼中心、9/10=嘴角（見 MOUTH_PAIR）。
     for (const i of [MP_LEFT_SHOULDER, MP_RIGHT_SHOULDER, MP_LEFT_ELBOW, MP_RIGHT_ELBOW,
-                      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]) {
+                      0, 2, 5, MOUTH_PAIR[0], MOUTH_PAIR[1]]) {
       const p = lm[i];
       if (!(p.visible ?? true)) continue;
       addJoint(p.x * W, p.y * H, JOINT_RADIUS);
     }
+    if (neck) addJoint(neck.x * W, neck.y * H, JOINT_RADIUS);
+    if (chin) addJoint(chin.x * W, chin.y * H, JOINT_RADIUS);
     if (leftHand) addJoint(leftHand.x * W, leftHand.y * H, HAND_DOT_RADIUS);
     if (rightHand) addJoint(rightHand.x * W, rightHand.y * H, HAND_DOT_RADIUS);
     ctx2d.fillStyle = color;
@@ -542,15 +601,17 @@ function processFrame() {
         if (slotInactiveSinceMs[slot] === 0) slotInactiveSinceMs[slot] = nowMs;
         if (nowMs - slotInactiveSinceMs[slot] > SLOT_RELEASE_MS) {
           resetSlotDetectors(arcDet, arcLastSeqBySlot[slot]);
-          arc = { left: { triggerSeq: 0 }, right: { triggerSeq: 0 } };
+          arc = { left: { triggerSeq: 0 }, right: { triggerSeq: 0 }, leftVisible: false, rightVisible: false };
         } else {
           arc = {
             left: arcDet.left.update({ point: null }, nowMs),
             right: arcDet.right.update({ point: null }, nowMs),
+            leftVisible: false,
+            rightVisible: false,
           };
         }
       }
-      const combinedArc = combineArcTriggers(arcLastSeqBySlot[slot], arc.left, arc.right);
+      const combinedArc = combineArcTriggers(arcLastSeqBySlot[slot], arc, nowMs);
       arcTriggerSeqBySlot[slot + 1] = combinedArc.triggerSeq;
     }
     emitGesturePerformanceState({ arcTriggerSeqBySlot, presentSlots }, nowMs);

@@ -16,8 +16,9 @@
 //  selectionSignature，下一次按頂端播放鍵時 playCurrentSource() 才用新的指派重新載入。
 //  指派是持久設定，不隨追蹤雜訊變動：下拉列「無／演奏者 1~N」，N ＝ 系統控制 bar 選的「現場人數」
 //  （playerCount，還沒選是 0 → 只有「無」），不因當下偵測到幾人而增減。
-//  指派聲部的實際演奏＝逐步觸發（見 humanPerformer.js）：每做一次有效拋物線手勢就前進一步，
-//  沒有時間快慢限制、沒有代打——沒人觸發，這個聲部就停在原地，不會自己往下走。
+//  指派聲部的實際演奏＝共用小節格線同步（見 humanPerformer.js）：全體聲部共用同一個由全體
+//  演奏者揮手節奏估出的拍速連續前進，不等任何人；每個小節開始預設由電腦代打，指派演奏者在
+//  這個小節內做一次有效拋物線手勢就接手該聲部剩餘部分，整小節沒揮手就整小節由電腦代打補完。
 // ============================================================
 
 import { Store, rafThrottle } from '../ui.js';
@@ -42,7 +43,7 @@ function formatTime(sec) {
 const PLAYER_COUNT = 4;      // 可指派的演奏者 ID 數上限（對齊 vision.js 的 CONFIG.maxUsers）；
                              // 實際列幾個由系統控制 bar 的「現場人數」決定（見 setPlayerCount）
 
-// 真人聲部的排程 tick 週期（humanPerformer.js 逐步觸發排程器的驅動頻率）。
+// 真人聲部的排程 tick 週期（humanPerformer.js 共用位置推進與發聲判斷的驅動頻率）。
 const SCHEDULER_TICK_MS = 12;
 // 播完偵測／humanGate 補算的 UI tick 週期。
 const UI_TICK_MS = 200;
@@ -228,7 +229,7 @@ function clearSource() {
    播放（本地／雲端共用同一套邏輯）
    ═══════════════════════════════════════════ */
 // 「目前引擎裡在播的到底是什麼」的簽章：來源身分 + 分譜／指派狀態。兩者都相同才能直接續播，
-// 任一項不同都要重新交給 humanPerformer.load() 重建逐步觸發用的資料。
+// 任一項不同都要重新交給 humanPerformer.load() 重建聲部與小節格線。
 const buildPlaybackSignature = (source) =>
   `${sourceIdentity(source)}::${selectionSignature(playerStore.state.score, playerStore.state.assignments)}`;
 
@@ -254,7 +255,9 @@ async function playCurrentSource() {
   isSongLoading = true;
   const loadingIndicatorTimer = setTimeout(() => playerStore.set({ transport: 'loading' }), LOADING_INDICATOR_DELAY_MS);
   try {
-    await synth.load(s.score, assignedPartIds());
+    // 傳快照（[partId, slot][]），不要傳活的 Map——humanPerformer.js 的 buildVoices() 需要
+    // partId → 演奏者槽位的對應才能把拍速樣本歸到對的人（見 createTempoEstimator()）。
+    await synth.load(s.score, [...s.assignments]);
     if (synth.humanPerformer.unplacedPartIds.length) {
       console.warn('⚠️ 分譜聲部超過合成器可用的輸出 channel，以下聲部這一輪不會出聲：',
         synth.humanPerformer.unplacedPartIds.join('、'));
@@ -333,7 +336,7 @@ function uiTick() {
 }
 
 // 真人聲部的排程 tick：把每個指派聲部目前的手勢狀態（在場／觸發計數）交給
-// humanPerformer.tick()，由它決定要不要前進一步、順便反應式排程伴奏（見 humanPerformer.js）。
+// humanPerformer.tick()，由它推進共用位置、判斷這一小節該由誰接手（見 humanPerformer.js）。
 function schedulerTick() {
   if (synth.isLoaded() && !synth.isPaused()) synth.humanPerformer.tick(performance.now(), gestureFor);
 }

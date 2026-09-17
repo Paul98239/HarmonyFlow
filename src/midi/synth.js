@@ -2,12 +2,12 @@
 //  synth.js — spessasynth 合成器：兩個合成器（伴奏 synth／真人聲部 synthHuman）、humanGain 閘門。
 //  純引擎：不知道「分譜」「指派」是什麼，也不碰 DOM。
 //
-//  沒有 Sequencer、沒有連續播放的時鐘：兩個合成器都只接收 humanPerformer.js（逐步觸發排程器）
-//  送來的個別 noteOn／noteOff／初始 program 設定，見 humanPerformer.js 檔頭說明。
+//  沒有 Sequencer：兩個合成器都只接收 humanPerformer.js（共用小節格線同步排程器）送來的個別
+//  noteOn／noteOff／初始 program 設定，見 humanPerformer.js 檔頭說明。
 //
-//  兩軌（bus）模型：指派出去的聲部走 synthHuman（每顆音的 velocity 一律用樂譜原值，
-//  humanPerformer.js 排程觸發時機），沒指派的電腦伴奏走 synth（反應式排程，同樣由
-//  humanPerformer.js 驅動）。伴奏那一軌固定不動，是「我的聲部」音量的比較基準。
+//  兩軌（bus）模型：被指派聲部這一刻由誰接手（電腦代打或真人）決定新音走 synth 還是
+//  synthHuman，velocity 一律用樂譜原值；沒被指派的聲部固定走 synth。伴奏那一軌固定不動，
+//  是「我的聲部」音量的比較基準。
 // ============================================================
 
 import { HumanPerformer } from './humanPerformer.js';
@@ -51,8 +51,8 @@ let isSongLoaded = false;
 let isProcessingPlay = false;
 let lastGateTarget = -1;
 
-// 逐步觸發排程器（humanPerformer.js）：同時驅動 synth（伴奏，反應式排程）與 synthHuman
-// （指派聲部，觸發＝前進一步），由播放器的 12ms 排程 tick 呼叫 tick()。
+// 共用小節格線同步排程器（humanPerformer.js）：驅動 synth（伴奏／代打）與 synthHuman
+// （指派聲部接手後的部分），由播放器的 12ms 排程 tick 呼叫 tick()。
 export const humanPerformer = new HumanPerformer();
 
 /* ═══════════════════════════════════════════
@@ -165,15 +165,15 @@ export function flushPreviousSong() {
   }
 }
 
-// 載入這首歌：確保引擎就緒、清掉上一首的殘留，再把樂譜交給排程器分組（不會發出聲音，
-// 播放要另外呼叫 play()）。
-export async function load(score, assignedPartIds) {
+// 載入這首歌：確保引擎就緒、清掉上一首的殘留，再把樂譜交給排程器建立聲部（不會發出聲音，
+// 播放要另外呼叫 play()）。assignments 是 [partId, 演奏者槽位][] 快照。
+export async function load(score, assignments) {
   if (!isReady) {
     const ok = await initEngine();
     if (!ok) throw new Error('音源庫載入失敗');
   }
   flushPreviousSong();
-  humanPerformer.load(score, assignedPartIds);
+  humanPerformer.load(score, assignments);
   isSongLoaded = true;
 }
 
@@ -186,7 +186,7 @@ export async function play() {
   } finally { isProcessingPlay = false; }
 }
 export function pause() {
-  humanPerformer.pause(); // 收掉真人聲部還在響的音、清掉還沒到期的伴奏排程
+  humanPerformer.pause(); // 收掉所有正在響的音；共用位置與拍速都保留，下次播放從原處繼續
 }
 export function isLoaded() { return isSongLoaded; }
 export function isPaused() { return !isSongLoaded || !humanPerformer.isPlaying(); }

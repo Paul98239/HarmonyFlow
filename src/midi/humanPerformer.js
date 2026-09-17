@@ -1,30 +1,40 @@
 // ============================================================
-//  humanPerformer.js — 逐步觸發排程器（純邏輯，無 DOM／CDN）
+//  humanPerformer.js — 逐小節同步排程器（純邏輯，無 DOM／CDN）
 //
-//  沒有連續播放的時鐘，只有離散的「前進一步」。
+//  合奏總譜靠共用小節格線同步（見 midiParser.js 的 buildMeasureGrid()）：所有聲部（含被指派
+//  出去的）共用同一個樂曲位置 _posSec，位置照全體演奏者揮手節奏估出的共用拍速（相對樂譜原速
+//  的倍率 rate，見 createTempoEstimator()）連續前進，不等任何人、也不看誰觸發——這樣才會像
+//  真實樂團一樣「所有人在同一個拍點上」，不會有各聲部各自推進、漂移成不同進度的問題（這是從
+//  同事的單人鋼琴專案 smartplay.js 移植過來的舊模型套到合奏總譜會出現的毛病：各聲部音符密度
+//  不同，「一手勢＝一步」在聲部之間節奏語意不對等）。_posSec 直接比對音符的 startSeconds／
+//  endSeconds（parseMidi() 已依 tempoMap 換算好），不需要在這裡重算 tick↔秒的對應。
 //
-//  指派聲部：依起始 tick 把音符分組成一步一步（同 tick 的多顆音＝和弦，一起算一步）。你每
-//  做一次有效拋物線（vision.js 的 ArcDetector，triggerSeq 變動）就前進一步：關掉「原本該在
-//  這一步結束」的音、開新的一步（樂譜原始 velocity），沒有任何快慢限制——你多快觸發，音符
-//  就多快出來；一顆音會持續響到你觸發下一步、且原譜判定它該結束為止，不會被意外切斷。第一
-//  次觸發如果第一步之前還有伴奏（前奏），只播前奏、不算前進一步。
+//  每個小節開始時，所有聲部預設由伴奏合成器（電腦）播出，且被指派聲部的那條「代打」channel
+//  刻意調低音量（CC7）。演奏者若在這個小節內做一次有效拋物線手勢，這個聲部就從共用位置正確
+//  的地方「接手」——之後這個小節剩餘的音改由真人合成器（全音量）播出，同時餵一筆時間樣本給
+//  拍速估計器；整個小節都沒揮手，這個聲部就整小節由電腦代打補完（局部代打）。接手只換「之後
+//  新 noteOn 的音」要走哪顆合成器，正在響的音留在原本那顆合成器上自然結束，不重疊發聲、不
+//  提前切斷。
 //
-//  伴奏（未指派的聲部）：沒有 Sequencer，改成反應式排程——每次任一位演奏者前進一步，就把
-//  「這一步到（這位演奏者）下一步之間」原本該出現的伴奏音符，依原始時間差排入佇列，用
-//  performance.now() 為準即時觸發 note-on／note-off。伴奏的進度完全綁在「目前所有演奏者中
-//  推進最遠的那一位」，不會自己跑到前面。沒有任何聲部被指派時，整份當「伴奏」處理，改成
-//  照真實經過時間連續自動播放（等同以前的整份播放）。
-//
-//  不重播 CC／pitch-bend：每個聲部的音色（bank/program）只在 load() 時套用一次，之後不跟著
-//  播放過程逐一重放原始事件（刻意的簡化）。
+//  沒有前奏特例、沒有 lookahead 佇列：所有聲部的音符都是共用位置推進到 startSeconds 才
+//  noteOn、推進到 endSeconds 才 noteOff，每個 tick 只處理「已經到期」的部分。velocity 一律
+//  用樂譜原值，不套用手勢公式；不重播 CC／pitch-bend，音色只在 load() 時套用一次。
 // ============================================================
 
+import { buildMeasureGrid } from './midiParser.js';
+
 export const DEFAULT_PERFORMER_CONFIG = Object.freeze({
-  drumChannel: 9,        // MIDI 規格：第 10 個 channel（索引 9）是打擊
-  autoLookaheadSec: 3,   // 沒有人指派任何聲部時，整份自動播放每次預先排程的範圍（秒）
+  drumChannel: 9,              // MIDI 規格：第 10 個 channel（索引 9）是打擊
+  takeoverLookaheadMs: 180,    // 揮手時距小節結束不到這個時間，視為在搶下一小節（避免準時揮卻沒聲音）
+  standInVolumeCc: 64,         // 被指派聲部「電腦代打」那條 channel 的音量（CC7，GM 預設 100，
+                                // 約 −6dB）；一接手就跳到真人軌全音量，對比聽得出來，不動 velocity
 });
 
 const CHANNELS_PER_PORT = 16;
+
+/* ═══════════════════════════════════════════
+   輸出 channel 分配（沿用舊版邏輯，不變）
+   ═══════════════════════════════════════════ */
 
 // 這個合成器上可用的旋律輸出 channel＝跳過每個 port 的打擊槽（ch % 16 === drumChannel）。
 function melodicChannelsFor(synth, drumChannel) {
@@ -53,34 +63,162 @@ function allocateChannels(parts, melodicChannels, drumChannel) {
   return { byPartId, unplaced };
 }
 
-// 把已依 startTick 排序的音符分組成一步一步：同 tick 的多顆音（和弦）算一步。
-function groupIntoSteps(notes) {
-  const steps = [];
-  let current = null;
-  for (const n of notes) {
-    if (!current || current.startTick !== n.startTick) {
-      current = { startTick: n.startTick, notes: [] };
-      steps.push(current);
-    }
-    current.notes.push(n);
+/* ═══════════════════════════════════════════
+   聲部（voice）建構
+   ═══════════════════════════════════════════ */
+
+// 聲部→輸出 channel：伴奏合成器（accompSynth）現在要幫「全部」聲部各配一個 channel——包含
+// 被指派聲部的代打 channel（見檔頭說明）；真人合成器（humanSynth）只需要幫被指派的聲部配
+// channel。兩個池子各自獨立配額用完的聲部回報在 unplaced，這一輪不會出聲。
+function buildVoices(score, assignments, accompSynth, humanSynth, cfg) {
+  const voices = new Map(); // partId → voice
+  const unplaced = [];
+
+  const notesByPart = new Map(); // score.notes 已依 startTick 排序，照順序分組即可
+  for (const note of score.notes) {
+    let list = notesByPart.get(note.partId);
+    if (!list) notesByPart.set(note.partId, (list = []));
+    list.push(note);
   }
-  return steps;
+
+  const { byPartId: autoChannelOf, unplaced: autoUnplaced } =
+    allocateChannels(score.parts, melodicChannelsFor(accompSynth, cfg.drumChannel), cfg.drumChannel);
+  unplaced.push(...autoUnplaced);
+
+  const assignedParts = score.parts.filter((p) => assignments.has(p.id));
+  const { byPartId: humanChannelOf, unplaced: humanUnplaced } =
+    allocateChannels(assignedParts, melodicChannelsFor(humanSynth, cfg.drumChannel), cfg.drumChannel);
+  unplaced.push(...humanUnplaced);
+
+  for (const p of score.parts) {
+    const autoChannel = autoChannelOf.get(p.id);
+    if (autoChannel === undefined) continue; // 伴奏 channel 都用完了，這一輪整個聲部不出聲
+    const humanChannel = humanChannelOf.get(p.id) ?? null;
+    voices.set(p.id, {
+      partId: p.id,
+      slot: assignments.get(p.id) ?? null,
+      notes: notesByPart.get(p.id) || [],
+      autoChannel,
+      humanChannel,
+      assigned: humanChannel !== null,
+      cursor: 0,                // 下一個「還沒排程」的音符在 notes 裡的位置
+      sounding: new Map(),      // note(音高) → { endSeconds, viaHuman }
+      owner: 'auto',            // 'auto' | 'human'：這一刻新 noteOn 要走哪顆合成器
+      ownedMeasure: -1,         // owner 是針對哪個小節判定的
+      claimMeasure: -1,         // 在小節尾聲揮手時，預約下一小節的擁有權
+      lastSeq: null,            // 上次觀察到的手勢 triggerSeq，null＝還沒對過基準
+    });
+  }
+  return { voices, unplaced };
 }
 
+/* ═══════════════════════════════════════════
+   共用拍速估計：由全體演奏者的手勢節奏估一個相對樂譜原速的倍率
+   ═══════════════════════════════════════════ */
+const TEMPO_CFG = Object.freeze({
+  minGapMs: 250,          // 兩次觸發間隔小於這個值當雜訊（同一次拋物線被算兩次之類）丟棄
+  maxGapMs: 6000,         // 大於這個值代表這個人停手太久，丟棄、只更新基準時刻
+  minRate: 0.5, maxRate: 2,          // 單次觀察值的合理範圍，超出視為誤判丟棄
+  rateFloor: 0.6, rateCeil: 1.8,     // 平滑後最終拍速的範圍
+  smoothing: 0.25,        // 每個有效樣本讓 rate 往目標值追近的比例
+  maxStepRatio: 0.12,     // 單次樣本最多能改變 rate 多少（相對目前值），避免抽搐
+  samplesPerSlot: 5,      // 每個演奏者最多留幾筆最近樣本
+  idleMs: 8000,           // 全員這麼久沒有有效樣本，開始滑回原速
+  idleTauMs: 4000,        // 滑回原速的時間常數
+});
+
+function median(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const mid = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+/**
+ * 建立共用拍速估計器。只估「相對樂譜原速的倍率」，不修正相位（落拍不外顯：音符一律對齊共用
+ * 拍速，不會因為誰觸發晚了就把音符往後推）。每個演奏者各自等權：中位數的中位數（先在每個
+ * 演奏者內取中位數、再跨演奏者取中位數），一個人狂揮也灌不爆全體。
+ */
+export function createTempoEstimator(cfg = TEMPO_CFG) {
+  const lastGestureMsBySlot = new Map(); // slot → 上次有效觸發的時刻
+  const samplesBySlot = new Map();       // slot → rateObs[]（最近幾筆，最新在陣列尾端）
+  let rate = 1;
+  let lastValidSampleMs = null;
+  let lastIdleMs = null;
+
+  function recomputeRate() {
+    const perSlotMedians = [];
+    for (const samples of samplesBySlot.values()) {
+      if (samples.length) perSlotMedians.push(median(samples));
+    }
+    if (!perSlotMedians.length) return;
+    const target = median(perSlotMedians);
+    const maxStep = Math.abs(rate) * cfg.maxStepRatio;
+    const delta = Math.max(-maxStep, Math.min(maxStep, (target - rate) * cfg.smoothing));
+    rate = Math.max(cfg.rateFloor, Math.min(cfg.rateCeil, rate + delta));
+  }
+
+  // 收到一次有效觸發：slot 是演奏者槽位，nominalMeasureMs 是他觸發當下所在小節、以樂譜原速
+  // 算的名目長度（不乘 rate，避免正回饋——越快越准許更快，會愈滾愈快）。
+  function onGesture(slot, nowMs, nominalMeasureMs) {
+    const lastMs = lastGestureMsBySlot.get(slot);
+    lastGestureMsBySlot.set(slot, nowMs);
+    if (lastMs == null) return; // 這個人第一次揮手，還沒有間隔可以估拍速
+
+    const gapMs = nowMs - lastMs;
+    if (gapMs < cfg.minGapMs || gapMs > cfg.maxGapMs) return;
+    const rateObs = nominalMeasureMs / gapMs;
+    if (rateObs < cfg.minRate || rateObs > cfg.maxRate) return;
+
+    let samples = samplesBySlot.get(slot);
+    if (!samples) samplesBySlot.set(slot, samples = []);
+    samples.push(rateObs);
+    if (samples.length > cfg.samplesPerSlot) samples.shift();
+    lastValidSampleMs = nowMs;
+    recomputeRate();
+  }
+
+  // 由 tick() 每次呼叫：全員 idleMs 沒有有效樣本就清空樣本、以 τ≈idleTauMs 指數滑回原速。
+  function idle(nowMs) {
+    if (lastValidSampleMs != null && nowMs - lastValidSampleMs > cfg.idleMs) {
+      samplesBySlot.clear();
+      lastGestureMsBySlot.clear();
+      lastValidSampleMs = null;
+    }
+    if (samplesBySlot.size === 0 && rate !== 1) {
+      const dtMs = lastIdleMs == null ? 0 : nowMs - lastIdleMs;
+      if (dtMs > 0) rate += (1 - rate) * (1 - Math.exp(-dtMs / cfg.idleTauMs));
+    }
+    lastIdleMs = nowMs;
+  }
+
+  function reset() {
+    lastGestureMsBySlot.clear();
+    samplesBySlot.clear();
+    rate = 1;
+    lastValidSampleMs = null;
+    lastIdleMs = null;
+  }
+
+  return { get rate() { return rate; }, onGesture, idle, reset };
+}
+
+/* ═══════════════════════════════════════════
+   HumanPerformer
+   ═══════════════════════════════════════════ */
 export class HumanPerformer {
   constructor(config = {}) {
     this.cfg = { ...DEFAULT_PERFORMER_CONFIG, ...config };
-    this.accompSynth = null;   // 伴奏合成器（未指派的聲部）
-    this.humanSynth = null;    // 真人聲部合成器（指派的聲部）
-    this._controlled = [];     // 每個指派聲部一筆，見 load()
-    this._accompaniment = [];  // 扁平陣列：{ note, outChannel }，依 startSeconds 排序
-    this._accompCursor = 0;    // 下一個「還沒排程」的伴奏音符在陣列中的位置
-    this._accompChannels = []; // 伴奏用到的輸出 channel，all-notes-off 時要逐一清
-    this._pending = [];        // 已排程、還沒到期的伴奏事件 { dueMs, fn }
-    this.unplacedPartIds = []; // 輸出 channel 不夠用而排不進去的聲部（這一輪不會出聲）
+    this.accompSynth = null;   // 伴奏合成器（電腦播的部分：未指派聲部＋被指派聲部的代打 channel）
+    this.humanSynth = null;    // 真人聲部合成器（被指派聲部接手後的部分）
+    this._score = null;
+    this._grid = [];           // buildMeasureGrid() 的結果；空陣列＝無法算小節（SMPTE division）
+    this._measureCursor = 0;   // 上次算出的小節 index，只前進不回頭（位置只會前進或歸零）
+    this._voices = new Map();  // partId → voice
+    this._tempo = createTempoEstimator();
+    this.unplacedPartIds = [];
     this._playing = false;
-    this._playStartMs = null;  // 沒有指派任何聲部時，整份自動播放的起始時刻
-    this._autoPlayedSec = 0;   // 同上，已經排程到的位置
+    this._posSec = 0;          // 全體共用的樂曲位置
+    this._lastTickMs = null;   // null＝下一次 tick() 不推進位置，只記錄基準（剛 play() 或剛 tick 過一次）
   }
 
   setSynths(accompSynth, humanSynth) {
@@ -89,70 +227,36 @@ export class HumanPerformer {
   }
 
   /**
-   * 載入這首歌：指派聲部分組成步驟，未指派聲部攤平成伴奏清單。
+   * 載入這首歌：建立聲部、套初始音色，準備好共用小節格線。
    * @param {import('./midiParser.js').ParsedMidi} score  parseMidi() 的結果（不會被修改）
-   * @param {string[]} assignedPartIds  要交給真人的聲部 id
+   * @param {Map<string,number>|[string,number][]} assignments  partId → 演奏者槽位
    */
-  load(score, assignedPartIds) {
+  load(score, assignments) {
     this.stop();
-    this._controlled = [];
-    this._accompaniment = [];
-    this._accompCursor = 0;
-    this._accompChannels = [];
-    this._pending = [];
+    this._score = score || null;
+    this._grid = score ? buildMeasureGrid(score) : [];
+    this._measureCursor = 0;
+    this._voices = new Map();
     this.unplacedPartIds = [];
-    this._playStartMs = null;
-    this._autoPlayedSec = 0;
+    this._posSec = 0;
     if (!score) return;
 
-    const assigned = Array.isArray(assignedPartIds) ? assignedPartIds : [];
-    const assignedSet = new Set(assigned);
+    const assignMap = assignments instanceof Map ? assignments : new Map(assignments || []);
     const partById = new Map(score.parts.map((p) => [p.id, p]));
 
-    const notesByPart = new Map(); // score.notes 已依 startTick 排序，照順序分組即可
-    for (const note of score.notes) {
-      let list = notesByPart.get(note.partId);
-      if (!list) notesByPart.set(note.partId, (list = []));
-      list.push(note);
+    const { voices, unplaced } = buildVoices(score, assignMap, this.accompSynth, this.humanSynth, this.cfg);
+    this._voices = voices;
+    this.unplacedPartIds = unplaced;
+
+    for (const voice of this._voices.values()) {
+      const part = partById.get(voice.partId);
+      this._applyInitialPatch(this.accompSynth, voice.autoChannel, part);
+      // 代打 channel 的音量在這裡就要明講成 standInVolumeCc／GM 預設 100 兩者之一：channel
+      // 是跨曲重複使用的，CC7 不在「reset all controllers」的清單裡，上一首歌留下的值會沿用
+      // 下去，不能只在「是代打」的情況下才送。
+      try { this.accompSynth?.controllerChange(voice.autoChannel, 7, voice.assigned ? this.cfg.standInVolumeCc : 100); } catch (err) {}
+      if (voice.assigned) this._applyInitialPatch(this.humanSynth, voice.humanChannel, part);
     }
-
-    // ── 指派聲部：分組成步驟 ──
-    const humanParts = assigned.map((id) => partById.get(id)).filter(Boolean);
-    const { byPartId: humanChannelOf, unplaced: humanUnplaced } =
-      allocateChannels(humanParts, melodicChannelsFor(this.humanSynth, this.cfg.drumChannel), this.cfg.drumChannel);
-    this.unplacedPartIds.push(...humanUnplaced);
-
-    for (const p of humanParts) {
-      const outChannel = humanChannelOf.get(p.id);
-      if (outChannel === undefined) continue;
-      this._applyInitialPatch(this.humanSynth, outChannel, p);
-      const steps = groupIntoSteps(notesByPart.get(p.id) || []);
-      this._controlled.push({
-        partId: p.id,
-        outChannel,
-        steps,
-        cursorIndex: 0,
-        sounding: new Map(), // note → endTick
-        lastTriggerSeq: null,
-        didLeadIn: false,
-      });
-    }
-
-    // ── 未指派聲部：攤平成伴奏清單 ──
-    const accompParts = score.parts.filter((p) => !assignedSet.has(p.id));
-    const { byPartId: accompChannelOf, unplaced: accompUnplaced } =
-      allocateChannels(accompParts, melodicChannelsFor(this.accompSynth, this.cfg.drumChannel), this.cfg.drumChannel);
-    this.unplacedPartIds.push(...accompUnplaced);
-
-    for (const p of accompParts) {
-      const outChannel = accompChannelOf.get(p.id);
-      if (outChannel === undefined) continue;
-      this._applyInitialPatch(this.accompSynth, outChannel, p);
-      this._accompChannels.push(outChannel);
-    }
-    this._accompaniment = score.notes
-      .filter((n) => accompChannelOf.has(n.partId))
-      .map((n) => ({ note: n, outChannel: accompChannelOf.get(n.partId) }));
   }
 
   _applyInitialPatch(synth, channel, part) {
@@ -166,53 +270,57 @@ export class HumanPerformer {
 
   play() {
     this._playing = true;
-    if (!this._controlled.length) {
-      // 沒有人指派任何聲部：整份當伴奏，照真實經過時間連續播放；用 _autoPlayedSec 記住
-      // 已經排到哪，暫停再繼續時起始時刻要往回推，不會平白多算一段暫停期間的時間。
-      this._playStartMs = performance.now() - this._autoPlayedSec * 1000;
-    }
+    this._lastTickMs = null; // 避免暫停期間累積的時間被當成一次巨大的 dt，把位置瞬間推老遠
   }
 
-  // 暫停：清掉還沒到期的伴奏排程（避免暫停期間累積、恢復時一次爆音）、收掉還在響的音。
+  // 暫停：收掉還在響的音，位置與拍速都保留（下次播放從原位置、原拍速繼續）。
   pause() {
     this._playing = false;
-    this._pending = [];
+    this._lastTickMs = null;
     this.silence();
   }
 
+  // 收掉所有正在響的音。兩條路徑（真人／伴奏）都補一次 CC123 All Notes Off 當保險，避免
+  // sounding 這份記錄跟實際發聲不同步時留下關不掉的長音。
   silence() {
-    for (const part of this._controlled) {
-      for (const note of part.sounding.keys()) {
-        try { this.humanSynth?.noteOff(part.outChannel, note); } catch (err) {}
+    for (const voice of this._voices.values()) {
+      for (const [note, info] of voice.sounding) {
+        const synth = info.viaHuman ? this.humanSynth : this.accompSynth;
+        const channel = info.viaHuman ? voice.humanChannel : voice.autoChannel;
+        try { synth?.noteOff(channel, note); } catch (err) {}
       }
-      part.sounding.clear();
-    }
-    if (this.accompSynth) {
-      for (const ch of this._accompChannels) {
-        try { this.accompSynth.controllerChange(ch, 123, 0); } catch (err) {} // CC123 All Notes Off
+      voice.sounding.clear();
+      try { this.accompSynth?.controllerChange(voice.autoChannel, 123, 0); } catch (err) {}
+      if (voice.humanChannel !== null) {
+        try { this.humanSynth?.controllerChange(voice.humanChannel, 123, 0); } catch (err) {}
       }
     }
   }
 
-  // 停止／換歌前的清場：收音＋游標歸零。
+  // 停止／換歌前的清場：收音＋位置與每個聲部的擁有權狀態全部歸零。
   stop() {
     this.pause();
-    for (const part of this._controlled) {
-      part.cursorIndex = 0;
-      part.lastTriggerSeq = null;
-      part.didLeadIn = false;
-      part.sounding.clear();
+    this._posSec = 0;
+    this._measureCursor = 0;
+    this._tempo.reset();
+    for (const voice of this._voices.values()) {
+      voice.cursor = 0;
+      voice.owner = 'auto';
+      voice.ownedMeasure = -1;
+      voice.claimMeasure = -1;
+      voice.lastSeq = null;
     }
-    this._accompCursor = 0;
-    this._playStartMs = null;
-    this._autoPlayedSec = 0;
   }
 
   isPlaying() { return this._playing; }
 
   isFinished() {
-    const controlledDone = this._controlled.every((p) => p.cursorIndex >= p.steps.length);
-    return controlledDone && this._accompCursor >= this._accompaniment.length;
+    if (!this._score) return false;
+    if (this._posSec < this._score.durationSeconds) return false;
+    for (const voice of this._voices.values()) {
+      if (voice.sounding.size > 0) return false;
+    }
+    return true;
   }
 
   /**
@@ -223,101 +331,98 @@ export class HumanPerformer {
    */
   tick(nowMs, getGestureFor) {
     if (!this._playing) return;
+    const dtMs = this._lastTickMs == null ? 0 : nowMs - this._lastTickMs;
+    this._lastTickMs = nowMs;
 
-    while (this._pending.length && this._pending[0].dueMs <= nowMs) {
-      const ev = this._pending.shift();
-      try { ev.fn(); } catch (err) {}
+    this._tempo.idle(nowMs);
+    this._advancePosition(dtMs);
+    this._syncOwnership(nowMs, getGestureFor);
+    this._emitDueNotes();
+  }
+
+  // 位置直接在「秒」這個維度前進，不重算 tick↔秒：note.startSeconds／endSeconds、
+  // grid[].startSeconds／endSeconds 都已經由 parseMidi() 依原曲 tempo map 換算好，樂譜自己
+  // 的漸慢／漸快因此仍會被尊重——rate 只是均勻縮放這條已經有速度曲線的時間軸，不是另外疊加。
+  _advancePosition(dtMs) {
+    if (dtMs <= 0) return;
+    this._posSec += (dtMs / 1000) * this._tempo.rate;
+  }
+
+  // 目前位置落在第幾個小節。position 只會前進或在 stop() 時歸零，游標只需要往前追、不用
+  // 每次都從頭二分搜尋。沒有格線（SMPTE）回傳 -1。
+  _currentMeasureIndex() {
+    const grid = this._grid;
+    if (!grid.length) return -1;
+    while (this._measureCursor + 1 < grid.length && grid[this._measureCursor + 1].startSeconds <= this._posSec) {
+      this._measureCursor++;
     }
+    return this._measureCursor;
+  }
 
-    if (!this._controlled.length) {
-      // 沒有人指派任何聲部：整份當伴奏，照真實經過時間連續往前排程。
-      const elapsedSec = (nowMs - this._playStartMs) / 1000;
-      const horizon = elapsedSec + this.cfg.autoLookaheadSec;
-      this._scheduleAccompInRange(this._autoPlayedSec, horizon, 0, this._playStartMs);
-      this._autoPlayedSec = horizon;
-      return;
-    }
+  // 每個小節開始都重設成電腦代打（'auto'）；被指派聲部若在這個小節內偵測到新的拋物線觸發，
+  // 就接手（'human'）並餵一筆樣本給拍速估計器。揮手時已經逼近小節尾聲（< takeoverLookaheadMs）
+  // 就改成預約下一小節，避免「準時揮手卻因為小節剛好在這一瞬間切換而沒接到」。
+  _syncOwnership(nowMs, getGestureFor) {
+    const m = this._currentMeasureIndex();
+    if (m < 0) return; // 沒有格線：所有聲部維持 load() 時的 'auto'，全部由電腦播（見檔頭說明）
 
-    for (const part of this._controlled) {
-      const g = (getGestureFor && getGestureFor(part.partId)) || { present: false, triggerSeq: 0 };
-      let triggered = false;
-      if (part.lastTriggerSeq === null) {
-        // 剛 load() 完的第一次觀察：只記錄基準，不當成「這一刻剛觸發」。
-        part.lastTriggerSeq = g.triggerSeq;
-      } else if (g.triggerSeq !== part.lastTriggerSeq) {
-        part.lastTriggerSeq = g.triggerSeq;
-        triggered = true;
+    const measure = this._grid[m];
+    const nominalMeasureMs = (measure.endSeconds - measure.startSeconds) * 1000;
+    const remainMs = ((measure.endSeconds - this._posSec) / this._tempo.rate) * 1000;
+
+    for (const voice of this._voices.values()) {
+      if (!voice.assigned) continue;
+
+      if (voice.ownedMeasure !== m) {
+        voice.owner = voice.claimMeasure === m ? 'human' : 'auto';
+        voice.claimMeasure = -1;
+        voice.ownedMeasure = m;
       }
-      if (triggered) this._advanceControlled(part, nowMs);
+
+      const gesture = getGestureFor(voice.partId);
+      if (voice.lastSeq === null) { voice.lastSeq = gesture.triggerSeq; continue; } // 首次只記基準
+      if (gesture.triggerSeq === voice.lastSeq) continue;
+      voice.lastSeq = gesture.triggerSeq;
+
+      this._tempo.onGesture(voice.slot, nowMs, nominalMeasureMs);
+
+      if (remainMs <= this.cfg.takeoverLookaheadMs) voice.claimMeasure = m + 1;
+      else voice.owner = 'human';
     }
   }
 
-  // 前進一步：第一次觸發如果第一步之前還有伴奏（前奏），只排前奏、不前進；之後每次觸發
-  // 關掉「原本該在這一步結束」的音、開新的一步，並把「這一步到下一步之間」的伴奏排入佇列。
-  _advanceControlled(part, nowMs) {
-    if (!part.didLeadIn) {
-      part.didLeadIn = true;
-      const to = part.steps.length ? part.steps[0].notes[0].startSeconds : Infinity;
-      this._scheduleAccompInRange(0, to, 0, nowMs);
-      return;
-    }
-
-    if (part.cursorIndex >= part.steps.length) return; // 已經彈完了，之後的觸發沒有效果
-
-    const step = part.steps[part.cursorIndex];
-    const stepSeconds = step.notes[0].startSeconds;
-
-    this._releaseDueControlled(part, step.startTick);
-    for (const n of step.notes) {
-      try { this.humanSynth?.noteOn(part.outChannel, n.note, n.velocity); } catch (err) {}
-      part.sounding.set(n.note, n.endTick);
-    }
-    part.cursorIndex++;
-
-    const to = part.cursorIndex < part.steps.length
-      ? part.steps[part.cursorIndex].notes[0].startSeconds
-      : Infinity;
-    this._scheduleAccompInRange(stepSeconds, to, stepSeconds, nowMs);
-  }
-
-  // 關掉這個聲部裡「原本該在 uptoTick（含）之前結束」的音——一顆音持續響到你觸發下一步、
-  // 且原譜判定它該結束為止，不是用實際秒數算時長。
-  _releaseDueControlled(part, uptoTick) {
-    for (const [note, endTick] of [...part.sounding]) {
-      if (endTick <= uptoTick) {
-        try { this.humanSynth?.noteOff(part.outChannel, note); } catch (err) {}
-        part.sounding.delete(note);
+  // 每個聲部：先關掉到期的音，再把新到期的音開出去（一步一步推進 cursor，同一 startSeconds
+  // 的音符＝和弦，會在同一次呼叫裡一起處理）。
+  _emitDueNotes() {
+    for (const voice of this._voices.values()) {
+      this._releaseDue(voice);
+      while (voice.cursor < voice.notes.length && voice.notes[voice.cursor].startSeconds <= this._posSec) {
+        const note = voice.notes[voice.cursor];
+        const { synth, channel } = this._synthAndChannelFor(voice);
+        try { synth?.noteOn(channel, note.note, note.velocity); } catch (err) {}
+        voice.sounding.set(note.note, { endSeconds: note.endSeconds, viaHuman: voice.owner === 'human' });
+        voice.cursor++;
       }
     }
   }
 
-  // 排程「原本落在 [fromSec, toSec) 這段時間內」、還沒排程過的伴奏音符；每顆音的實際延遲＝
-  // 它原始時間跟 originSec 的差，從 nowMs 這一刻起算（originSec 通常等於 fromSec，也就是
-  // 剛推進到的這一步／這一刻）。伴奏清單已依 startSeconds 排序，游標只前進不回頭。
-  _scheduleAccompInRange(fromSec, toSec, originSec, nowMs) {
-    while (this._accompCursor < this._accompaniment.length) {
-      const entry = this._accompaniment[this._accompCursor];
-      const sec = entry.note.startSeconds;
-      if (sec < fromSec) { this._accompCursor++; continue; } // 已排序，理論上不會發生，防呆用
-      if (sec >= toSec) break;
-      this._accompCursor++;
-      const delayMs = Math.max(0, sec - originSec) * 1000;
-      this._scheduleNoteEvents(entry, nowMs + delayMs);
+  // 關掉這個聲部裡「原譜判定該結束」的音——用它發聲當下記錄的那顆合成器關閉，不是用現在的
+  // owner（owner 可能在這顆音還響著的時候就換了，見檔頭「接手」說明：正在響的音留在原本
+  // 那顆合成器上自然結束）。
+  _releaseDue(voice) {
+    for (const [note, info] of [...voice.sounding]) {
+      if (info.endSeconds > this._posSec) continue;
+      const synth = info.viaHuman ? this.humanSynth : this.accompSynth;
+      const channel = info.viaHuman ? voice.humanChannel : voice.autoChannel;
+      try { synth?.noteOff(channel, note); } catch (err) {}
+      voice.sounding.delete(note);
     }
   }
 
-  _scheduleNoteEvents(entry, onMs) {
-    const { note, outChannel } = entry;
-    const offMs = onMs + Math.max(1, note.durationSeconds * 1000);
-    this._pending.push({
-      dueMs: onMs,
-      fn: () => { try { this.accompSynth?.noteOn(outChannel, note.note, note.velocity); } catch (err) {} },
-    });
-    this._pending.push({
-      dueMs: offMs,
-      fn: () => { try { this.accompSynth?.noteOff(outChannel, note.note); } catch (err) {} },
-    });
-    // 佇列不大（每次只新增一兩顆音的 on/off），插入排序的成本可接受。
-    this._pending.sort((a, b) => a.dueMs - b.dueMs);
+  _synthAndChannelFor(voice) {
+    if (voice.owner === 'human' && voice.humanChannel !== null) {
+      return { synth: this.humanSynth, channel: voice.humanChannel };
+    }
+    return { synth: this.accompSynth, channel: voice.autoChannel };
   }
 }
