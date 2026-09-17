@@ -16,9 +16,10 @@
 //  selectionSignature，下一次按頂端播放鍵時 playCurrentSource() 才用新的指派重新載入。
 //  指派是持久設定，不隨追蹤雜訊變動：下拉列「無／演奏者 1~N」，N ＝ 系統控制 bar 選的「現場人數」
 //  （playerCount，還沒選是 0 → 只有「無」），不因當下偵測到幾人而增減。
-//  指派聲部的實際演奏＝共用小節格線同步（見 humanPerformer.js）：全體聲部共用同一個由全體
-//  演奏者揮手節奏估出的拍速連續前進，不等任何人；每個小節開始預設由電腦代打，指派演奏者在
-//  這個小節內做一次有效拋物線手勢就接手該聲部剩餘部分，整小節沒揮手就整小節由電腦代打補完。
+//  指派聲部的實際演奏＝拍級事件驅動（見 humanPerformer.js）：沒有背景時鐘，全體指派演奏者
+//  共用同一個拍位，只在有人做出有效拋物線手勢的那一刻才前進；輪到但沒被自己演奏者接手的拍
+//  就是靜音，不會被電腦補（沒有代打）。沒被指派的聲部完全不受影響，反應式跟著推進最遠的
+//  進度持續播放；完全沒有人指派時整份照真實經過時間連續自動播放。
 // ============================================================
 
 import { Store, rafThrottle } from '../ui.js';
@@ -229,7 +230,7 @@ function clearSource() {
    播放（本地／雲端共用同一套邏輯）
    ═══════════════════════════════════════════ */
 // 「目前引擎裡在播的到底是什麼」的簽章：來源身分 + 分譜／指派狀態。兩者都相同才能直接續播，
-// 任一項不同都要重新交給 humanPerformer.load() 重建聲部與小節格線。
+// 任一項不同都要重新交給 humanPerformer.load() 重建聲部與拍格線。
 const buildPlaybackSignature = (source) =>
   `${sourceIdentity(source)}::${selectionSignature(playerStore.state.score, playerStore.state.assignments)}`;
 
@@ -256,7 +257,7 @@ async function playCurrentSource() {
   const loadingIndicatorTimer = setTimeout(() => playerStore.set({ transport: 'loading' }), LOADING_INDICATOR_DELAY_MS);
   try {
     // 傳快照（[partId, slot][]），不要傳活的 Map——humanPerformer.js 的 buildVoices() 需要
-    // partId → 演奏者槽位的對應才能把拍速樣本歸到對的人（見 createTempoEstimator()）。
+    // partId → 演奏者槽位的對應才能知道每個指派聲部要問哪個 ID 的手勢狀態。
     await synth.load(s.score, [...s.assignments]);
     if (synth.humanPerformer.unplacedPartIds.length) {
       console.warn('⚠️ 分譜聲部超過合成器可用的輸出 channel，以下聲部這一輪不會出聲：',
@@ -336,7 +337,7 @@ function uiTick() {
 }
 
 // 真人聲部的排程 tick：把每個指派聲部目前的手勢狀態（在場／觸發計數）交給
-// humanPerformer.tick()，由它推進共用位置、判斷這一小節該由誰接手（見 humanPerformer.js）。
+// humanPerformer.tick()，由它判斷有沒有新觸發、該不該接手（見 humanPerformer.js）。
 function schedulerTick() {
   if (synth.isLoaded() && !synth.isPaused()) synth.humanPerformer.tick(performance.now(), gestureFor);
 }
@@ -535,7 +536,7 @@ function renderLibraryPicker({ player }) {
 // 分譜清單每一列就是「聲部名（GM 音色的繁體中文名）＋一個下拉（無／演奏者 1~N）」，由 index.html 的
 // <template id="tpl-part-row"> clone，聲部名用 textContent 填（來自檔案內容，不當 HTML）。列只在 parts 參照或
 // playerCount 變了才重建，每次 render 都校正各下拉的值與 is-mine。ID 只是槽位編號的顯示提示，畫面上不額外
-// 標示在不在場——不在場的處理交給 humanPerformer.js 的手勢／代打雙模式，指派本身留著。
+// 標示在不在場——不在場就是沒有新觸發，交給 humanPerformer.js 判斷該靜音還是接手，指派本身留著。
 const localInput = document.getElementById('localMidiInput');
 const localFileName = document.getElementById('localMidiFileName');
 const scorePartSection = document.getElementById('scorePartSection');

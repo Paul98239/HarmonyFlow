@@ -50,8 +50,16 @@ const TAU = Math.PI * 2;
 // 嘴巴中點正下方的虛擬「下巴」節點偏移量：以肩寬為單位（跟 ArcDetector 門檻、ID 標籤字級
 // 同一套慣例），人離鏡頭遠近不同時偏移比例才會一致，不用固定 px。
 const CHIN_OFFSET_RATIO = 0.18;
-// 慣用手鎖定：連續這麼久沒有新觸發（毫秒）才放開鎖定，讓使用者能換手。
-const HAND_LOCK_RELEASE_MS = 3000;
+// 慣用手鎖定的兩道放開條件：HAND_LOCK_RELEASE_MS 是保險絲（現在 humanPerformer.js 是拍級
+// 事件驅動、沒有背景時鐘，停頓幾秒——例如正在對著一顆長音不動——是完全正常的演奏節奏，門檻
+// 故意放寬，不再是主要機制）；真正負責「換手」體驗的是 HAND_STILL_RADIUS／HAND_STILL_MS：
+// 鎖定的手連續待在一個小範圍內夠久就視為靜止（藏起來的手通常也是靜止的），比「多久沒觸發」
+// 更直接對應「手被藏起來但還沒觸發過」這個情境——MediaPipe 對被遮擋的手常常會猜一個信心分數
+// 還過得去的位置，可見度旗標未必會掉到不可見，光調可見度的遲滯沒有用。
+const HAND_LOCK_RELEASE_MS = 8000;
+const HAND_STILL_RADIUS = 0.10;  // 肩寬單位，小於 ArcDetector 的 minDepthRatio(0.15)：真正的
+                                  // 拋物線手勢一定會讓手離開這個半徑，不會誤放開正在使用的手
+const HAND_STILL_MS = 700;       // 連續待在半徑內這麼久才放開鎖定
 
 const FRAME_ERROR_THRESHOLD = 90; // 連續幾幀處理失敗才判定為持續性錯誤並顯示錯誤畫面（約 1.5~3 秒）
 
@@ -74,7 +82,10 @@ const arcDetectors = Array.from({ length: CONFIG.maxUsers },
 // 合成雙手 ArcDetector 時需要「上一幀各手的 triggerSeq」才能判斷有沒有新觸發（見
 // combineArcTriggers()）；ArcDetector 本身的 triggerSeq 是累加值，不是「這一幀有沒有觸發」的旗標。
 const arcLastSeqBySlot = Array.from({ length: CONFIG.maxUsers },
-  () => ({ left: 0, right: 0, combinedSeq: 0, lockedHand: null, lastTriggerMs: undefined }));
+  () => ({
+    left: 0, right: 0, combinedSeq: 0, lockedHand: null, lastTriggerMs: undefined,
+    stillAnchor: null, stillSinceMs: undefined,
+  }));
 // 注意：combinedSeq 刻意不在這裡歸零。humanPerformer.js 靠它「有沒有變」判斷有沒有新觸發，
 // 歸零會讓下一次比對誤判成一次新事件、平白多彈一個音（實測發現：走出鏡頭超過 SLOT_RELEASE_MS、
 // 按重置骨架 ID、改現場人數都會呼叫到這裡）。combinedSeq 單調遞增、永不重置。
@@ -82,6 +93,7 @@ const resetSlotDetectors = (arcSlot, lastSeq) => {
   arcSlot.left.reset(); arcSlot.right.reset();
   lastSeq.left = 0; lastSeq.right = 0;
   lastSeq.lockedHand = null; lastSeq.lastTriggerMs = undefined;
+  lastSeq.stillAnchor = null; lastSeq.stillSinceMs = undefined;
 };
 // 一次歸位所有槽位的手勢偵測器（重置骨架 ID、關閉攝影機、人數改變重建追蹤器時共用）。
 const resetAllSlotDetectors = () => {
@@ -345,7 +357,8 @@ function virtualChinPoint(lm, shoulderWidth) {
 }
 
 // 把一個在場槽位的骨架餵給它那對 ArcDetector（拋物線手勢 → 換音符觸發）。回傳的
-// leftVisible／rightVisible 供 combineArcTriggers() 判斷鎖定的手是否該放開。
+// leftVisible／rightVisible／leftPoint／rightPoint／shoulderWidth 供 combineArcTriggers()
+// 判斷鎖定的手是否該放開（可見度、靜止偵測都要用到實際座標）。
 function updateSlotArc(arcDet, track, nowMs) {
   const sm = track.smoothed;
   const ls = sm[MP_LEFT_SHOULDER], rs = sm[MP_RIGHT_SHOULDER];
@@ -357,21 +370,37 @@ function updateSlotArc(arcDet, track, nowMs) {
     right: arcDet.right.update({ point: rightPoint, shoulderWidth }, nowMs),
     leftVisible: !!leftPoint,
     rightVisible: !!rightPoint,
+    leftPoint, rightPoint, shoulderWidth,
   };
 }
 
 // 合成雙手的 ArcDetector 結果，並套用「自動鎖定慣用手」：哪隻手先做出有效拋物線就鎖定它，
 // 之後只認那隻手的觸發——避免另一隻閒置手被模型猜出來後在畫面上飄移、湊出假拋物線造成誤觸發
-// （實測發現的問題）。鎖定的手連續不可見、或連續 HAND_LOCK_RELEASE_MS 沒有新觸發，才放開讓
-// 使用者換手。combinedSeq 是槽位自己的累加計數，供 midi/humanPerformer.js 判斷「有沒有新事件」。
-// state 就是 arcLastSeqBySlot[slot]，逐幀被這個函式直接改動（歸位見 resetSlotDetectors）。
+// （實測發現的問題）。鎖定的手連續不可見、連續 HAND_LOCK_RELEASE_MS 沒有新觸發（保險絲）、
+// 或連續 HAND_STILL_MS 幾乎沒在動（主要機制，見上方常數註解），才放開讓使用者換手。
+// combinedSeq 是槽位自己的累加計數，供 midi/humanPerformer.js 判斷「有沒有新事件」。state
+// 就是 arcLastSeqBySlot[slot]，逐幀被這個函式直接改動（歸位見 resetSlotDetectors）。
 function combineArcTriggers(state, arc, nowMs) {
-  const { left, right, leftVisible, rightVisible } = arc;
+  const { left, right, leftVisible, rightVisible, leftPoint, rightPoint, shoulderWidth } = arc;
 
   if (state.lockedHand === "left" && !leftVisible) state.lockedHand = null;
   if (state.lockedHand === "right" && !rightVisible) state.lockedHand = null;
   if (state.lockedHand && nowMs - (state.lastTriggerMs ?? nowMs) > HAND_LOCK_RELEASE_MS) {
     state.lockedHand = null;
+  }
+
+  if (state.lockedHand) {
+    const point = state.lockedHand === "left" ? leftPoint : rightPoint;
+    const radius = HAND_STILL_RADIUS * Math.max(shoulderWidth || 0, 0.04);
+    const dist = point && state.stillAnchor ? Math.hypot(point.x - state.stillAnchor.x, point.y - state.stillAnchor.y) : Infinity;
+    if (dist > radius) {
+      state.stillAnchor = point;
+      state.stillSinceMs = nowMs;
+    } else if (nowMs - state.stillSinceMs > HAND_STILL_MS) {
+      state.lockedHand = null;
+    }
+  } else {
+    state.stillAnchor = null;
   }
 
   const leftChanged = left.triggerSeq !== state.left;

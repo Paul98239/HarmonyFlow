@@ -1226,6 +1226,40 @@ export function buildMeasureGrid(parsed) {
   return grid;
 }
 
+/**
+ * @typedef {{index:number, measureIndex:number, beatInMeasure:number, startTick:number,
+ *   endTick:number, startSeconds:number, endSeconds:number}} Beat
+ */
+
+/**
+ * 把小節格線（`buildMeasureGrid()`）切成拍格線：每小節 `numerator` 拍、每拍 `beatTicks`——
+ * 兩者都是檔案真實的 division 與拍號算出來的，不是猜的。拍號中途變更造成的截短小節，
+ * 最後一拍夾到 `measure.endTick`；長度為 0 就不收。SMPTE division（`buildMeasureGrid()`
+ * 回空陣列）這裡也回空陣列。
+ * @param {ParsedMidi} parsed  parseMidi() 的結果
+ * @returns {Beat[]}
+ */
+export function buildBeatGrid(parsed) {
+  const beats = [];
+  for (const m of buildMeasureGrid(parsed)) {
+    for (let b = 0; b < m.numerator; b++) {
+      const startTick = m.startTick + b * m.beatTicks;
+      if (startTick >= m.endTick) break;
+      const endTick = Math.min(startTick + m.beatTicks, m.endTick);
+      beats.push({
+        index: beats.length,
+        measureIndex: m.index,
+        beatInMeasure: b,
+        startTick,
+        endTick,
+        startSeconds: parsed.tickToSeconds(startTick),
+        endSeconds: parsed.tickToSeconds(endTick),
+      });
+    }
+  }
+  return beats;
+}
+
 /* ═══════════════════════════════════════════
    編碼：模型 → SMF 位元組
    ═══════════════════════════════════════════ */

@@ -2,12 +2,11 @@
 //  synth.js — spessasynth 合成器：兩個合成器（伴奏 synth／真人聲部 synthHuman）、humanGain 閘門。
 //  純引擎：不知道「分譜」「指派」是什麼，也不碰 DOM。
 //
-//  沒有 Sequencer：兩個合成器都只接收 humanPerformer.js（共用小節格線同步排程器）送來的個別
+//  沒有 Sequencer：兩個合成器都只接收 humanPerformer.js（拍級事件驅動排程器）送來的個別
 //  noteOn／noteOff／初始 program 設定，見 humanPerformer.js 檔頭說明。
 //
-//  兩軌（bus）模型：被指派聲部這一刻由誰接手（電腦代打或真人）決定新音走 synth 還是
-//  synthHuman，velocity 一律用樂譜原值；沒被指派的聲部固定走 synth。伴奏那一軌固定不動，
-//  是「我的聲部」音量的比較基準。
+//  兩軌（bus）模型：被指派聲部固定走 synthHuman，velocity 一律用樂譜原值，沒被自己的演奏者
+//  接手就是靜音（沒有代打）；沒被指派的聲部固定走 synth，不受任何人觸發影響，反應式播放。
 // ============================================================
 
 import { HumanPerformer } from './humanPerformer.js';
@@ -51,8 +50,8 @@ let isSongLoaded = false;
 let isProcessingPlay = false;
 let lastGateTarget = -1;
 
-// 共用小節格線同步排程器（humanPerformer.js）：驅動 synth（伴奏／代打）與 synthHuman
-// （指派聲部接手後的部分），由播放器的 12ms 排程 tick 呼叫 tick()。
+// 拍級事件驅動排程器（humanPerformer.js）：驅動 synth（未指派聲部，反應式播放）與
+// synthHuman（指派聲部，接手才發聲），由播放器的 12ms 排程 tick 呼叫 tick()。
 export const humanPerformer = new HumanPerformer();
 
 /* ═══════════════════════════════════════════
@@ -186,7 +185,7 @@ export async function play() {
   } finally { isProcessingPlay = false; }
 }
 export function pause() {
-  humanPerformer.pause(); // 收掉所有正在響的音；共用位置與拍速都保留，下次播放從原處繼續
+  humanPerformer.pause(); // 收掉所有正在響的音；每個聲部的播放進度都保留，下次播放從原處繼續
 }
 export function isLoaded() { return isSongLoaded; }
 export function isPaused() { return !isSongLoaded || !humanPerformer.isPlaying(); }
