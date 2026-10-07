@@ -9,7 +9,7 @@
 import {
   PoseLandmarker,
   FilesetResolver,
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/vision_bundle.mjs";
+} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/vision_bundle.mjs";
 import { PersonTracker, buildDetection } from "./tracking.js";
 import { ArcDetector } from "./gesture.js";
 
@@ -907,7 +907,7 @@ async function initSystem() {
 
     setStatus("正在載入 WASM 視覺模組⋯");
     visionFileset = await FilesetResolver.forVisionTasks(
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm"
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/wasm"
     );
 
     setStatus("正在載入 Pose 模型⋯");
