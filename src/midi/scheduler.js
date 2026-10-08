@@ -15,19 +15,21 @@
 //  的 follower 音各自排好發聲時刻：`按下時刻 + (樂譜秒(startTick) − 樂譜秒(T_k)) ÷ playbackRate`（startTick == T_k 的在這次呼叫內
 //  同刻發聲）。第 0 段（第一個 driver 起音之前的前奏）在 play() 後用 1× 起算，所以前奏照原速播、停在你的入場點。前奏還沒播完
 //  時按鍵不放行（前奏鎖：不然第 1 段重新對時，前奏剩下的音就被跳過），只記預按，播到入場點由 tick() 自動放行第一個起音。
-//    · 你按得比預估早：上一段沒放完的 follower 音照自己排好的時刻繼續放完（長度照 MIDI 音符長度，依速度換算），不跳、不一次
+//    · 你按得比預估早：上一段沒放完的 follower 音照自己排好的時刻繼續放完（長度照 MIDI 音符長度，不依速度換算），不跳、不一次
 //      放出（不擠）、不丟；它們最多比該有的時間晚「你早按的量」，下一次按鍵重新對時就歸零（不累積）。唯一的修剪是尾巴收尾
 //      （見「收音」）：同譜表的新音發聲時，舊音不會比檔案裡的重疊響得更久。
 //    · 你按得比預估晚：這一段放完就靜止等你，不會越過你的下一個起音；已經開始的音照 MIDI 音長收完。
 //  playbackRate（命名同官方 Sequencer：樂譜秒 ÷ 真實秒）＝最近 8 個按鍵的頭尾比值（pressTiming.js，模擬評估選出來的）。
 //  去抖（pressTiming.js）：兩次按鍵太近就忽略第二次（擋手抖、手勢重複觸發）。
 //
-//  收音：driver 的音到期（對應時刻）或下一次按鍵時 endTick ≤ 新錨點的先收掉，follower 的音從它發聲的時刻起算原始時值。
-//  每顆音都在自己的結尾收、不撐住（你的與電腦的一樣）：你猶豫時音結束、之後是安靜，像真的樂器；放行時先收再放。跨過你起音、
-//  還在響的電腦音，在你按下那個起音時依剩下的長度重新對時（只延後，見 _retimeCrossing）。尾巴收尾：同一個譜表的新音發聲時，
-//  還在響的舊音（起音 tick 比新音早）的收音時刻上限＝新音發聲時刻 ＋ 檔案裡這兩顆音的重疊量（結尾 tick − 新音起音 tick，
-//  最少 0）依目前速度換算——你按得比預估早時，舊音不會比檔案裡的重疊多響一截（糊在一起），也不丟音；只會提早、不會延長。同音高重疊的音依發聲順序先進先出
-//  收音（跟官方合成器對 note-off 的解讀一致），每個 noteOn 都送出一個 noteOff。
+//  收音：音長就是 MIDI 的音符長度，不依速度換算（電腦音的「起音」才跟著你的速度）。driver 的音到期或下一次按鍵時 endTick ≤ 新錨點的
+//  先收掉（先收再放），follower 的音從它發聲的時刻起算原始時值。
+//  hold（loop 等你按下一個起音）：音的結尾對齊某個還沒放行的 driver 起音（你的與電腦的一樣，見 _holdIndexOf），原長走完也不收，
+//  放行那個起音時才收（max(原長的結尾, 按下的時刻)，見 _releaseHeld）——只延後、不提前，所以你按得比預估早時不會切斷電腦音。
+//  是否 hold 看每顆音自己的結尾，不看它屬於哪個 segment：同 tick 你的音短、電腦音長時，短音照原長收、長音等它對齊的起音。
+//  尾巴收尾：同一個譜表的新音發聲時，還在響的舊音（起音 tick 比新音早）的收音時刻上限＝新音發聲時刻 ＋ 檔案裡這兩顆音的重疊量
+//  （結尾 tick − 新音起音 tick，最少 0，不換算）——舊音不會比檔案裡的重疊多響一截（糊在一起），也不丟音；hold 著的舊音在這裡被截成有限值。
+//  同音高重疊的音依發聲順序先進先出收音（hold 著的不算），每個 noteOn 都送出一個 noteOff。
 //
 //  lookahead：tick(nowMs, audioNow) 有給 AudioContext 時間時，電腦輔助聲部 LOOKAHEAD_MS 以內要發聲／收音的事件提早帶時間戳（eventOptions.time）
 //  送進合成器，由 worklet 依取樣時鐘準時放，不受主執行緒卡頓影響；你的聲部永遠立即發聲、不帶時間戳。worklet 沒有取消已排程事件的
@@ -80,6 +82,9 @@ const LOOKAHEAD_MS = 50;
 const LATE_SAMPLES_MAX = 5000;
 // 按鍵記錄最多留幾筆（超過就丟最舊的），避免長時間播放無限成長。
 const PRESS_LOG_MAX = 20000;
+// hold（loop 等你按下一個起音）的對齊容差：音的結尾比某個 driver 起音早不超過這麼多 tick，就算「結尾接著這個起音」。
+// MuseScore 匯出相連音時記譜長度少 1 tick，所以至少要容許 1；再多一點吸收取整誤差。不是規格，是匯出器的慣例。
+const HOLD_GAP_TICKS = 2;
 // GM 預設的混音值（CC121 不會重設音量、聲像、Program，見 GML-v1 §3.2.5.2；channel 又是跨曲重複使用，所以沒有 init 的 staff
 // 也要明確送一次，避免沿用到別的曲子在同一個 channel 上留下的設定）。
 const GM_DEFAULT_VOLUME = 100, GM_DEFAULT_PAN = 64, GM_DEFAULT_REVERB = 0, GM_DEFAULT_CHORUS = 0;
@@ -484,7 +489,7 @@ export class Scheduler {
       const { staff, note } = this._followers[i];
       const startSec = this._secOf(note.startTick);
       const dueMs = clockMs + ((startSec - scoreSec) * 1000) / rate;
-      fresh.push({ dueMs, offMs: dueMs + ((this._secOf(note.endTick) - startSec) * 1000) / rate, staff, note });
+      fresh.push({ dueMs, offMs: dueMs + (this._secOf(note.endTick) - startSec) * 1000, staff, note });   // 起音跟著你的速度，音長是檔案寫的長度
     }
     // 兩個都已依 dueMs 排好的清單合併（穩定：同時刻舊的在前）
     const merged = [], old = this._pending;
@@ -558,9 +563,9 @@ export class Scheduler {
 
     this._anchorSlice(j + 1, clock, scoreSec, this.playbackRate);   // 先更新錨點與已啟動的段
     this._closeByTick(seg.ticks);                                   // driver 的音 endTick ≤ 這個起音的，先收
-    this._retimeCrossing(seg.ticks, scoreSec, clock);               // 跨過這個起音、還在響的電腦音：收音時刻跟著你這一下重新對時
+    this._releaseHeld(j, clock);                                    // 結尾對齊這個起音（或更早的起音）而 hold 著的音：到原長的結尾與這一刻較晚的那個收
     this._closeDue();
-    for (const { staff, note } of seg.items) this._sound(staff, note, clock + ((this._secOf(note.endTick) - scoreSec) * 1000) / this.playbackRate, clock);
+    for (const { staff, note } of seg.items) this._sound(staff, note, clock + (this._secOf(note.endTick) - scoreSec) * 1000, clock);
     this._emitPending();                                            // 同 tick 的 follower 音（dueMs ＝ 這一刻）跟你的音同刻
     this._closeDue();                                               // 零長度的音
   }
@@ -574,8 +579,10 @@ export class Scheduler {
     let queue = staff.sounding.get(note.midiNote);
     if (!queue) staff.sounding.set(note.midiNote, (queue = []));
     const opts = this._stamp(staff, dueMs);
-    // capped：之後不再被重新對時延長（被同譜表的新音截短過，或後面排著同音高的新音，見 _capOverlaps）
-    queue.push({ endTick: note.endTick, offMs, note, onTime: opts?.time, capped: false }); // 先登記再 noteOn：合成器收到 noteOn 時，佇列最後一項就是這顆音
+    // hold：結尾接著某個還沒放行的 driver 起音的音（你的與電腦的一樣），先不排收音（Infinity），等你按到那個起音才收（_releaseHeld），
+    // origOffMs 是原長的結尾；被同譜表的新音截短過的不再 hold（見 _capOverlaps，capped）
+    const holdIdx = this._holdIndexOf(note);
+    queue.push({ endTick: note.endTick, offMs: holdIdx === null ? offMs : Infinity, origOffMs: offMs, holdIdx, note, onTime: opts?.time, capped: false }); // 先登記再 noteOn：合成器收到 noteOn 時，佇列最後一項就是這顆音
     try { this._synthOf(staff)?.noteOn(staff.channel, note.midiNote, note.velocity, opts); } catch (err) {}
   }
 
@@ -589,19 +596,19 @@ export class Scheduler {
     for (const queue of staff.sounding.values()) {
       for (const entry of queue) {
         if (entry.note.startTick >= note.startTick) continue;
-        const capMs = onsetMs + (Math.max(0, this._secOf(entry.endTick) - startSec) * 1000) / this.playbackRate;
-        // 只有「真的截短」才標成不再延長（EPS：capMs 與 offMs 從同一個錨點算出來，相等時只差浮點誤差，不算截短；多聲部譜表的
-        // 內聲部短音常在長音中間起音，不能因為同譜表有別的音就不再重新對時）
-        if (capMs < entry.offMs - EPS_MS) { entry.offMs = capMs; entry.capped = true; }
-        // 同音高：新音的收音在先進先出佇列裡排在舊音後面，舊音之後若再被重新對時延長，新音的收音也會被拖住
-        else if (entry.note.midiNote === note.midiNote) entry.capped = true;
+        const capMs = onsetMs + Math.max(0, this._secOf(entry.endTick) - startSec) * 1000;
+        // 只有「真的截短」才標成 capped、不再 hold（EPS：capMs 與 offMs 從同一個錨點算出來，相等時只差浮點誤差，不算截短）。
+        // 單音旋律的譜表因此不會糊到你下一次按鍵；hold 著的音（offMs＝Infinity）遇到同譜表的新音也在這裡被截成有限值
+        if (capMs < entry.offMs - EPS_MS) { entry.offMs = capMs; entry.capped = true; entry.holdIdx = null; }
+        // 同音高：新音的收音在先進先出佇列裡排在舊音後面，舊音若還 hold 著，新音的收音會被拖住，所以也不再 hold
+        else if (entry.note.midiNote === note.midiNote) { entry.capped = true; entry.holdIdx = null; }
       }
     }
     // 同音高的舊音若因此到期，要在新音 noteOn 之前先收（先收再放：不然同音高的 noteOff 會連新音一起關掉）
     const same = staff.sounding.get(note.midiNote);
-    while (same?.length && same[0].offMs <= onsetMs + EPS_MS) {
-      try { this._synthOf(staff)?.noteOff(staff.channel, note.midiNote, this._offOpts(staff, same[0], same[0].offMs)); } catch (err) {}
-      same.shift();
+    for (let i; same && (i = this._dueIndex(same, onsetMs)) !== -1; ) {
+      try { this._synthOf(staff)?.noteOff(staff.channel, note.midiNote, this._offOpts(staff, same[i], same[i].offMs)); } catch (err) {}
+      same.splice(i, 1);
     }
     if (same && !same.length) staff.sounding.delete(note.midiNote);
   }
@@ -686,35 +693,50 @@ export class Scheduler {
     }
   }
 
-  // 收掉到期的音（offMs ≤ limitMs）。同音高重疊時只看佇列最前面那一顆（先進先出）。limitMs 預設是時鐘；tick()
+  // 收掉到期的音（offMs ≤ limitMs）。同音高重疊時先進先出（hold 著的音不算，見 _dueIndex）。limitMs 預設是時鐘；tick()
   // 帶 lookahead 時是時鐘 + LOOKAHEAD_MS，只對電腦輔助聲部生效——你的音永遠在時鐘到了才收。
   _closeDue(limitMs = this._clockMs) {
     for (const staff of this._staves.values()) {
       const synth = this._synthOf(staff);
       const limit = staff.kind === 'human' ? this._clockMs : limitMs;
       for (const [pitch, queue] of staff.sounding) {
-        while (queue.length && queue[0].offMs <= limit + EPS_MS) {
-          try { synth?.noteOff(staff.channel, pitch, this._offOpts(staff, queue[0], queue[0].offMs)); } catch (err) {}
-          queue.shift();
+        for (let i; (i = this._dueIndex(queue, limit)) !== -1; ) {
+          try { synth?.noteOff(staff.channel, pitch, this._offOpts(staff, queue[i], queue[i].offMs)); } catch (err) {}
+          queue.splice(i, 1);
         }
         if (!queue.length) staff.sounding.delete(pitch);
       }
     }
   }
 
-  // 你按下起音 ticks（樂譜秒 scoreSec）時，還在響、跨過這個起音的電腦音（startTick < ticks < endTick）：收音時刻至少是
-  // 「按下時刻 ＋ 剩下的樂譜長度 ÷ 新速度」。為什麼：舊的收音時刻是它發聲當下依當時速度估的，你比估到的慢時，這個起音之後它該
-  // 還剩的長度要從你真正按下的時刻重新算，音才會對齊你的 tick。只延後、不提前（max），所以你按得比預估早時行為不變（N2：
-  // 沒放完的電腦音照原長放完）；標成 capped 的（被尾巴收尾截短過、後面排著同音高的新音）不動。只在按下的那一刻調整：
-  // 收音時刻到了你還沒按下一個起音，照樣收（不撐住，跟你的音一樣）。
-  _retimeCrossing(ticks, scoreSec, clock) {
+  // 同音高佇列裡「下一個該收的音」的位置：先進先出只排沒有 hold 的音——hold 著的音要等你按到它的起音才收，不能擋住排在它後面、
+  // 已經到期的音（延遲放出的舊 tick 的電腦音可能比新 tick 的音晚發聲）。第一個沒有 hold 的音到期（offMs ≤ limit）就回傳它的位置，否則 -1。
+  _dueIndex(queue, limit) {
+    const i = queue.findIndex((e) => e.holdIdx === null);
+    return i !== -1 && queue[i].offMs <= limit + EPS_MS ? i : -1;
+  }
+
+  // 這顆音要 hold 到第幾個 driver 起音？結尾 tick 等於（或在 HOLD_GAP_TICKS 之內早於）某個 driver 起音、而且那個起音在這顆音起音
+  // 之後、還沒放行（編號 >= _segIndex）才 hold，回傳那個 driver segment 的編號；否則 null（照原長收）。
+  // 為什麼看每顆音自己的結尾而不是它屬於哪個 segment：同一個 tick 你的音短、電腦音長時，短音（結尾不在起音上）照原長收，
+  // 長音只在它結尾對齊的那個起音才收，不會被中間的按鍵切掉，也不會被拉長到不屬於它的起音。整首自動播放沒有 driver 起音，永遠 null。
+  _holdIndexOf(note) {
+    const a = this._driverTicks;
+    let lo = 0, hi = a.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (a[mid] < note.endTick) lo = mid + 1; else hi = mid; }   // lower bound：第一個 >= endTick 的起音
+    if (lo >= a.length || lo < this._segIndex) return null;
+    return a[lo] - note.endTick <= HOLD_GAP_TICKS && a[lo] > note.startTick ? lo : null;
+  }
+
+  // 你放行第 j 個 driver segment 時：hold 著、等的是第 j 個（或更早）起音的音，收音時刻＝原長的結尾與這一刻較晚的那個。
+  // 只延後、不提前：你按得比預估早，原長還沒走完的音照原長放完（不切斷電腦音）；你晚按，hold 到這一刻才收。
+  _releaseHeld(j, clock) {
     for (const staff of this._staves.values()) {
-      if (staff.kind === 'human') continue;
       for (const queue of staff.sounding.values()) {
         for (const entry of queue) {
-          if (entry.capped || entry.note.startTick >= ticks || entry.endTick <= ticks) continue;
-          const retimed = clock + ((this._secOf(entry.endTick) - scoreSec) * 1000) / this.playbackRate;
-          if (retimed > entry.offMs) entry.offMs = retimed;
+          if (entry.holdIdx === null || entry.holdIdx === undefined || entry.holdIdx > j) continue;
+          entry.offMs = Math.max(entry.origOffMs, clock);
+          entry.holdIdx = null;
         }
       }
     }

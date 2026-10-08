@@ -205,10 +205,11 @@ export function silenceStats(sim) {
 /**
  * 不變量（任何按鍵速度、任何人數都該成立）：
  *   releasedMissing＝0：該放行的音都發聲了（你的音：它所屬的 segment 已放行；電腦的音：它那一段已被按鍵啟動）；
- *   unpaired／strayOff／badVelocity＝0：每個 noteOn 一個 noteOff、不送 velocity 0；
+ *   unpaired／strayOff／badVelocity＝0：每個 noteOn 一個 noteOff、不送 velocity 0（hold 著、等你按下一個起音的音不算沒收，見 held）；
  *   offTrigger＝0：你的每顆音都在某一次成功按鍵的那一刻發聲（0ms）；例外是前奏鎖：前奏中預按的第一個起音，在前奏播完那一刻放行；
  *   syncMax＝0：同一個 tick 的音（你的與電腦的）同刻發聲。
  * notReleased：曲末還沒被放行／啟動的音（按得不夠多、中途停手）——不是違規，由情境決定要不要求完整放行。
+ * held：曲末還 hold 著、等你按到它結尾對齊的起音才會收的音（你中途停手時才會有；按完整首之後一定是 0）。
  */
 export function measure(sim) {
   const { hp, records, stats, pressLog } = sim;
@@ -235,9 +236,11 @@ export function measure(sim) {
   // 唯一的例外：前奏鎖期間被擋下的預按（released＝false），播放頭到入場點時由 tick() 自動放行第一個起音（第 0 個 driver segment）
   const prePressRelease = (r) => segOf.get(r.note) === 0 && pressLog.some((p) => !p.released && p.ms <= r.onMs);
   const offTrigger = pressLog.length ? records.filter((r) => r.label === 'human' && !pressedMs.has(r.onMs) && !prePressRelease(r)).length : 0;
+  let held = 0;
+  for (const v of hp._staves.values()) for (const queue of v.sounding.values()) for (const e of queue) if (e.holdIdx !== null && e.holdIdx !== undefined) held++;
   return {
-    total, sounded: records.length, releasedMissing, notReleased,
-    unpaired: records.filter((r) => r.offMs == null).length, strayOff: stats.strayOff, badVelocity: stats.badVelocity,
+    total, sounded: records.length, releasedMissing, notReleased, held,
+    unpaired: records.filter((r) => r.offMs == null).length - held, strayOff: stats.strayOff, badVelocity: stats.badVelocity,
     syncMax: Math.round(syncMax), offTrigger,
     pressCount: pressLog.length, released: pressLog.filter((p) => p.released).length, blocked: pressLog.filter((p) => !p.released).length,
     finished: hp.isFinished(),
