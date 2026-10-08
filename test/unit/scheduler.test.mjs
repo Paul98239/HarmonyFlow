@@ -1435,4 +1435,152 @@ run('lookahead 壓力測試：隨機譜、不規則的 tick 間隔（含停頓�
   }
 });
 
+/* ═══════════════════════════════════════════
+   指派單位：part 或 staff；槽位可以是字串（'kb'＝PC 鍵盤手）
+   ═══════════════════════════════════════════ */
+
+run('staff 級指派：指派 staff id 只有那個譜表走真人軌，同一個 part 的另一個譜表與其他 part 走電腦輔助；staff 的指派優先於 part 的', () => {
+  const score = buildStaffScore([{ id: 'piano', staves: [{ id: 't1c0', notes: [0, 2], pitch: 72 }, { id: 't2c0', notes: [0, 2], pitch: 48 }] }]);
+  const { hp, log, d } = makeStaffHp(score, [['t1c0', 1]]);
+  assert(hp._staves.get('t1c0').kind === 'human' && hp._staves.get('t1c0').slot === 1, '上行譜（t1c0）走真人軌');
+  assert(hp._staves.get('t2c0').kind === 'assist', '下行譜沒被指派，走電腦輔助');
+  assert(hp._driverSegs.length === 2 && hp._driverSegs.every((g) => g.items.length === 1), 'driver segment 只含上行譜的音');
+  d.tick(); d.press();
+  assert(onMs(log, 72, 'human') === d.nowMs && onMs(log, 48, 'assist') === d.nowMs, '一次按鍵：上行譜（你的）與同 tick 的下行譜（電腦的）同刻發聲');
+  const both = makeStaffHp(score, [['piano', 2], ['t1c0', 1]]);
+  assert(both.hp._staves.get('t1c0').slot === 1 && both.hp._staves.get('t2c0').slot === 2, 'staff 的指派優先於 part 的');
+  assert(portsNeeded(score, [['t1c0', 1]]) >= DEFAULT_PORTS, 'portsNeeded 也認 staff 級指派');
+});
+
+run("槽位可以是字串：'kb'（PC 鍵盤手）有資格觸發，其他槽位沒有", () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [0, 1, 2], a1: [0, 1, 2] }), [['p0', 'kb']]);
+  d.tick();
+  assert(hp.trigger(1, d.nowMs) === false, '槽位 1 沒有指派聲部，不放行');
+  assert(hp.trigger('kb', d.nowMs) === true && onMs(log, 40, 'human') === d.nowMs, "'kb' 放行，你的 40 與電腦的 52 同刻發聲");
+});
+
+/* ═══════════════════════════════════════════
+   熱切換指派（reassign）：從目前位置接續，不從頭
+   ═══════════════════════════════════════════ */
+
+run('reassign：整首自動播放播到一半改成指派聲部——已經過的音不重播、不補放，停在你的下一個起音等你按', () => {
+  const score = buildBeatScore({ p0: [0, 1, 2, 3, 4, 5], a1: [0, 1, 2, 3, 4, 5] });
+  const { hp, log, d } = makeHp(score, []);
+  d.tick(); d.runMs(1200);                                    // 播到拍 2.4（tick 1152）：拍 0、1、2 的音已響過
+  const before = count(log, 'on');
+  assert(before === 6, `前提：已經響了拍 0～2 的 6 顆音，實際 ${before}`);
+  hp.reassign(new Map([['p0', 1]]));
+  d.runMs(2000);
+  assert(count(log, 'on') === before, `改指派後沒按，已經過的音不重播、拍 3 以後的音要等你按，實際又多了 ${count(log, 'on') - before} 顆`);
+  assert(near(hp.getPositionTicks(), 1440, 1e-6), `播放頭停在你的下一個起音（拍 3＝tick 1440），實際 ${hp.getPositionTicks()}`);
+  const t = d.nowMs;
+  assert(d.press() === true, '之後照常放行');
+  assert(onMs(log, 43, 'human') === t && onMs(log, 55, 'assist') === t, '拍 3 的你的 43 與電腦的 55 同刻發聲');
+});
+
+run('reassign：指派聲部播到一半改成整首自動播放——從目前位置往下播完，每顆音恰好響一次', () => {
+  const score = buildBeatScore({ p0: [0, 1, 2, 3, 4], a1: [0, 1, 2, 3, 4] });
+  const { hp, log, d } = makeHp(score, [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press(); d.pressAt(t0 + 500); d.pressAt(t0 + 1000);       // 按到拍 2
+  d.runMs(200);
+  hp.reassign(new Map());
+  d.runMs(5000);
+  for (const n of [40, 41, 42, 43, 44, 52, 53, 54, 55, 56]) assert(count(log, 'on', n) === 1, `音 ${n} 恰好響一次，實際 ${count(log, 'on', n)}`);
+  assert(hp.isFinished() && hp._assignedSlots.size === 0, '改成自動播放後播完');
+  assert(log.filter((e) => e.t === 'on' && e.note >= 43 && e.note <= 44).every((e) => e.label === 'assist'), '改指派之後 p0 的音走電腦輔助軌');
+});
+
+run('reassign：前奏鎖在改指派之後仍有效（改成指派入場晚的聲部，播放頭還在前奏裡）', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [4, 5], a1: [0, 1, 2, 3, 4, 5] }), []);
+  d.tick(); d.runMs(300);
+  hp.reassign(new Map([['p0', 1]]));
+  assert(hp._hasPrelude === true, '改指派後重算前奏');
+  assert(d.press() === false, '前奏還沒播到你的入場點，按鍵不放行（只記預按）');
+  d.runMs(2000);
+  assert(onMs(log, 40, 'human') !== undefined, '預按過：播到入場點自動放行你的第一個起音');
+  assert(count(log, 'on', 52) === 1 && count(log, 'on', 55) === 1, '前奏的電腦音沒有因為改指派重播或丟掉');
+});
+
+run('reassign：debounce／速度歷史清掉但速度保留；改指派之後第一下按鍵不丟例外也不被擋', () => {
+  const { hp, d } = makeHp(buildBeatScore({ p0: [0, 1, 2, 3, 4], a1: [0, 1, 2, 3, 4] }), [['p0', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press(); d.pressAt(t0 + 400); d.pressAt(t0 + 800);
+  const rate = hp.playbackRate;
+  hp.reassign(new Map([['a1', 1]]));
+  assert(hp.playbackRate === rate, '速度估計保留');
+  d.runMs(100);
+  assert(d.press() === true, '改指派後的第一下放行');
+});
+
+run('reassign：播完之前改完，isFinished 正確（已過的音算已發聲，剩下的要全響完且收完）', () => {
+  const { hp, d } = makeHp(buildBeatScore({ p0: [0, 1, 2], a1: [0, 1, 2, 3, 4] }), [['p0', 1]]);
+  d.tick(); d.press(); d.runMs(100);
+  hp.reassign(new Map([['a1', 1]]));
+  assert(!hp.isFinished(), '改完還沒按完，不算播完');
+  for (let k = 0; k < 6; k++) { d.runMs(700); d.press(); }
+  d.runMs(3000);
+  assert(hp.isFinished(), '按完全部 driver 起音、剩下的都響完收完＝播完');
+});
+
+run('reassign：剛按下一個起音就改指派，那個 tick 的音已經響過，不會再放一次', () => {
+  const { hp, log, d } = makeHp(buildBeatScore({ p0: [0, 1, 2, 3], a1: [0, 1, 2, 3] }), [['p0', 1]]);
+  d.tick(); d.runMs(100);
+  d.press();                                                  // 拍 0 的 40 與 52 響了
+  hp.reassign(new Map());                                     // 播放頭還在拍 0 上（沒有 tick 隔開）
+  d.runMs(4000);
+  for (const n of [40, 41, 42, 43, 52, 53, 54, 55]) assert(count(log, 'on', n) === 1, `音 ${n} 恰好響一次，實際 ${count(log, 'on', n)}`);
+});
+
+run('reassign：你早按時留下、還沒發聲的電腦音，改指派後仍照原排定時刻放出來（不丟）', () => {
+  // 電腦的 60 在拍 0.9（排在 450ms 發聲）；第二下提早到 320ms（播放頭跳到拍 1），這時 60 還在佇列裡，改指派不能把它丟掉
+  const { hp, log, d } = makeHp(buildBeatScore({ me: [0, 1, 2, 3], cpu: [{ beat: 0.9, dur: 0.05, note: 60 }] }), [['me', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.pressAt(t0 + 320);
+  hp.reassign(new Map());
+  d.runMs(400);
+  assert(count(log, 'on', 60) === 1, `60 照排定時刻響一次，實際 ${count(log, 'on', 60)}`);
+  assert(near(onMs(log, 60, 'assist') - t0, 450, TICK_MS * 2), `60 在原排定的 450ms 發聲，實際 ${onMs(log, 60, 'assist') - t0}`);
+});
+
+run('reassign：沒有樂譜（load(null)）不丟例外', () => {
+  const hp = new Scheduler();
+  hp.load(null, []);
+  hp.reassign(new Map([['x', 1]]));
+});
+
+run('reassign 壓力測試：canon 實譜，在隨機時刻改指派（自動播放 ↔ 小提琴 ↔ 大提琴 ↔ 兩個都指派），每顆音最多響一次、最後播得完', () => {
+  const score = canonScore;
+  const [violin, cello] = [score.parts.find((p) => p.name === '小提琴').id, score.parts.find((p) => p.name === '大提琴').id];
+  const options = [[], [[violin, 'kb']], [[cello, 'kb']], [[violin, 'kb'], [cello, 'kb']]];
+  for (const seed of [3, 8, 21, 40]) {
+    let r = seed;
+    const rnd = () => { r = (r * 1103515245 + 12345) & 0x7fffffff; return r / 0x7fffffff; };
+    const { hp, log, d } = makeHp(score, options[Math.floor(rnd() * 4)]);
+    d.tick();
+    let guard = 0;
+    for (let k = 0; k < 4; k++) {
+      // 隨機走一段：有 driver 就隨機按幾下（被去抖擋掉就算了），沒有就讓它自己播
+      const end = d.nowMs + 1000 + rnd() * 9000;
+      while (d.nowMs < end && guard++ < 100000) {
+        d.runMs(60 + rnd() * 400);
+        if (hp._assignedSlots.size && rnd() < 0.7) hp.trigger('kb', d.nowMs);
+      }
+      hp.reassign(new Map(options[Math.floor(rnd() * 4)]));
+    }
+    // 收尾：有 driver 就一直按到放行完，等所有音響完
+    for (let k = 0; k < 5000 && !hp.isFinished(); k++) {
+      d.runMs(150);
+      if (hp._assignedSlots.size) hp.trigger('kb', d.nowMs);
+    }
+    assert(hp.isFinished(), `seed ${seed}：改指派之後最後要播得完`);
+    assert(count(log, 'on') <= score.notes.length, `seed ${seed}：noteOn 共 ${count(log, 'on')} 次，不能超過音符數 ${score.notes.length}（有音重複響）`);
+    assert(count(log, 'on') === count(log, 'off'), `seed ${seed}：每個 noteOn 一個 noteOff，實際 ${count(log, 'on')}／${count(log, 'off')}`);
+  }
+});
+
 console.log('\n全部測試跑完。');

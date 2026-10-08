@@ -179,19 +179,24 @@ function scanPerform(songs) {
    掃描 2.5：每個聲部單獨指派
    ═══════════════════════════════════════════ */
 
-// 每個有音符的 part（含打擊）單獨指派給演奏者 1、準時按完整首：不變量同 perform。證明「所有聲部都可以彈奏」。
+// 每個指派單位單獨指派給一位演奏者、準時按完整首：不變量同 perform。證明「所有聲部都可以彈奏」。
+// 指派單位跟畫面一致（midiPlayer.js 的 assignmentUnits）：通常一個 part 一個；只有一個 part 而它有 ≥ 2 個 staff 時，一個 staff 一個。
 function scanPerPart(songs) {
   const rows = [];
   for (const s of songs) {
-    for (const part of s.score.parts) {
+    const { parts } = s.score;
+    const units = parts.length === 1 && parts[0].staves.length >= 2
+      ? parts[0].staves.map((v, i) => ({ id: v.id, name: `${parts[0].name}・譜表 ${i + 1}`, noteCount: v.noteCount }))
+      : parts.map((p) => ({ id: p.id, name: p.name, noteCount: p.noteCount }));
+    for (const part of units) {
       if (!part.noteCount) continue;
       const presses = onsetPresses(driverSecs(s.score, [part.id]), { rnd: makeRng(5) });
       rows.push({ s, part, m: measure(simulate(s.score, [{ partIds: [part.id], presses, keepGoing: true }])) });
     }
   }
-  console.log(`\n=== 每個聲部單獨指派（準時按完整首），共 ${rows.length} 個聲部／${songs.length} 首 ===`);
+  console.log(`\n=== 每個指派單位單獨指派（準時按完整首），共 ${rows.length} 個單位／${songs.length} 首 ===`);
   const bad = rows.filter((r) => violations(r.m));
-  console.log(`不符合不變量：${bad.length} 個聲部`);
+  console.log(`不符合不變量：${bad.length} 個單位`);
   for (const r of bad.slice(0, 8)) console.log('  ✗', r.s.title, r.part.name, JSON.stringify(r.m));
   return bad.length;
 }

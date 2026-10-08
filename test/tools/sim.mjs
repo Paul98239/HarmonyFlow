@@ -146,10 +146,10 @@ export function rankedParts(score) {
   return score.parts.filter((p) => !p.staves.every((v) => v.percussionKit) && count.get(p.id)).sort((a, b) => count.get(b.id) - count.get(a.id));
 }
 
-// 這些聲部的起音（每個不同的 startTick 一次＝一個 driver segment）的樂譜秒數，由早到晚：按鍵時間表照這張排。
+// 這些聲部（part id，或單聲部多行譜時的 staff id）的起音（每個不同的 startTick 一次＝一個 driver segment）的樂譜秒數，由早到晚：按鍵時間表照這張排。
 export function driverSecs(score, partIds) {
   const ticks = new Set();
-  for (const n of score.notes) if (partIds.includes(n.partId)) ticks.add(n.startTick);
+  for (const n of score.notes) if (partIds.includes(n.partId) || partIds.includes(n.staffId)) ticks.add(n.startTick);
   return [...ticks].sort((a, b) => a - b).map((t) => score.midiTicksToSeconds(t));
 }
 

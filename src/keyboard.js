@@ -1,5 +1,5 @@
 // ============================================================
-//  keyboard.js — 鍵盤觸發：電腦鍵盤的四排字元鍵，每按一下＝演奏者 1 的一次觸發（放行全曲的下一個 segment，見 scheduler.js 的 trigger()）
+//  keyboard.js — 鍵盤觸發：電腦鍵盤的四排字元鍵，每按一下＝「PC 鍵盤手」的一次觸發（放行全曲的下一個 segment，見 scheduler.js 的 trigger()）
 //
 //  這裡只負責「哪些按鍵算觸發」與防呆，按下去之後的事（發聲、時值）全在排程器。不 import 任何其他模組。
 // ============================================================
@@ -13,7 +13,6 @@ const TRIGGER_CODES = new Set([
   ...'ASDFGHJKL'.split('').map((c) => `Key${c}`), 'Semicolon', 'Quote',
   ...'ZXCVBNM'.split('').map((c) => `Key${c}`), 'Comma', 'Period', 'Slash',
 ]);
-const KEYBOARD_SLOT = 1; // 目前只有一位演奏者（開發者）；一個人可以被指派多個聲部
 
 // 量測：鍵盤事件從瀏覽器產生，到我們的 handler 開始跑，在主執行緒佇列裡等了多久（毫秒）。主執行緒被影像算繪／姿勢推論
 // 卡住時這個值會變大——你的音雖然在 handler 內同步發聲，但 handler 本身晚了就等於音晚了。只留最近一批，避免無限成長。
@@ -27,9 +26,11 @@ const isTyping = (el) => !!el && (el.isContentEditable || el.tagName === 'TEXTAR
 
 /**
  * 掛上 keydown 監聽。每次有效按鍵在 keydown 事件裡同步呼叫 onTrigger(slot)（不經過計時器，發聲才不會晚）。
- * @param {(slot: number) => void} onTrigger
+ * slot 由呼叫端交進來（main.js 傳 scheduler.js 的 KEYBOARD_SLOT）：這個模組不 import 其他模組。一個人可以被指派多個聲部。
+ * @param {(slot: number|string) => void} onTrigger
+ * @param {number|string} slot  這個鍵盤代表的演奏者槽位
  */
-export function startKeyboardTrigger(onTrigger) {
+export function startKeyboardTrigger(onTrigger, slot) {
   window.addEventListener('keydown', (e) => {
     if (!TRIGGER_CODES.has(e.code)) return;
     if (e.repeat) return;                                // 按住不放的自動重複：一次按下只算一次
@@ -39,6 +40,6 @@ export function startKeyboardTrigger(onTrigger) {
     e.preventDefault();
     inputDelays.push(performance.now() - e.timeStamp); // e.timeStamp 跟 performance.now() 同一個時間原點（事件產生的時刻）
     if (inputDelays.length > INPUT_DELAY_MAX) inputDelays.shift();
-    onTrigger(KEYBOARD_SLOT);
+    onTrigger(slot);
   });
 }

@@ -243,6 +243,14 @@ export async function load(score, assignments) {
   isSongLoaded = true;
 }
 
+// 播放中（含暫停）改指派：不重新載入、不從頭，從目前位置接續（排程器的 reassign()）。歌曲需要的 port 變多就先補，補完 reset 過的
+// channel 由 reassign() 重送初始狀態。沒載入歌曲時不做事。
+export function reassign(score, assignments) {
+  if (!isSongLoaded) return;
+  ensurePorts(portsNeeded(score, assignments));
+  scheduler.reassign(assignments);
+}
+
 export async function play() {
   if (isProcessingPlay || !isSongLoaded) return;
   isProcessingPlay = true;

@@ -57,6 +57,9 @@ export const DEFAULT_SCHEDULER_CONFIG = Object.freeze({
 // synth.js 自己計數。
 export const CHANNELS_PER_PORT = 16;
 export const DEFAULT_PORTS = 4;
+// 鍵盤的演奏者槽位。肢體動作的槽位是數字 1~4（演奏者 ID），鍵盤用字串，兩者不衝突，日後可以並存。
+// 單一來源：midiPlayer.js 列在指派下拉的「PC 鍵盤手」、main.js 交給 keyboard.js 的觸發槽位都用它。
+export const KEYBOARD_SLOT = 'kb';
 
 /* ═══════════════════════════════════════════
    應用層常數——不是規格
@@ -156,14 +159,18 @@ function makeStaff(spec, slot, notes, kind, channel) {
   };
 }
 
+// 這個 staff 被指派給誰（槽位，沒有指派回 undefined）。指派的單位是 part，單聲部的多行譜（例如鋼琴一個 part 兩個 staff）
+// 也可以只指派其中一個 staff：staff id 的指派優先於 part id 的。
+const slotOfSpec = (assignments, spec) => assignments.get(spec.id) ?? assignments.get(spec.partId);
+
 // 這首歌至少需要幾個 port 的 channel（不低於 DEFAULT_PORTS）：旋律 staff 每個 port 有 15 個、打擊 staff 每種鼓組 program 佔一個
 // port 的打擊槽，指派與未指派兩個池子（兩個合成器）各自算，取較大的。assignments 同 load()：Map 或 [partId, 槽位][]。
 export function portsNeeded(score, assignments) {
   const assignMap = assignments instanceof Map ? assignments : new Map(assignments || []);
   const pools = [{ melodic: 0, kits: new Set() }, { melodic: 0, kits: new Set() }]; // [指派, 未指派]
   for (const part of score?.parts || []) {
-    const pool = pools[assignMap.has(part.id) ? 0 : 1];
     for (const spec of staffSpecsOf(part)) {
+      const pool = pools[slotOfSpec(assignMap, spec) !== undefined ? 0 : 1];
       if (spec.percussionKit) pool.kits.add(spec.program); else pool.melodic++;
     }
   }
@@ -187,7 +194,7 @@ function buildStaves(score, assignments, assistSynth, humanSynth, cfg, ports) {
 
   const assignedSpecs = [], assistSpecs = [];
   for (const part of score.parts) {
-    for (const spec of staffSpecsOf(part)) (assignments.has(part.id) ? assignedSpecs : assistSpecs).push(spec);
+    for (const spec of staffSpecsOf(part)) (slotOfSpec(assignments, spec) !== undefined ? assignedSpecs : assistSpecs).push(spec);
   }
 
   const { byStaffId: humanCh, unplaced: u1 } =
@@ -199,7 +206,7 @@ function buildStaves(score, assignments, assistSynth, humanSynth, cfg, ports) {
   for (const spec of assignedSpecs) {
     const channel = humanCh.get(spec.id);
     if (channel === undefined) continue;
-    staves.set(spec.id, makeStaff(spec, assignments.get(spec.partId), notesByStaff.get(spec.id) || [], 'human', channel));
+    staves.set(spec.id, makeStaff(spec, slotOfSpec(assignments, spec), notesByStaff.get(spec.id) || [], 'human', channel));
   }
   for (const spec of assistSpecs) {
     const channel = assistCh.get(spec.id);
@@ -356,6 +363,62 @@ export class Scheduler {
     } catch (err) { /* 初始音色設定失敗不致命 */ }
   }
 
+  /**
+   * 播放到一半改指派（或整首自動播放 ↔ 有人演奏）：從目前的播放位置接續，不從頭。
+   * 做法：量舊計畫的播放頭，算出「界線 boundary」→ 收掉還在響的音 → 依新的指派重建 staff 與計畫（同 load()）→ 起音在界線之前的音算已經過了
+   * （不重播、不補放，isFinished 才算得對）→ driver 游標指到第一個 >= 界線的起音 → 以現在的時鐘為界線重新錨定這一段（速度沿用）。
+   * 界線：舊計畫停格在你的下一個起音上（播放頭已走到它，還沒按）→ 那個起音的 tick（它的音還沒響）；否則是播放頭所在的 tick（含）
+   * ——剛按下一個起音、播放頭還在它上面時，那個 tick 的音已經響過，不能再放一次。
+   * 舊計畫排好、還沒發聲的電腦音（你早按時留下來的，起音在界線之前）若在新計畫仍是電腦聲部就保留（照原排定時刻放完，不丟）。
+   * 去抖與估速歷史清掉（舊的間隔對不上新的 driver 序列），速度估計保留；前奏鎖依新計畫重算（界線若還在新 driver 的第一個起音之前，
+   * 前奏鎖照常生效）。播放／暫停狀態不變。切換的瞬間還在響的音會被收掉、不重播；lookahead 已經提早送出、還沒響的電腦音取消不了，
+   * 若它的起音在界線之後，新計畫會再放一次（最多 LOOKAHEAD_MS 內的短暫重複）。
+   * @param {Map<string,number|string>|[string,number|string][]} assignments  同 load()
+   */
+  reassign(assignments) {
+    if (!this._score) return;
+    const score = this._score;
+    const rate = this.playbackRate;
+    const oldPending = this._pending;
+    const pos = this.getPositionTicks();
+    const next = this._driverSegs[this._segIndex];
+    // 播放頭是浮點數（秒 ↔ tick 換算有誤差）：比大小都留一個微小量，起音 tick 是整數
+    const boundary = next && pos >= next.ticks - 1e-6 ? next.ticks : pos + 1e-6;
+    this.silence();
+    this._staves = new Map();
+    this._driverSegs = []; this._driverTicks = []; this._followers = []; this._sliceFirst = [];
+    this._assignedSlots = new Set();
+    this._hasPrelude = false;
+    this._totalNotes = 0;
+    this.unplacedStaffIds = [];
+    this._createStaves(score, assignments);
+
+    // 舊計畫排好、還沒發聲、起音在界線之前的電腦音：新計畫裡那個 staff 還是電腦聲部就留著（換成新的 staff 物件，排定時刻不變）
+    const kept = [];
+    for (const p of oldPending) {
+      const staff = this._staves.get(p.staff.id);
+      if (staff && staff.kind === 'assist' && p.note.startTick < boundary) kept.push({ ...p, staff });
+    }
+    const keptNotes = new Set(kept.map((p) => p.note));
+    this._sounded.clear();
+    for (const staff of this._staves.values()) {
+      for (const note of staff.notes) if (note.startTick < boundary && !keptNotes.has(note)) this._sounded.add(note);
+    }
+    this._segIndex = this._driverTicks.findIndex((t) => t >= boundary);   // 第一個 >= 界線的 driver 起音；都在前面就是放完了
+    if (this._segIndex === -1) this._segIndex = this._driverTicks.length;
+    this._pending = kept;                                                // _anchorSlice 會把這一段的電腦音依時刻併進來
+    this._anchor = null;
+    this._anchoredSlice = -1;
+    this._preludeCredit = false;
+    this._history = [];
+    this._lastAcceptClock = null;
+    this._lastAttemptClock = null;
+    this._lastAttemptIntervalMs = Infinity;
+    this._lastTickMs = null;
+    // 這一段的編號＝已經放行的 driver 起音數；第 0 段（前奏）一律 1× 起算
+    this._anchorSlice(this._segIndex, this._clockMs, this._secOf(Math.max(0, boundary)), this._segIndex === 0 ? 1 : rate, boundary);
+  }
+
   play() {
     this._playing = true;
     // 第一個 tick 的 dt 是 0；暫停的時間不會算進時鐘（時鐘只在 tick() 前進），所以不用重設任何排好的時刻。
@@ -479,14 +542,16 @@ export class Scheduler {
   }
 
   // 啟動第 slice 段：記下錨點，把這一段的 follower 音各自排好發聲時刻（按下時刻 ＋ 樂譜秒差 ÷ 速度）與收音時刻（發聲時刻 ＋
-  // 音符原始時值 ÷ 速度），併進排程佇列（依 dueMs 排序）。上一段還沒放完的 follower 音留在佇列裡，照自己的時刻放完。
-  _anchorSlice(slice, clockMs, scoreSec, rate) {
+  // 音符原始時值，不換算；結尾對齊你某個起音的音在發聲時另外標 hold，見 _sound），併進排程佇列（依 dueMs 排序）。上一段還沒放完的 follower 音留在佇列裡，照自己的時刻放完。
+  // fromTick：熱切換指派（reassign）從中間接續時，這一段裡 startTick 在它之前的音已經過了，不排進佇列（不然會一次補放）。
+  _anchorSlice(slice, clockMs, scoreSec, rate, fromTick = -Infinity) {
     this._anchor = { slice, clockMs, scoreSec, rate };
     this._anchoredSlice = slice;
     const from = this._sliceFirst[slice], to = this._sliceFirst[slice + 1];
     const fresh = [];
     for (let i = from; i < to; i++) {
       const { staff, note } = this._followers[i];
+      if (note.startTick < fromTick) continue;
       const startSec = this._secOf(note.startTick);
       const dueMs = clockMs + ((startSec - scoreSec) * 1000) / rate;
       fresh.push({ dueMs, offMs: dueMs + (this._secOf(note.endTick) - startSec) * 1000, staff, note });   // 起音跟著你的速度，音長是檔案寫的長度

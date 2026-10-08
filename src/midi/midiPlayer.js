@@ -6,16 +6,17 @@
 //  與 render(snapshot)——render 只在值不同時寫 DOM。檔尾把三段合成一個區塊模組
 //  { actions, fields, inputs, mount, render } 給 layout.js。
 //
-//  對外（main.js）：startPlayer()、warmUpMidiEngine()、triggerSlot()、setPlayerCount()；
+//  對外（main.js）：startPlayer()、warmUpMidiEngine()、triggerSlot()、setPlayerCount()、KEYBOARD_SLOT；
 //  （layout.js）：playerStore 與檔尾的區塊模組。
 //
 //  選歌＝載入，播放鍵才是播放：選取本地檔案或雲端曲目之後，會立刻解析＋更新狀態
 //  （歌名／分譜清單），但不會啟動音源引擎；使用者按下播放鍵才會真的發出聲音。
-//  分譜的互動是「指派演奏者」：每個聲部一個下拉，選「演奏者 1~N」＝那個聲部交給那個追蹤 ID
-//  的真人，其餘沒指派的聲部由電腦輔助播放。改下拉只更新指派、不觸發任何播放——它會改動
-//  selectionSignature，下一次按頂端播放鍵時 playCurrentSource() 才用新的指派重新載入。
-//  指派是持久設定，不隨追蹤雜訊變動：下拉列「無／演奏者 1~N」，N ＝ 系統控制 bar 選的「現場人數」
-//  （playerCount，還沒選是 0 → 只有「無」），不因當下偵測到幾人而增減。
+//  分譜的互動是「指派演奏者」：每個指派單位一個下拉，選「PC 鍵盤手」或「演奏者 1~N」＝那個聲部交給那個人，其餘沒指派的
+//  聲部由電腦輔助播放。指派單位通常是 part（一個樂器）；只有一個 part 而它有多個譜表（鋼琴兩行譜）時改列 staff，讓你只彈其中一個譜表。
+//  改下拉不會重新載入：還沒播過就只更新指派，下一次按頂端播放鍵時 playCurrentSource() 依 selectionSignature 重新載入；
+//  播放中（含暫停）改指派則從目前位置接續（synth.reassign()），不從頭。
+//  指派是持久設定，不隨追蹤雜訊變動：下拉列「無／PC 鍵盤手／演奏者 1~N」，N ＝ 系統控制 bar 選的「現場人數」
+//  （playerCount，還沒選是 0 → 只有「無」和「PC 鍵盤手」；PC 鍵盤手不依賴現場人數），不因當下偵測到幾人而增減。
 //  演奏＝每次觸發（triggerSlot，目前來自鍵盤）放行「全曲的下一個 segment」（同一個 tick 上所有聲部的音），你的聲部與
 //  電腦輔助的聲部在同一次呼叫內一起發聲（見 scheduler.js）；指派只決定哪些聲部走真人合成器、哪些演奏者有資格觸發。
 //  完全沒有人指派時整份照時間連續自動播放。
@@ -30,6 +31,9 @@ import { Store, rafThrottle } from '../ui.js';
 import * as synth from './synth.js';
 import { parseMidi } from './midiParser.js';
 import { downloadMidiFile, fetchCategories, searchSongs } from './midiApi.js';
+import { KEYBOARD_SLOT } from './scheduler.js';
+
+export { KEYBOARD_SLOT };   // main.js 交給 keyboard.js 的觸發槽位
 
 /* ═══════════════════════════════════════════
    🕒 共用小工具
@@ -68,8 +72,8 @@ const LOADING_INDICATOR_DELAY_MS = 120; // 按播放後延遲這麼久才顯示 
  * @property {boolean} finished          播完了（演奏：＝模組變數 endHandled 的鏡射；試聽：官方回報 isFinished）；此時 ▶ 從頭播
  * @property {boolean} busy              載入／續播／重播／進入試聽處理中（＝isSongLoading；播放列按鈕立刻全灰）
  * @property {object | null} score       parseMidi() 的結果；null ＝ 沒有分譜資訊（單軌或解析失敗）
- * @property {object[]} parts            score.parts；長度 > 1 才顯示分譜區塊
- * @property {Map<string, number>} assignments partId → 演奏者 ID；改動時換新 Map
+ * @property {object[]} parts            score.parts；沒有聲部（長度 0）才不顯示分譜區塊
+ * @property {Map<string, number|string>} assignments 指派單位 id（part id，或單聲部多行譜時的 staff id）→ 演奏者槽位（1~4 或 KEYBOARD_SLOT）；改動時換新 Map
  * @property {number} playerCount        系統控制 bar 選的「現場人數」；0 ＝ 還沒選
  * @property {number} positionSeconds    目前播放位置（演奏：樂譜原始秒數，同 note.startSeconds 座標系；試聽：官方 currentTime）；
  *                                       頂端進度條唯讀顯示用，沒有任何 seek 路徑會寫它
@@ -113,23 +117,31 @@ function sourceIdentity(source) {
 }
 
 // 分譜狀態的簽章：沒有分譜資訊、或沒有任何指派 → 固定值 'ALL'（整份當電腦輔助聲部自動播放）；
-// 有指派就用排序後的「聲部=演奏者ID」對組成簽章，任一項不同都要重新 synth.load()。
+// 有指派就用排序後的「指派單位=演奏者」對組成簽章，任一項不同都要重新 synth.load()。
 function selectionSignature(score, assignments) {
-  if (!score || score.parts.length <= 1 || assignments.size === 0) return 'ALL';
+  if (!score || assignments.size === 0) return 'ALL';
   return 'assign:' + [...assignments.entries()]
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0))
     .map(([p, id]) => `${p}=${id}`).join(',');
 }
 
-const allPartIds = () => playerStore.state.parts.map((p) => p.id);
-// 目前確實存在於 score 又被指派出去的聲部 id。
-const assignedPartIds = () => allPartIds().filter((id) => playerStore.state.assignments.has(id));
+// 指派單位：通常一個 part 一個；只有一個 part 而它有 ≥ 2 個 staff（鋼琴兩行譜）時改成一個 staff 一個，讓你只彈其中一個譜表。
+// 多聲部的歌先以樂器（part）為單位。id 是 part id（p…）或 staff id（t…c…），scheduler 兩種都認（staff 優先）。
+export function assignmentUnits(parts) {
+  if (parts.length === 1 && parts[0].staves?.length >= 2) {
+    return parts[0].staves.map((staff, i) => ({ id: staff.id, name: `${parts[0].name}・譜表 ${i + 1}` }));
+  }
+  return parts.map((part) => ({ id: part.id, name: part.name }));
+}
+const allUnitIds = () => assignmentUnits(playerStore.state.parts).map((u) => u.id);
+// 目前確實存在於 score 又被指派出去的單位 id。
+const assignedUnitIds = () => allUnitIds().filter((id) => playerStore.state.assignments.has(id));
 /* ═══════════════════════════════════════════
    觸發與 humanGate
    ═══════════════════════════════════════════ */
 // humanGain 總開關該不該開：播放中、沒播完、且真的有指派。
 const updateHumanGate = () => {
-  const armed = synth.isLoaded() && !synth.isPaused() && !endHandled && assignedPartIds().length > 0;
+  const armed = synth.isLoaded() && !synth.isPaused() && !endHandled && assignedUnitIds().length > 0;
   synth.setHumanGate(armed);
 };
 
@@ -389,25 +401,43 @@ async function playPreview({ fromStart = false } = {}) {
 /* ═══════════════════════════════════════════
    指派／人數
    ═══════════════════════════════════════════ */
-// 指派演奏者下拉：更新 assignments，不觸發播放。新的指派會在下一次按頂端播放鍵時經簽章比對重新載入；
-// 播放中改指派則維持舊組合，暫停再播放即換成新組合。
-function assignPart(partId, slot) {
-  const n = Number(slot);
+// 下拉的值 → 槽位：'kb' 是 PC 鍵盤手（不看現場人數）；數字要在 1~現場人數 之內；空字串／不合法＝沒有指派（null）。
+function slotOfOption(value) {
+  if (value === KEYBOARD_SLOT) return KEYBOARD_SLOT;
+  const n = Number(value);
+  return Number.isInteger(n) && n >= 1 && n <= playerStore.state.playerCount ? n : null;
+}
+
+// 播放中（含暫停）改指派：不重新載入、不從頭，從目前位置接續。還沒播過、播完、試聽中、處理中，或沒有引擎裡的歌，就維持
+// 「下一次按頂端播放鍵時依簽章重新載入」。
+function reassignInPlace() {
+  const s = playerStore.state;
+  if (lastPlayedSignature === null || s.mode !== 'perform' || isSongLoading || endHandled || !s.source || !s.score) return;
+  synth.reassign(s.score, [...s.assignments]);   // 傳快照（[單位 id, 槽位][]），跟 synth.load() 一樣
+  lastPlayedSignature = buildPlaybackSignature(s.source);
+}
+
+// 指派演奏者下拉：更新 assignments。順序不拘——什麼時候改都即時處理（播放中從目前位置接續，否則下次 ▶ 重新載入）。
+function assignPart(unitId, value) {
+  const slot = slotOfOption(value);
   const assignments = new Map(playerStore.state.assignments);
-  if (n >= 1 && n <= playerStore.state.playerCount) assignments.set(partId, n);
-  else assignments.delete(partId);
+  if (slot !== null) assignments.set(unitId, slot);
+  else assignments.delete(unitId);
   playerStore.set({ assignments });
+  reassignInPlace();
   updateHumanGate(); // 指派全清時 humanGain 立即收掉
 }
 
 // 系統控制 bar 「現場人數」切換成功後（main.js 經 vision 的 setPoseCountListener 接上）：下拉改列 1~n，
-// 超出範圍的指派剪掉。跟改指派一樣不觸發播放——下次按頂端播放鍵才重載。
+// 超出範圍的演奏者指派剪掉（PC 鍵盤手不受影響）。被剪掉的指派跟改指派一樣即時處理。
 export function setPlayerCount(n) {
   const next = Math.max(0, Math.min(PLAYER_COUNT, Number(n) || 0));
   const s = playerStore.state;
   if (next === s.playerCount) return;
-  const assignments = new Map([...s.assignments].filter(([, id]) => id <= next));
+  const kept = [...s.assignments].filter(([, id]) => id === KEYBOARD_SLOT || id <= next);
+  const assignments = new Map(kept);
   playerStore.set({ playerCount: next, assignments });
+  if (kept.length !== s.assignments.size) reassignInPlace();
   updateHumanGate();
 }
 
@@ -711,7 +741,7 @@ function renderLibraryPicker({ player }) {
 /* ═══════════════════════════════════════════
    🎼 畫面 3／3：選歌面板的本地檔案／分譜清單（指派演奏者 ID）
    ═══════════════════════════════════════════ */
-// 分譜清單每一列就是「聲部名（GM 音色的繁體中文名）＋一個下拉（無／演奏者 1~N）」，由 index.html 的
+// 分譜清單每一列就是「聲部名（GM 音色的繁體中文名；單聲部多行譜是「聲部名・譜表 N」）＋一個下拉（無／PC 鍵盤手／演奏者 1~N）」，由 index.html 的
 // <template id="tpl-part-row"> clone，聲部名用 textContent 填（來自檔案內容，不當 HTML）。列只在 parts 參照或
 // playerCount 變了才重建，每次 render 都校正各下拉的值與 is-mine。ID 只是槽位編號的顯示提示，畫面上不額外
 // 標示在不在場——指派本身留著，不隨追蹤雜訊變動。
@@ -731,15 +761,15 @@ const songPanelFields = {
   'part-assign': (el) => assignPart(el.dataset.partId, el.value),
 };
 
-function buildPartRow(part, playerCount) {
+function buildPartRow(unit, playerCount) {
   const row = partRowTemplate.content.firstElementChild.cloneNode(true);
-  row.dataset.partId = part.id;
+  row.dataset.partId = unit.id;
   const name = row.querySelector('.score-part-name');
-  name.textContent = part.name;
-  name.title = part.name;
+  name.textContent = unit.name;
+  name.title = unit.name;
   const select = row.querySelector('.score-part-id');
-  select.dataset.partId = part.id;
-  select.append(new Option('無', ''));
+  select.dataset.partId = unit.id;
+  select.append(new Option('無', ''), new Option('PC 鍵盤手', KEYBOARD_SLOT));
   for (let n = 1; n <= playerCount; n++) select.append(new Option(`演奏者 ${n}`, String(n)));
   return row;
 }
@@ -762,20 +792,20 @@ function renderSongPanel({ player }) {
   // 來源不是本地檔案（雲端曲目、取消、格式不支援）就把檔案輸入清掉，同一個檔案才能再次觸發 change。
   if (!isLocal && localInput.value) localInput.value = '';
 
-  scorePartSection.hidden = player.parts.length <= 1;
+  scorePartSection.hidden = player.parts.length === 0;
   const text = infoText(player);
   if (scoreInfoText.textContent !== text) scoreInfoText.textContent = text;
 
   if (player.parts !== renderedParts || player.playerCount !== renderedPlayerCount) {
     renderedParts = player.parts;
     renderedPlayerCount = player.playerCount;
-    scorePartList.replaceChildren(...player.parts.map((part) => buildPartRow(part, player.playerCount)));
+    scorePartList.replaceChildren(...assignmentUnits(player.parts).map((unit) => buildPartRow(unit, player.playerCount)));
   }
   for (const sel of scorePartList.querySelectorAll('.score-part-id')) {
-    const assigned = player.assignments.get(sel.dataset.partId) || 0;
-    const value = assigned ? String(assigned) : '';
+    const assigned = player.assignments.get(sel.dataset.partId);   // 1~4、KEYBOARD_SLOT 或 undefined
+    const value = assigned === undefined ? '' : String(assigned);
     if (sel.value !== value) sel.value = value;
-    sel.closest('.score-part-row').classList.toggle('is-mine', assigned > 0);
+    sel.closest('.score-part-row').classList.toggle('is-mine', assigned !== undefined);
   }
 }
 

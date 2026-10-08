@@ -99,7 +99,7 @@
         </div>
         <div class="tl-widget">
           <button id="song-toggle" class="btn tl-trigger" type="button" data-action="toggle-panel" data-panel="song">選歌</button>
-          <!-- 選歌面板：選曲＋分譜。#scorePartSection 預設隱藏，只有選到的 MIDI 被偵測出一個以上聲部時才浮現。
+          <!-- 選歌面板：選曲＋分譜。#scorePartSection 預設隱藏，選到的 MIDI 有任何聲部時才浮現（單聲部也能指派給 PC 鍵盤手）。
                .tl-scroll 是面板內真正捲動的那一層；✕ 是外殼的 absolute 子元素，不會跟著內容捲走。 -->
           <div id="panel-song" class="tl-popup" hidden>
             <button class="btn tl-close" type="button" data-action="close-panel" aria-label="關閉">✕</button>
@@ -142,7 +142,7 @@
     </div>
   </div>
 
-  <!-- 分譜清單的一列：聲部名（GM 繁中音色名）＋「指派演奏者」下拉（無／演奏者 1~N，N ＝ 現場人數）。
+  <!-- 分譜清單的一列：聲部名（GM 繁中音色名）＋「指派演奏者」下拉（無／PC 鍵盤手／演奏者 1~N，N ＝ 現場人數）。
        src/midi/midiPlayer.js clone 這個 template，用 textContent 填名字、new Option 填選項。 -->
   <template id="tpl-part-row">
     <div class="score-part-row">

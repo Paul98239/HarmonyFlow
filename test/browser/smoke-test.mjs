@@ -130,7 +130,7 @@ const positionSeconds = (page) => page.evaluate(async () => {
   const { scheduler } = await import('/src/midi/synth.js');
   return scheduler._score ? scheduler._score.midiTicksToSeconds(scheduler.getPositionTicks()) : 0;
 });
-// 演奏有指派聲部時，播放頭只在觸發時往前（每放行一個 segment 就跳到它的 tick）：這裡按觸發鍵（演奏者 1，真實的鍵盤路徑）一下一下
+// 演奏有指派聲部時，播放頭只在觸發時往前（每放行一個 segment 就跳到它的 tick）：這裡按觸發鍵（PC 鍵盤手，真實的鍵盤路徑）一下一下
 // 把進度推到超過 seconds 才回傳（逾時或按了 400 下就回傳目前的值，讓後面的斷言報出實際數字）。
 async function waitForPositionAbove(page, seconds, timeoutMs = 30000) {
   const deadline = Date.now() + timeoutMs;
@@ -420,7 +420,7 @@ async function checkChannelGrowth(page, problems) {
   }
 }
 
-// 選人數 → 開選歌面板 → 上傳本地樣本 MIDI → 等分譜列出來 → （試聽基本操作）→ 把第一個聲部指派給演奏者 1
+// 選人數 → 開選歌面板 → 上傳本地樣本 MIDI → 等分譜列出來 → （試聽基本操作）→ 把第一個聲部指派給 PC 鍵盤手
 // → 按播放 → 暫停 → 重播，沿途逐一斷言四顆鈕的狀態。跟真實使用者操作路徑一致（見 index.html 的
 // data-field／data-action），不繞過 UI 直接呼叫內部函式（只有「載入中」「播完」兩種難以自然走到的狀態例外）。
 async function driveAppToPlaying(page, problems) {
@@ -446,9 +446,8 @@ async function driveAppToPlaying(page, problems) {
   await checkAudioLatencyStats(page, problems);
   await loadLocalFile(page, { name: 'canon-violin-cello.mid', mimeType: 'audio/midi', buffer: readFileSync(SAMPLE_MIDI) }); // 換回範例樂譜，後面的流程照舊
 
-  console.log('▶ 把第一個聲部指派給演奏者 1…');
-  // 下拉要等姿勢模型（landmarker）建好、現場人數生效才列出「演奏者 1」：模型是懶惰載入，慢的機器上要 40 秒以上，超過 Playwright 預設的 30 秒
-  await page.locator('.score-part-id').first().selectOption('1', { timeout: 120000 });
+  console.log('▶ 把第一個聲部指派給 PC 鍵盤手…');
+  await page.locator('.score-part-id').first().selectOption('kb');   // PC 鍵盤手不依賴現場人數（不必等姿勢模型）
 
   console.log('▶ 按下播放…');
   await page.click('#btnPlay');
@@ -480,7 +479,7 @@ async function driveAppToPlaying(page, problems) {
   if (!finOk) problems.push(`播完後按 ▶ 沒有從頭播：${beforeFinishedPlay.toFixed(2)}s → ${afterFinishedPlay.toFixed(2)}s`);
 }
 
-// 鍵盤觸發（接在 driveAppToPlaying 後面，此時演奏播放中、第一個聲部指派給演奏者 1）：觀察點是排程器的 driver segment 游標
+// 鍵盤觸發（接在 driveAppToPlaying 後面，此時演奏播放中、第一個聲部指派給 PC 鍵盤手）：觀察點是排程器的 driver segment 游標
 // （segIndex＝已放行的 driver segment 數）。trigger() 在 keydown 事件裡同步執行，按鍵送出之後游標立刻就變了，不用等排程 tick——
 // 所以讀取前不需要任何等待。但兩次有效按鍵之間要隔過去抖窗口（最長 500ms，見 pressTiming.js），預期「被放行」的按鍵前先
 // waitDebounce()，不然會被當成手抖忽略。等的是「排程器時鐘」走過窗口，不是真實時間：headless 同時跑姿勢推論時排程器時鐘只有真實時間的三成左右。
@@ -489,7 +488,7 @@ const waitDebounce = (page) => page.waitForFunction(() => {
   return sch._lastAcceptClock == null || sch._clockMs - sch._lastAcceptClock >= 600;
 }, null, { timeout: 120000 });
 async function driveKeyboardTrigger(page, problems) {
-  console.log('▶ 鍵盤觸發：四排字元鍵＝演奏者 1 放行全曲的下一個 segment，防呆（repeat／組合鍵／打字／下拉 type-ahead）…');
+  console.log('▶ 鍵盤觸發：四排字元鍵＝PC 鍵盤手放行全曲的下一個 segment，防呆（repeat／組合鍵／打字／下拉 type-ahead）…');
   const slot = () => page.evaluate(() => {
     const sch = window.__hf.synth.scheduler;
     const sounding = [...sch._staves.values()].some((v) => v.sounding.size > 0);
@@ -498,7 +497,7 @@ async function driveKeyboardTrigger(page, problems) {
   });
   await page.evaluate(() => document.activeElement?.blur());
 
-  // 前奏鎖：範例樂譜是卡農，第一個聲部（小提琴，目前指派給演奏者 1）要等大提琴先進的前奏播完（約 14 秒）才入場，
+  // 前奏鎖：範例樂譜是卡農，第一個聲部（小提琴，目前指派給 PC 鍵盤手）要等大提琴先進的前奏播完（約 14 秒）才入場，
   // ▶ 之後馬上按不能放行（放行就會跳過大提琴的前奏）；只記成預按。
   let s = await slot();
   check(s.seg === 0, '按鍵之前：還沒有任何 driver segment 被放行', problems, JSON.stringify(s));
@@ -510,7 +509,7 @@ async function driveKeyboardTrigger(page, problems) {
   await page.click('#btnPause');
   await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
   await page.locator('.score-part-id').nth(0).selectOption('');
-  await page.locator('.score-part-id').nth(1).selectOption('1');
+  await page.locator('.score-part-id').nth(1).selectOption('kb');
   await page.click('#btnReplay');
   await page.waitForSelector('#btnPause.is-current', { timeout: 15000 });
   await page.evaluate(() => document.activeElement?.blur());
@@ -599,11 +598,11 @@ async function driveKeyboardTrigger(page, problems) {
   const stats = await page.evaluate(() => window.__stats());
   check(stats.按鍵事件等待ms.count > 0 && stats.按鍵事件等待ms.max >= 0 && typeof stats.電腦音遲到ms.count === 'number', 'window.__stats()：鍵盤事件等待時間有記錄、電腦音遲到量可讀', problems, JSON.stringify(stats));
 
-  // 換回原本的指派（第一個聲部給演奏者 1），後面的測試照舊
+  // 換回原本的指派（第一個聲部給 PC 鍵盤手），後面的測試照舊
   await page.click('#btnPause');
   await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
   await page.locator('.score-part-id').nth(1).selectOption('');
-  await page.locator('.score-part-id').nth(0).selectOption('1');
+  await page.locator('.score-part-id').nth(0).selectOption('kb');
   await page.click('#btnReplay');
   await page.waitForSelector('#btnPause.is-current', { timeout: 15000 });
 }
@@ -623,7 +622,7 @@ async function drivePreviewVsPerformance(page, problems) {
   check(perfPos > 0.3 && posAfter === 0, '進入試聽＝演奏進度歸零（排程器已停）', problems, `${perfPos.toFixed(2)}s → ${posAfter.toFixed(2)}s`);
 
   console.log('▶ 試聽中按觸發鍵、改指派…');
-  // 此時演奏者 1 還指派著第一個聲部：若按鍵沒被忽略，排程器會放行音（試聽中排程器已停，不該有任何反應）
+  // 此時 PC 鍵盤手還指派著第一個聲部：若按鍵沒被忽略，排程器會放行音（試聽中排程器已停，不該有任何反應）
   await page.keyboard.press('KeyF');
   const tA = await previewTime(page);
   await page.waitForTimeout(500);
@@ -648,6 +647,114 @@ async function drivePreviewVsPerformance(page, problems) {
   check(pos > 0.3, '離開試聽後 ▶ 重新載入，演奏從頭開始往前走', problems, `${pos.toFixed(2)}s`);
   await page.click('#btnPause');
   await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+}
+
+// 單聲部、兩個譜表的 MIDI（鋼琴兩行譜：同名兩條軌、上行譜有初始化區塊，MuseScore 的佈局）：parser 切成 1 個 part、2 個 staff。
+function makePianoTwoStaffMidi() {
+  const u32 = (n) => [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+  const vlq = (n) => { const b = [n & 0x7f]; n >>>= 7; while (n > 0) { b.unshift((n & 0x7f) | 0x80); n >>>= 7; } return b; };
+  const track = (events) => {
+    const body = events.flatMap((e) => [...vlq(e.d), ...e.b]).concat([...vlq(0), 0xff, 0x2f, 0x00]);
+    return [0x4d, 0x54, 0x72, 0x6b, ...u32(body.length), ...body];
+  };
+  const enc = new TextEncoder();
+  const nameEv = (s) => { const b = [...enc.encode(s)]; return { d: 0, b: [0xff, 0x03, b.length, ...b] }; };
+  const cc = (c, n, v) => ({ d: 0, b: [0xb0 | c, n, v] });
+  const init = [cc(0, 121, 0), { d: 0, b: [0xc0, 0] }, cc(0, 7, 100), cc(0, 10, 64), cc(0, 91, 0), cc(0, 93, 0)];
+  const notes = (pitches) => pitches.flatMap((p, i) => [{ d: i === 0 ? 0 : 1, b: [0x90, p, 90] }, { d: 479, b: [0x80, p, 0] }]);
+  const tracks = [
+    track([nameEv('Piano'), { d: 0, b: [0xff, 0x51, 3, 0x07, 0xa1, 0x20] }, ...init, ...notes([72, 74, 76, 77, 79, 81, 83, 84])]),
+    track([nameEv('Piano'), ...notes([48, 50, 52, 53, 55, 57, 59, 60])]),
+  ];
+  return Buffer.from([0x4d, 0x54, 0x68, 0x64, ...u32(6), 0, 1, 0, tracks.length, 0x01, 0xe0, ...tracks.flat()]);
+}
+const PIANO_MIDI = { name: 'piano-two-staves.mid', mimeType: 'audio/midi', buffer: makePianoTwoStaffMidi() };
+
+// 指派：單聲部也能指派（下拉有「PC 鍵盤手」）、單聲部多行譜改列譜表、指派到譜表、播放中（含改成別的聲部）從目前位置接續而不是從頭。
+const partRows = (page) => page.evaluate(() => ({
+  hidden: document.getElementById('scorePartSection').hidden,
+  rows: [...document.querySelectorAll('#scorePartList .score-part-row')].map((r) => ({
+    name: r.querySelector('.score-part-name').textContent,
+    options: [...r.querySelectorAll('option')].map((o) => o.textContent),
+  })),
+}));
+async function driveAssignmentUnits(page, problems) {
+  console.log('▶ 指派單位：單聲部也能指派；單聲部多行譜列出譜表；播放中改指派從目前位置接續…');
+  await page.evaluate(() => document.activeElement?.blur());
+
+  // 「演奏者 1」要等姿勢模型（landmarker，懶惰載入，慢的機器上要 40 秒以上）建好、現場人數生效才列出來
+  await page.waitForFunction(() => window.__hf.store.state.playerCount === 1, null, { timeout: 120000 });
+  await loadLocalFile(page, TINY_MIDI);
+  let r = await partRows(page);
+  check(!r.hidden && r.rows.length === 1 && r.rows[0].options.join() === '無,PC 鍵盤手,演奏者 1', '單聲部的歌也列出指派下拉（無／PC 鍵盤手／演奏者 1）', problems, JSON.stringify(r));
+
+  await loadLocalFile(page, PIANO_MIDI);
+  r = await partRows(page);
+  check(r.rows.length === 2 && r.rows[0].name.endsWith('譜表 1') && r.rows[1].name.endsWith('譜表 2'), '單聲部的多行譜（鋼琴兩行）改列兩個譜表', problems, JSON.stringify(r));
+  await page.locator('.score-part-id').nth(0).selectOption('kb');   // 不用先選現場人數也列得出「PC 鍵盤手」
+  await page.click('#btnPlay');
+  await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
+  await page.keyboard.press('KeyF');
+  const staffKinds = await page.evaluate(() => [...window.__hf.synth.scheduler._staves.values()].map((v) => `${v.id}:${v.kind}`).sort().join());
+  const seg = await page.evaluate(() => window.__hf.synth.scheduler._segIndex);
+  check(seg === 1 && /:human/.test(staffKinds) && /:assist/.test(staffKinds), '只指派上行譜：它走真人軌、下行譜走電腦輔助，按鍵放行一個 segment', problems, `${staffKinds} seg ${seg}`);
+  await page.click('#btnPause');
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+
+  // 播放中改指派：canon 指派大提琴（沒有前奏）→ 推進 → 改成不指派 → 改成指派小提琴；每次都不重新載入、不從頭
+  await loadLocalFile(page, { name: 'canon-violin-cello.mid', mimeType: 'audio/midi', buffer: readFileSync(SAMPLE_MIDI) });
+  await page.locator('.score-part-id').nth(1).selectOption('kb');
+  await page.click('#btnPlay');
+  await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
+  const before = await waitForPositionAbove(page, 1);
+  await page.locator('.score-part-id').nth(1).selectOption('');
+  await page.waitForTimeout(100);
+  let st = await page.evaluate(() => ({ pos: window.__hf.synth.scheduler.getPositionTicks(), playing: window.__hf.synth.scheduler.isPlaying(), slots: window.__hf.synth.scheduler._assignedSlots.size, busy: window.__hf.store.state.busy, transport: window.__hf.store.state.transport }));
+  const sec = (ticks) => page.evaluate((t) => window.__hf.synth.scheduler._score.midiTicksToSeconds(t), ticks);
+  let after = await sec(st.pos);
+  check(st.playing && st.transport === 'playing' && st.slots === 0 && after >= before - 0.3 && after < before + 3, '播放中把大提琴改成「無」：沒有重新載入、從目前位置（約 ' + before.toFixed(1) + 's）接續自動播放', problems, JSON.stringify({ ...st, before, after }));
+  await page.locator('.score-part-id').nth(0).selectOption('kb');
+  await page.waitForTimeout(100);
+  st = await page.evaluate(() => ({ pos: window.__hf.synth.scheduler.getPositionTicks(), playing: window.__hf.synth.scheduler.isPlaying(), slots: [...window.__hf.synth.scheduler._assignedSlots].join(), transport: window.__hf.store.state.transport }));
+  after = await sec(st.pos);
+  check(st.playing && st.transport === 'playing' && st.slots === 'kb' && after >= before - 0.3, '播放中再把小提琴改成「PC 鍵盤手」：仍在播放、位置沒有回到開頭', problems, JSON.stringify({ ...st, before, after }));
+  await page.locator('.score-part-id').nth(0).selectOption('');
+  await page.click('#btnPause');
+  await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
+}
+
+// 不先選現場人數、不碰攝影機：另開頁面，載入單聲部的歌，下拉只有「無／PC 鍵盤手」，指派給 PC 鍵盤手後 ▶ 、按鍵就放行。
+async function driveKeyboardWithoutPoseCount(browser, problems) {
+  console.log('▶ 沒選現場人數：單聲部的歌指派給 PC 鍵盤手，▶ 後按鍵放行（另開頁面）…');
+  const page = await browser.newPage();
+  const stray = [];
+  page.on('console', (msg) => {
+    const text = msg.text();
+    if (isBenign(text)) return;
+    if (msg.type() === 'error' || msg.type() === 'warning') stray.push(`console.${msg.type()}: ${text}`);
+  });
+  page.on('pageerror', (err) => stray.push(`pageerror: ${err.message}`));
+  try {
+    await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'load' });
+    await page.waitForFunction(() => !document.getElementById('app-shell')?.inert, { timeout: 30000 });
+    await exposeModules(page);
+    await page.click('#song-toggle');   // 選歌面板預設是收起來的
+    await page.setInputFiles('#localMidiInput', TINY_MIDI);
+    await page.waitForSelector('.score-part-id', { timeout: 10000 });
+    const r = await partRows(page);
+    check(!r.hidden && r.rows.length === 1 && r.rows[0].options.join() === '無,PC 鍵盤手', '還沒選現場人數：下拉只有「無／PC 鍵盤手」', problems, JSON.stringify(r));
+    await page.locator('.score-part-id').first().selectOption('kb');
+    await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 10000 });
+    await page.click('#btnPlay');
+    await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });
+    await page.evaluate(() => document.activeElement?.blur());
+    await page.keyboard.press('KeyF');
+    const seg = await page.evaluate(() => window.__hf.synth.scheduler._segIndex);
+    check(seg === 1, '不必先選現場人數：PC 鍵盤手按鍵放行唯一的 driver segment', problems, `seg ${seg}`);
+  } finally {
+    await page.close();
+  }
+  check(stray.length === 0, '沒選現場人數的頁面沒有預期之外的 console error／warning／pageerror', problems, stray.join('；'));
 }
 
 // 試聽播完：載入最小 MIDI（單音 2 秒）→ ♪ → 官方回報播完、uiTick 偵測到 → 「播完」狀態（▶ 從頭、↻ 可按、
@@ -887,7 +994,9 @@ async function main() {
     await drivePreviewRaces(page, problems);
     await drivePreviewBadBytes(page, problems);
     await driveTransportTable(page, problems);
+    await driveAssignmentUnits(page, problems);
     await drivePreviewEngineFailure(browser, problems);
+    await driveKeyboardWithoutPoseCount(browser, problems);
 
     console.log(`▶ 靜置觀察 ${args.duration}ms，收集 console 訊息…`);
     await page.waitForTimeout(args.duration);

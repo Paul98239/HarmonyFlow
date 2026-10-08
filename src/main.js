@@ -48,8 +48,8 @@ async function bootSystem() {
     midiPlayer.warmUpMidiEngine(),
   ]);
 
-  // 觸發來源目前是鍵盤（演奏者 1，每按一下放行全曲的下一個 segment）：揮手暫時關閉，vision.js 的手勢狀態不接進播放器。
-  startKeyboardTrigger(midiPlayer.triggerSlot);
+  // 觸發來源目前是鍵盤（分譜下拉的「PC 鍵盤手」，每按一下放行全曲的下一個 segment）：揮手暫時關閉，vision.js 的手勢狀態不接進播放器。
+  startKeyboardTrigger(midiPlayer.triggerSlot, midiPlayer.KEYBOARD_SLOT);
 
   // 視覺初始化失敗時錯誤畫面已經顯示，載入畫面不收、inert 也維持
   if (!visionOk) return;
