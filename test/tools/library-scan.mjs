@@ -1,7 +1,7 @@
 // ============================================================
 //  library-scan.mjs — 曲庫全掃：用整個遠端 MIDI 曲庫驗證排程器（手動執行，不進 CI，純 Node）
 //
-//  四種掃描（--only=parse,autoplay,perform,scenarios，預設全跑）：
+//  五種掃描（--only=parse,autoplay,perform,perpart,scenarios，預設全跑）：
 //    parse      每首歌解析與聲部切分：沒有例外、至少 1 個 part、每個 staff 都分得到輸出 channel、警告分類統計、
 //               多聲部（可指派）的歌有幾首；〈蝸牛與黃鸝鳥〉必須切成「長笛、大鋼琴」（使用者用原始 MuseScore 檔確認過的金標準）；
 //               另外印出按鍵負擔：只有被指派的聲部要按（這裡取音符最多的聲部），每首歌要按幾下、原速下每秒要按幾下。
@@ -10,6 +10,7 @@
 //    perform    多聲部歌曲 × 5 種按鍵風格（準時／快 20％／快 3 倍＋抖動／慢 25％＋抖動／慢 2 倍＋抖動），指派音符最多的聲部：
 //               你的每個起音都放行、你的每顆音在按鍵當下發聲（0ms）、電腦聲部不用按而且一顆不丟、每個 noteOn 一個 noteOff、
 //               同一個 tick 的音（你的與電腦的）同刻（差 0ms）——任何按鍵速度都成立，沒有放寬的選項。被去抖擋掉的按鍵會重按。
+//    perpart    每個聲部（part）單獨指派給一位演奏者、準時按完整首：任何一個聲部都彈得出來（你的音按鍵當下發聲、電腦聲部一顆不丟、同刻音差 0ms）。
 //    scenarios  情境掃描：一人兩聲部、多人（2～4 位輪流按，聲部都被指派）、連按（每 24ms 一下，被去抖擋掉的重按）、中途停手
 //               （不再回來／回來）、第一下提早按——
 //               每個情境都用同一組不變量判定通過與否。
@@ -18,7 +19,7 @@
 //  檔案會略過）；也可以用 --dir 指到別的資料夾。--limit=N 只掃前 N 首。
 //
 //  用法：node test/tools/library-scan.mjs --download
-//        node test/tools/library-scan.mjs [--dir=資料夾] [--only=parse,autoplay,perform,scenarios] [--limit=N]
+//        node test/tools/library-scan.mjs [--dir=資料夾] [--only=parse,autoplay,perform,perpart,scenarios] [--limit=N]
 // ============================================================
 
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -30,7 +31,7 @@ import { autoPlayStats, driverPressLoad, driverSecs, makeRng, measure, onsetPres
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const [k, v = true] = a.replace(/^--/, '').split('='); return [k, v]; }));
 const DIR = resolve(args.dir || join(dirname(fileURLToPath(import.meta.url)), 'library'));
-const ONLY = new Set(String(args.only || 'parse,autoplay,perform,scenarios').split(','));
+const ONLY = new Set(String(args.only || 'parse,autoplay,perform,perpart,scenarios').split(','));
 const LIMIT = Number(args.limit) || Infinity;
 const TICK_TOL_MS = 12.5;                          // 一個排程 tick（12ms）加浮點容差
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -175,6 +176,27 @@ function scanPerform(songs) {
 }
 
 /* ═══════════════════════════════════════════
+   掃描 2.5：每個聲部單獨指派
+   ═══════════════════════════════════════════ */
+
+// 每個有音符的 part（含打擊）單獨指派給演奏者 1、準時按完整首：不變量同 perform。證明「所有聲部都可以彈奏」。
+function scanPerPart(songs) {
+  const rows = [];
+  for (const s of songs) {
+    for (const part of s.score.parts) {
+      if (!part.noteCount) continue;
+      const presses = onsetPresses(driverSecs(s.score, [part.id]), { rnd: makeRng(5) });
+      rows.push({ s, part, m: measure(simulate(s.score, [{ partIds: [part.id], presses, keepGoing: true }])) });
+    }
+  }
+  console.log(`\n=== 每個聲部單獨指派（準時按完整首），共 ${rows.length} 個聲部／${songs.length} 首 ===`);
+  const bad = rows.filter((r) => violations(r.m));
+  console.log(`不符合不變量：${bad.length} 個聲部`);
+  for (const r of bad.slice(0, 8)) console.log('  ✗', r.s.title, r.part.name, JSON.stringify(r.m));
+  return bad.length;
+}
+
+/* ═══════════════════════════════════════════
    掃描 3：情境
    ═══════════════════════════════════════════ */
 
@@ -242,6 +264,7 @@ let problems = 0;
 if (ONLY.has('parse')) problems += scanParse(songs, Math.min(LIMIT, readdirSync(DIR).filter((x) => x.endsWith('.mid')).length));
 if (ONLY.has('autoplay')) problems += scanAutoplay(songs);
 if (ONLY.has('perform')) problems += scanPerform(songs);
+if (ONLY.has('perpart')) problems += scanPerPart(songs);
 if (ONLY.has('scenarios')) problems += scanScenarios(songs);
 console.log(`\n${problems ? `有 ${problems} 筆不符合` : '全部符合'}（${((Date.now() - started) / 1000).toFixed(0)} 秒）`);
 process.exitCode = problems ? 1 : 0;
