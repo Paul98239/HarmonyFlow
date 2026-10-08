@@ -286,7 +286,7 @@ const MUTATIONS = [
   { name: '指派：播放中改指派不即時處理（要等下次 ▶ 重新載入）', target: PLAYER, suites: ['smoke'], edits: [['  reassignInPlace();\n  updateHumanGate(); // 指派全清時', '  updateHumanGate(); // 指派全清時']],
     expect: ['播放中把大提琴改成'] },
   { name: '指派：下拉沒有 PC 鍵盤手', target: PLAYER, suites: ['smoke'], edits: [["select.append(new Option('無', ''), new Option('PC 鍵盤手', KEYBOARD_SLOT));", "select.append(new Option('無', ''));"]],
-    expect: ['單聲部的歌也列出指派下拉'] },
+    expect: ['單聲部的歌也列出指派下拉', '把第一個聲部指派給 PC 鍵盤手'] },
   { name: '指派：單聲部的歌不顯示分譜區塊', target: PLAYER, suites: ['smoke'], edits: [['scorePartSection.hidden = player.parts.length === 0;', 'scorePartSection.hidden = player.parts.length <= 1;']],
     expect: ['單聲部的歌也列出指派下拉'] },
   // ── 試聽：播放列與引擎接線（瀏覽器測試，每個一分多鐘）──
