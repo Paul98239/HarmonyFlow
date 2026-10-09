@@ -721,14 +721,18 @@ body, html {
 }
 
 /* 歌曲下拉：原生 <select> 關著時的已選歌名超出會被瀏覽器截斷、CSS 沒辦法讓它捲動，所以在它上面疊一份鏡像文字（.mq）：
-   底色同下拉、蓋住被截斷的原文，位置對齊下拉的文字區（左邊＝邊框＋左 padding，右邊留給下拉箭頭），不吃點擊。
-   展開後的選項清單仍是原生的、完全不動。停用時下拉整個變淡（opacity），鏡像文字用混色模擬同樣的淡度（不能用 opacity：
-   半透明的底色會讓底下的原文透出來變成重影）。 */
+   位置對齊下拉的文字區（左邊＝邊框＋左 padding，右邊留給下拉箭頭），不吃點擊。
+   展開後的選項清單仍是原生的、完全不動。停用時下拉整個變淡（opacity），鏡像不在下拉裡面、吃不到那個淡度，所以文字色用混色模擬。 */
 .select-mq { position: relative; width: 100%; }
-.select-mq > select { font: inherit; }   /* 下拉與鏡像文字都從 .select-mq 繼承字型，才會一模一樣（原生下拉預設用自己的字型） */
+/* 下拉與鏡像文字都從 .select-mq 繼承字型，才會一模一樣（原生下拉預設用自己的字型）。
+   原生下拉自己的文字設成透明、完全交給鏡像文字顯示：鏡像只蓋到箭頭之前（箭頭寬度因平台而異），若只靠它「蓋住」原文，
+   被截斷的原文會在鏡像右緣與箭頭之間露出一小截字元。用 -webkit-text-fill-color 而不是 color：原生箭頭是用 color 畫的，
+   color:transparent 會連箭頭一起消失。展開的選項清單不受影響：選項明確指定回原本的填色。 */
+.select-mq > select { font: inherit; -webkit-text-fill-color: transparent; }
+.select-mq > select option { -webkit-text-fill-color: var(--text); }
 .select-mq > .mq {
   position: absolute; left: calc(var(--line) + 0.65em); right: 2.2em; top: 50%; transform: translateY(-50%);
-  pointer-events: none; background: var(--bg); color: var(--text); font: inherit;
+  pointer-events: none; color: var(--text); font: inherit;
 }
 .select-mq:has(select:disabled) > .mq { color: color-mix(in srgb, var(--text) 35%, var(--bg)); }
 

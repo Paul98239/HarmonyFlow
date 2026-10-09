@@ -312,6 +312,10 @@ const MUTATIONS = [
     expect: ['超出欄位的本地檔名 loop', '分譜名稱的原文、複本、title 一致'] },
   { name: '跑馬燈：換文字時不重啟 loop（接續上一首的位置）', target: 'src/ui.js', suites: ['smoke'], edits: [["  track.dataset.phase = track.dataset.phase === 'b' ? 'a' : 'b';", '  void 0;']],
     expect: ['連續換成另一首長名稱：loop 從頭開始'] },
+  { name: '歌曲下拉：原生文字不透明（被截斷的字元在箭頭旁露出來）', target: 'src/styles.css', suites: ['smoke'], edits: [['.select-mq > select { font: inherit; -webkit-text-fill-color: transparent; }', '.select-mq > select { font: inherit; }']],
+    expect: ['原生文字透明'] },
+  { name: '歌曲下拉：原生文字用 color 透明（連箭頭一起消失）', target: 'src/styles.css', suites: ['smoke'], edits: [['.select-mq > select { font: inherit; -webkit-text-fill-color: transparent; }', '.select-mq > select { font: inherit; color: transparent; }']],
+    expect: ['原生文字透明'] },
   { name: '歌曲下拉：鏡像文字不跟選項同步', target: PLAYER, suites: ['smoke'], edits: [["  setMarqueeText(songMirrorEl, shown, songSelectEl.selectedIndex > 0 ? shown : '');", '  void shown;']],
     expect: ['歌曲下拉：超出欄位的已選歌名由鏡像文字 loop'] },
   // ── 試聽：播放列與引擎接線（瀏覽器測試，每個一分多鐘）──

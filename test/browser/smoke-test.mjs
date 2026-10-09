@@ -768,6 +768,13 @@ async function driveMarquee(page, problems) {
   await page.waitForTimeout(300);
   m = await marquee('#midiSongMirror');
   check(m.loop === 'block' && m.main === LONG_SONG && m.copy.includes('卡農'), '歌曲下拉：超出欄位的已選歌名由鏡像文字 loop', problems, JSON.stringify(m));
+  // 原生下拉自己的文字要透明（不然被截斷的字元會在鏡像右緣與箭頭之間露出一小截），但箭頭（用 color 畫）與展開的選項仍要看得到
+  const fills = await page.evaluate(() => {
+    const s = document.getElementById('midiSongSelect');
+    return { text: getComputedStyle(s).webkitTextFillColor, color: getComputedStyle(s).color, option: getComputedStyle(s.options[0]).webkitTextFillColor };
+  });
+  const CLEAR = 'rgba(0, 0, 0, 0)';
+  check(fills.text === CLEAR && fills.color !== CLEAR && fills.option !== CLEAR, '歌曲下拉：原生文字透明（箭頭旁不露出被截斷的字元），箭頭與展開的選項仍可見', problems, JSON.stringify(fills));
   await page.evaluate((prev) => window.__hf.store.set({ library: { ...prev, status: 'ready', items: [], selectedId: '' } }), savedLibrary);
   await page.waitForTimeout(300);
   m = await marquee('#midiSongMirror');
