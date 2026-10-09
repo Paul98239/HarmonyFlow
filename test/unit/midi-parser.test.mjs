@@ -10,7 +10,7 @@
 // ============================================================
 
 import { readFileSync } from 'node:fs';
-import { parseMidi } from '../../src/midi/midiParser.js';
+import { parseMidi, midiNoteName, gmProgramNameZh } from '../../src/midi/midiParser.js';
 
 function run(name, fn) {
   console.log(`\n=== ${name} ===`);
@@ -74,6 +74,32 @@ run('鋼琴兩行譜：下行譜沒有初始化區塊、軌名相同、同 chann
   assert(part.staves[1].program === 0 && part.staves[1].init?.volume === 100, '下行譜沿用上行譜（首軌）對這個 channel 的初始化');
 });
 
+run('staff 記下自己最低與最高的音高（分譜清單顯示譜表音域用）', () => {
+  const parsed = parseMidi(midiFile([
+    track([nameEv('Piano'), ...initBlock(0, 0), ...notes(0, [60, 72, 64])]),
+    track([nameEv('Piano'), ...notes(0, [36, 48])]),
+  ]));
+  const [upper, lower] = parsed.parts[0].staves;
+  assert(upper.minPitch === 60 && upper.maxPitch === 72, `上行譜音域應為 60~72，實際 ${upper.minPitch}~${upper.maxPitch}`);
+  assert(lower.minPitch === 36 && lower.maxPitch === 48, `下行譜音域應為 36~48，實際 ${lower.minPitch}~${lower.maxPitch}`);
+});
+
+run('音名：中央 C ＝ 60 ＝ C4，升記號用 #；超出 0~127 或不是整數回傳空字串', () => {
+  const cases = [[60, 'C4'], [57, 'A3'], [88, 'E6'], [0, 'C-1'], [127, 'G9'], [61, 'C#4'], [36, 'C2']];
+  for (const [n, name] of cases) assert(midiNoteName(n) === name, `${n} 應為 ${name}，實際 ${midiNoteName(n)}`);
+  assert(midiNoteName(-1) === '' && midiNoteName(128) === '' && midiNoteName(60.5) === '' && midiNoteName(NaN) === '', '非法音高要回傳空字串');
+});
+
+run('音色名用台灣用語且全表一致：128 個音色都有名字、沒有重複、沒有大陸用語', () => {
+  const names = Array.from({ length: 128 }, (_, p) => gmProgramNameZh(p));
+  assert(names.every((n) => typeof n === 'string' && n.length > 0), '每個 program 都要有名字');
+  assert(new Set(names).size === 128, '128 個名字不可重複：' + names.filter((n, i) => names.indexOf(n) !== i));
+  const banned = ['原聲', '鋪底', '主音', '教堂', '合成貝斯', '合成弦樂', '合成銅管', '筒鼓', '人聲「'];
+  for (const n of names) for (const b of banned) assert(!n.includes(b), `「${n}」含有非台灣用語「${b}」`);
+  assert(gmProgramNameZh(0) === '大鋼琴' && gmProgramNameZh(19) === '管風琴' && gmProgramNameZh(32) === '原音貝斯' && gmProgramNameZh(80) === '方波主奏' && gmProgramNameZh(88) === '新世紀音墊', '代表性的幾個名字');
+  assert(gmProgramNameZh(0, true) === '標準鼓組' && gmProgramNameZh(40, true) === '鼓刷鼓組', '鼓組名');
+});
+
 run('弓弦樂器三個 channel（normal／pizzicato／tremolo）：只有 normal 有音符 → 1 個 staff；pizzicato 也有音 → 2 個 staff', () => {
   const init = [...initBlock(0, 40), ...initBlock(1, 45), ...initBlock(2, 44)];
   const onlyNormal = parseMidi(midiFile([track([nameEv('Violin'), ...init, ...notes(0, [67])])]));
@@ -117,10 +143,10 @@ run('軌名是空的、沒有初始化區塊、但用的是這組沒有的 chann
   assert(sameFamily.parts.length === 2, `別的 channel 不併入上一組（即使同一個 GM family），實際 ${sameFamily.parts.length} 個 part`);
 });
 
-run('part 名稱取音符最多的 staff 的音色（不是第一個 staff）：pizzicato channel 音符較多就叫「撥弦弦樂」', () => {
+run('part 名稱取音符最多的 staff 的音色（不是第一個 staff）：pizzicato channel 音符較多就叫「撥奏弦樂」', () => {
   const init = [...initBlock(0, 40), ...initBlock(1, 45)];
   const parsed = parseMidi(midiFile([track([nameEv('Violin'), ...init, ...notes(0, [67]), ...notes(1, [60, 62, 64])])]));
-  assert(parsed.parts[0].staves.length === 2 && parsed.parts[0].name === '撥弦弦樂', `實際「${parsed.parts[0].name}」`);
+  assert(parsed.parts[0].staves.length === 2 && parsed.parts[0].name === '撥奏弦樂', `實際「${parsed.parts[0].name}」`);
 });
 
 run('基底名稱本身以數字結尾（弦樂合奏 1）：區分用全形括號，不疊成雙重數字', () => {

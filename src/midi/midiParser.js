@@ -98,48 +98,51 @@ const GM_DRUM_KITS = Object.freeze({
 });
 const DRUM_CHANNEL = 9;
 
-// General MIDI Level 1 音色表的繁體中文對照，索引就是 GM program 編號（0~127）。
+// General MIDI Level 1 音色表的繁體中文（台灣用語）對照，索引就是 GM program 編號（0~127）。
 // 分譜清單一律用這份表命名聲部，不採信檔案裡的軌名（FF03）／樂器名（FF04）：那些欄位常常是
 // 其他語言、排版用的分隔線或空白。GM program 是規格明訂、與語言無關的欄位，而且就是音源引擎
-// 實際會奏出的音色。
+// 實際會奏出的音色。這張表只管畫面上的顯示名稱；內部一律用 GM program 編號與 SoundFont 的音色，不依賴名稱。
+// 台灣用語的統一規則（同一個概念全表用同一個詞）：acoustic＝「原音」（不用大陸的「原聲」）、synth＝「合成器」、
+// lead＝「主奏」、pad＝「音墊」、slap＝「拍弦」、fretless＝「無琴格」、choir＝「合唱」、woodblock＝「木魚」、
+// tom＝「通通鼓」、pizzicato＝「撥奏」、brush＝「鼓刷」、管風琴不加「教堂」。
 const GM_PROGRAM_NAMES_ZH = Object.freeze([
-  '大鋼琴', '明亮鋼琴', '電平台鋼琴', '酒吧鋼琴',
-  '電鋼琴 1', '電鋼琴 2', '大鍵琴', '電鍵琴',
+  '大鋼琴', '明亮鋼琴', '電子大鋼琴', '酒吧鋼琴',
+  '電鋼琴 1', '電鋼琴 2', '大鍵琴', '擊弦古鋼琴',
   '鋼片琴', '鐘琴', '音樂盒', '顫音琴',
   '馬林巴琴', '木琴', '管鐘', '揚琴',
-  '拉桿風琴', '打擊式風琴', '搖滾風琴', '教堂管風琴',
+  '拉桿風琴', '打擊式風琴', '搖滾風琴', '管風琴',
   '簧風琴', '手風琴', '口琴', '探戈手風琴',
   '尼龍弦吉他', '鋼弦吉他', '爵士電吉他', '清音電吉他',
   '悶音電吉他', '過載電吉他', '破音電吉他', '吉他泛音',
-  '原聲貝斯', '指彈電貝斯', '撥片電貝斯', '無格貝斯',
-  '擊弦貝斯 1', '擊弦貝斯 2', '合成貝斯 1', '合成貝斯 2',
+  '原音貝斯', '指彈電貝斯', '撥片電貝斯', '無琴格貝斯',
+  '拍弦貝斯 1', '拍弦貝斯 2', '合成器貝斯 1', '合成器貝斯 2',
   '小提琴', '中提琴', '大提琴', '低音提琴',
-  '震音弦樂', '撥弦弦樂', '豎琴', '定音鼓',
-  '弦樂合奏 1', '弦樂合奏 2', '合成弦樂 1', '合成弦樂 2',
-  '人聲「啊」', '人聲「喔」', '合成人聲', '管弦樂齊奏',
+  '震音弦樂', '撥奏弦樂', '豎琴', '定音鼓',
+  '弦樂合奏 1', '弦樂合奏 2', '合成器弦樂 1', '合成器弦樂 2',
+  '合唱「啊」', '合唱「喔」', '合成器人聲', '管弦樂團重擊',
   '小號', '長號', '低音號', '弱音小號',
-  '法國號', '銅管組', '合成銅管 1', '合成銅管 2',
+  '法國號', '銅管組', '合成器銅管 1', '合成器銅管 2',
   '高音薩克斯風', '中音薩克斯風', '次中音薩克斯風', '上低音薩克斯風',
   '雙簧管', '英國管', '低音管', '單簧管',
   '短笛', '長笛', '直笛', '排笛',
-  '吹瓶', '尺八', '哨子', '陶笛',
-  '方波主音', '鋸齒波主音', '汽笛風琴主音', '吹管主音',
-  '香蘭琴主音', '人聲主音', '五度疊置主音', '貝斯加主音',
-  '新世紀鋪底', '溫暖鋪底', '複音合成鋪底', '人聲鋪底',
-  '弓弦鋪底', '金屬鋪底', '光暈鋪底', '掃頻鋪底',
+  '吹瓶', '尺八', '口哨', '陶笛',
+  '方波主奏', '鋸齒波主奏', '汽笛風琴主奏', '吹氣主奏',
+  '查朗戈主奏', '人聲主奏', '五度主奏', '貝斯加主奏',
+  '新世紀音墊', '溫暖音墊', '複音合成器音墊', '合唱音墊',
+  '弓弦音墊', '金屬音墊', '光暈音墊', '掃頻音墊',
   '音效：雨聲', '音效：配樂', '音效：水晶', '音效：氛圍',
   '音效：明亮', '音效：精靈', '音效：回聲', '音效：科幻',
   '西塔琴', '班鳩琴', '三味線', '箏',
-  '卡林巴琴', '風笛', '民謠提琴', '嗩吶',
-  '叮噹鈴', '阿哥哥鈴', '鋼鼓', '木塊',
-  '太鼓', '旋律筒鼓', '合成鼓', '反轉鈸',
+  '拇指琴', '風笛', '民謠提琴', '嗩吶',
+  '叮噹鈴', '阿哥哥鈴', '鋼鼓', '木魚',
+  '太鼓', '旋律通通鼓', '合成器鼓', '反向鈸',
   '吉他換把雜音', '呼吸聲', '海浪聲', '鳥鳴',
   '電話鈴聲', '直升機', '掌聲', '槍聲',
 ]);
 
 const GM_DRUM_KITS_ZH = Object.freeze({
   0: '標準鼓組', 8: '房間鼓組', 16: '強力鼓組', 24: '電子鼓組',
-  25: '類比鼓組', 32: '爵士鼓組', 40: '刷擊鼓組', 48: '管弦打擊組', 56: '音效鼓組',
+  25: '類比鼓組', 32: '爵士鼓組', 40: '鼓刷鼓組', 48: '管弦樂打擊組', 56: '音效打擊組',
 });
 
 /**
@@ -152,6 +155,17 @@ export function gmProgramNameZh(program, isDrum = false) {
   if (!Number.isInteger(program) || program < 0 || program > 127) return '';
   if (isDrum) return GM_DRUM_KITS_ZH[program] || GM_DRUM_KITS_ZH[0];
   return GM_PROGRAM_NAMES_ZH[program];
+}
+
+const PITCH_CLASS_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+
+/**
+ * MIDI 音高 → 科學音名（中央 C ＝ 60 ＝ C4，升記號用 #），例如 57 → 'A3'、88 → 'E6'。分譜清單顯示譜表音域用。
+ * 非 0~127 的整數回傳空字串。
+ */
+export function midiNoteName(midiNote) {
+  if (!Number.isInteger(midiNote) || midiNote < 0 || midiNote > 127) return '';
+  return PITCH_CLASS_NAMES[midiNote % 12] + (Math.floor(midiNote / 12) - 1);   // MIDI 0 ＝ C-1，所以八度要減 1
 }
 
 /* ═══════════════════════════════════════════
@@ -909,10 +923,10 @@ function makeNote(partId, staffId, trackIndex, channel, onEvent, endTick, midiTi
 // 同音高重疊次數）。staffIndex：`${trackIndex}:${軌內 channel}` → { partId, staffId, channel（絕對） }。
 function collectNotes(tracks, midiTicksToSeconds, warn, programResolver, staffIndex) {
   const notes = [];
-  const statsByStaff = new Map(); // staffId → { program, bank, noteCount, startTick, endTick, overlaps }
+  const statsByStaff = new Map(); // staffId → { program, bank, noteCount, startTick, endTick, overlaps, minPitch, maxPitch }
   const statsOf = (vk, program, bank) => {
     let st = statsByStaff.get(vk.staffId);
-    if (!st) statsByStaff.set(vk.staffId, (st = { program, bank, noteCount: 0, startTick: Infinity, endTick: 0, overlaps: 0 }));
+    if (!st) statsByStaff.set(vk.staffId, (st = { program, bank, noteCount: 0, startTick: Infinity, endTick: 0, overlaps: 0, minPitch: 127, maxPitch: 0 }));
     return st;
   };
   const emit = (vk, trackIndex, onEv, endTick) => {
@@ -921,6 +935,8 @@ function collectNotes(tracks, midiTicksToSeconds, warn, programResolver, staffIn
     st.noteCount++;
     st.startTick = Math.min(st.startTick, note.startTick);
     st.endTick = Math.max(st.endTick, note.endTick);
+    st.minPitch = Math.min(st.minPitch, note.midiNote);
+    st.maxPitch = Math.max(st.maxPitch, note.midiNote);
     notes.push(note);
   };
 
@@ -1035,7 +1051,7 @@ function buildPart(group, partId, statsByStaff, staffIndex, warn) {
       }
       staves.push({
         id: vk.staffId, partId, trackIndex: summary.track.index, channel: vk.channel, program, bank, percussionKit, init,
-        noteCount: st.noteCount, startTick: st.startTick, endTick: st.endTick,
+        noteCount: st.noteCount, startTick: st.startTick, endTick: st.endTick, minPitch: st.minPitch, maxPitch: st.maxPitch,
       });
     }
   }
@@ -1271,6 +1287,8 @@ function validateStructuralConventions(tracks, format, warn) {
  * @property {number} noteCount
  * @property {number} startTick
  * @property {number} endTick
+ * @property {number} minPitch  這個 staff 最低的音高（MIDI 0~127），分譜清單顯示譜表音域用
+ * @property {number} maxPitch  最高的音高
  */
 
 /**

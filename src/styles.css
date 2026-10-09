@@ -667,9 +667,12 @@ body, html {
   transition: border-color var(--dur-fast), background var(--dur-fast);
 }
 .score-part-row.is-mine { border-color: var(--accent); background: #2a2410; }
+/* 譜表名稱附有音域與音數（「大鋼琴・譜表 1（A3–E6，339 音）」），比面板給的寬度長，所以允許換行、不截斷：
+   截斷會把音域吃掉，名稱就失去用途。overflow-wrap:anywhere 讓超長的名稱在任何字元斷行，min-width:0 讓 flex 子項可以縮小；
+   text-wrap:pretty 避免最後一行只剩「音）」這種孤字（不支援的瀏覽器就忽略，只是換行位置難看一點）。 */
 .score-part-name {
   font-size: 1em; font-weight: 700; color: var(--text);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  overflow-wrap: anywhere; text-wrap: pretty;
   flex: 1 1 auto; min-width: 0;
 }
 /* 指派下拉：沿用 .player-input 的外觀（含 padding，跟同一個面板裡的分類／歌曲下拉文字

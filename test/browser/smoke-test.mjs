@@ -690,7 +690,7 @@ async function driveAssignmentUnits(page, problems) {
 
   await loadLocalFile(page, PIANO_MIDI);
   r = await partRows(page);
-  check(r.rows.length === 2 && r.rows[0].name.endsWith('譜表 1') && r.rows[1].name.endsWith('譜表 2'), '單聲部的多行譜（鋼琴兩行）改列兩個譜表', problems, JSON.stringify(r));
+  check(r.rows.length === 2 && r.rows[0].name === '大鋼琴・譜表 1（C5–C6，8 音）' && r.rows[1].name === '大鋼琴・譜表 2（C3–C4，8 音）', '單聲部的多行譜（鋼琴兩行）改列兩個譜表，名稱附音域與音數', problems, JSON.stringify(r));
   await page.locator('.score-part-id').nth(0).selectOption('kb');   // 不用先選現場人數也列得出「PC 鍵盤手」
   await page.click('#btnPlay');
   await page.waitForSelector('#btnPause.is-current', { timeout: 10000 });

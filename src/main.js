@@ -29,7 +29,7 @@ window.__stats = () => {
   };
 };
 
-// 開發用：彈完在 console 輸入 copy(__pressLog())，貼進 test/tools/recordings/<名稱>.json，再用 test/tools/symmetry-eval.mjs 離線重放。
+// 開發用：彈完在 console 輸入 copy(__pressLog())，貼進 test/tools/recordings/<名稱>.json 留存，供離線分析。
 // 時間是排程器時鐘（暫停不計），跟 sim.mjs 的座標一樣。
 window.__pressLog = midiPlayer.pressLog;
 

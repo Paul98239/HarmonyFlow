@@ -5,11 +5,9 @@
 //  每顆音實際 noteOn／noteOff 的假時間（假時間以 12ms 為一個 tick，跟 midiPlayer.js 一致），所以量不到合成器的 release 尾巴、
 //  humanGain 增益與 compressor（那些要用耳朵 A/B）。
 //
-//  怎麼判讀：每顆音算兩個差（毫秒，正＝比預期長）：
-//    對檔案＝實際音長 − 檔案音長（試聽就是檔案音長）；
-//    對演奏速度＝實際音長 − 檔案音長 × factor（factor＝你的按鍵間隔是樂譜間隔的幾倍；排程器該做到的是照你的速度等比例縮放）。
-//  · 「完美」情境（factor＝1、無手抖）若「對檔案」只差一個 tick 量級，排程器本身不是主因；差更大就是 tick 粒度。
-//  · 「慢 1.4×」情境「對演奏速度」接近 0、「對檔案」接近 +40％，代表音長變長只是跟著你的速度縮放（設計如此）。
+//  怎麼判讀：每顆音算「對檔案」＝實際音長 − 檔案音長（毫秒，正＝比檔案長；試聽就是檔案音長）。音長不依你的速度換算，所以
+//  每個情境都該只差 tick 粒度；hold 著的音（結尾對齊你的下一個起音）會一直響到你按下去，不在這支的「收音有沒有準時」範圍內，
+//  差很多的長音多半是 hold。
 //  聲部：每首歌音符最多的非打擊 part 當你的聲部（跟 rate-eval／early-eval 同一組），其餘是電腦音。沒有撐住，音多出來的
 //  長度只會是 tick 粒度（≤ 12ms：收音要等到下一個 tick 才送）。
 //  再依檔案音長分「短音（< 250ms）」「長音（≥ 250ms）」：tick 粒度對短音的比例影響大。
@@ -28,7 +26,7 @@ import { simulate, rankedParts, driverSecs, onsetPresses, makeRng } from './sim.
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const [k, v = true] = a.replace(/^--/, '').split('='); return [k, v]; }));
 const limit = Number(args.limit ?? 30);
-const listMid = (d) => (existsSync(d) ? readdirSync(d).filter((f) => f.endsWith('.mid') && !f.includes('-Violin') && !f.includes('-Violoncello')).map((f) => join(d, f)) : []);
+const listMid = (d) => (existsSync(d) ? readdirSync(d).filter((f) => f.endsWith('.mid')).map((f) => join(d, f)) : []);
 const allFiles = args.dir ? listMid(resolve(args.dir)) : [...listMid(join(ROOT, 'src/assets')), ...listMid(join(ROOT, 'test/tools/library')).slice(0, limit)];
 const files = typeof args.exclude === 'string' ? allFiles.filter((f) => !f.includes(args.exclude)) : allFiles;
 
@@ -66,7 +64,7 @@ for (const f of files) {
       if (fileMs <= 0) continue;
       const actual = r.offMs - r.onMs;
       const group = r.label;
-      acc[i][group][fileMs < SHORT_MS ? 'short' : 'long'].push({ vsFile: actual - fileMs, vsPlayer: actual - fileMs * sc.factor });
+      acc[i][group][fileMs < SHORT_MS ? 'short' : 'long'].push(actual - fileMs);
     }
   });
 }
@@ -74,14 +72,14 @@ console.log(`曲數（主聲部起音 ≥ 60 個）：${songs}；差值單位 ms
 
 for (const [i, sc] of SCENARIOS.entries()) {
   console.log(`■ ${sc.name}`);
-  console.log('  種類        音數   對檔案 p50  p90  p99 ｜ 對演奏速度 p50  p90  p99   >12ms  >30ms  >100ms  <-30ms');
+  console.log('  種類        音數   對檔案 p50  p90  p99    >12ms  >30ms  >100ms  <-30ms');
   for (const [label, title] of GROUPS) {
     for (const len of ['short', 'long']) {
       const s = acc[i][label][len];
-      const a = s.map((x) => x.vsFile).sort((x, y) => x - y), p = s.map((x) => x.vsPlayer).sort((x, y) => x - y);
+      const a = [...s].sort((x, y) => x - y);
       const name = `${title}${len === 'short' ? '短音' : '長音'}`.padEnd(10);
-      console.log(`  ${name}${String(s.length).padStart(9)}   ${f0(quantile(a, 0.5))} ${f0(quantile(a, 0.9))} ${f0(quantile(a, 0.99))} ｜ ${' '.repeat(10)}${f0(quantile(p, 0.5))} ${f0(quantile(p, 0.9))} ${f0(quantile(p, 0.99))}   `
-        + `${pct(p.filter((x) => x > 12).length, p.length)}   ${pct(p.filter((x) => x > 30).length, p.length)}    ${pct(p.filter((x) => x > 100).length, p.length)}    ${pct(p.filter((x) => x < -30).length, p.length)}`);
+      console.log(`  ${name}${String(s.length).padStart(9)}   ${f0(quantile(a, 0.5))} ${f0(quantile(a, 0.9))} ${f0(quantile(a, 0.99))}   `
+        + `${pct(a.filter((x) => x > 12).length, a.length)}   ${pct(a.filter((x) => x > 30).length, a.length)}    ${pct(a.filter((x) => x > 100).length, a.length)}    ${pct(a.filter((x) => x < -30).length, a.length)}`);
     }
   }
   console.log('');

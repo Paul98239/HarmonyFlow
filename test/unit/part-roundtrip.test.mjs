@@ -18,6 +18,7 @@ import { splitByPart, mergeParts, toBytes, noteMultiset } from '../tools/part-io
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ASSETS = join(__dirname, '../../src/assets');
+const FIXTURES = join(__dirname, '../fixtures');
 const LIBRARY = join(__dirname, '../tools/library');
 
 function run(name, fn) {
@@ -145,7 +146,7 @@ for (const [name, file] of [['小提琴', 'canon-violin-cello-Violin.mid'], ['�
     const split = splitByPart(canon).find((s) => s.name === name);
     assert(split, `找不到 part「${name}」`);
     const fromSplit = reparse(toBytes(split.model));
-    const golden = parseFile(join(ASSETS, file));
+    const golden = parseFile(join(FIXTURES, file));
     const a = noteMultiset(fromSplit.notes), b = noteMultiset(golden.notes);
     assert(a.length === b.length, `音符數 ${a.length} vs ${b.length}`);
     assert(a.every((k, i) => k === b[i]), '音符內容不同');

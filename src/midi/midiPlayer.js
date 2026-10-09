@@ -29,7 +29,7 @@
 
 import { Store, rafThrottle } from '../ui.js';
 import * as synth from './synth.js';
-import { parseMidi } from './midiParser.js';
+import { parseMidi, midiNoteName } from './midiParser.js';
 import { downloadMidiFile, fetchCategories, searchSongs } from './midiApi.js';
 import { KEYBOARD_SLOT } from './scheduler.js';
 
@@ -127,9 +127,18 @@ function selectionSignature(score, assignments) {
 
 // 指派單位：通常一個 part 一個；只有一個 part 而它有 ≥ 2 個 staff（鋼琴兩行譜）時改成一個 staff 一個，讓你只彈其中一個譜表。
 // 多聲部的歌先以樂器（part）為單位。id 是 part id（p…）或 staff id（t…c…），scheduler 兩種都認（staff 優先）。
+// 譜表的名稱附上音域與音數（例如「大鋼琴・譜表 1（A3–E6，339 音）」）：MIDI 檔裡沒有譜號，也沒有旋律／伴奏的資訊，
+// 這兩個數字是從音符直接量出來的事實，讓你選之前分得出哪個譜表是哪個；打擊譜表沒有音域可言，只附音數。
 export function assignmentUnits(parts) {
   if (parts.length === 1 && parts[0].staves?.length >= 2) {
-    return parts[0].staves.map((staff, i) => ({ id: staff.id, name: `${parts[0].name}・譜表 ${i + 1}` }));
+    return parts[0].staves.map((staff, i) => {
+      const facts = [];
+      if (!staff.percussionKit && Number.isInteger(staff.minPitch) && staff.minPitch <= staff.maxPitch) {
+        facts.push(`${midiNoteName(staff.minPitch)}–${midiNoteName(staff.maxPitch)}`);
+      }
+      if (Number.isInteger(staff.noteCount)) facts.push(`${staff.noteCount} 音`);
+      return { id: staff.id, name: `${parts[0].name}・譜表 ${i + 1}${facts.length ? `（${facts.join('，')}）` : ''}` };
+    });
   }
   return parts.map((part) => ({ id: part.id, name: part.name }));
 }
@@ -166,7 +175,7 @@ export function audioLatency() {
   return synth.audioLatencyInfo();
 }
 
-// 量測（同上）：這一輪的按鍵記錄與目前的指派，給 main.js 的 window.__pressLog 匯出，離線重放用（test/tools/symmetry-eval.mjs）。
+// 量測（同上）：這一輪的按鍵記錄與目前的指派，給 main.js 的 window.__pressLog 匯出，離線分析用。
 export function pressLog() {
   return { assignments: [...playerStore.state.assignments], presses: synth.scheduler.pressLog() };   // Map 展開成 [partId, 槽位][]，才能轉成 JSON
 }

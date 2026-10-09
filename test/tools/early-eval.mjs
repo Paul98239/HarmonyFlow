@@ -32,7 +32,7 @@ import { estimatePlaybackRate } from '../../src/midi/pressTiming.js';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const [k, v = true] = a.replace(/^--/, '').split('='); return [k, v]; }));
 const dirs = args.dir ? [resolve(args.dir)] : [join(ROOT, 'test/tools/library'), join(ROOT, 'src/assets')];
-const files = dirs.filter(existsSync).flatMap((d) => readdirSync(d).filter((f) => f.endsWith('.mid') && !f.includes('-Violin') && !f.includes('-Violoncello')).map((f) => join(d, f)));
+const files = dirs.filter(existsSync).flatMap((d) => readdirSync(d).filter((f) => f.endsWith('.mid')).map((f) => join(d, f)));
 
 // ── 樂譜：你的聲部起音（樂譜秒）與電腦音（樂譜秒） ──
 const songs = [];

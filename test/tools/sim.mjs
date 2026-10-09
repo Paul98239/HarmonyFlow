@@ -185,24 +185,6 @@ export function onsetPresses(secs, { factor = 1, jitter = 0, rnd = Math.random, 
    ═══════════════════════════════════════════ */
 
 /**
- * 電腦聲部的靜音：把電腦音依發聲時間排好，相鄰兩顆之間「前面所有音都收了、下一顆還沒開始」的空白（ms）。檔案本身的休止也會算進去，
- * 所以只拿來比較同一首歌、同一份按鍵在不同設定下的差異。回傳 { over100, over300, over300Sec }。
- */
-export function silenceStats(sim) {
-  const as = sim.records.filter((r) => r.label === 'assist' && r.offMs != null).sort((a, b) => a.onMs - b.onMs);
-  let maxOff = -1, over100 = 0, over300 = 0, over300Ms = 0;
-  for (const r of as) {
-    if (maxOff > 0) {
-      const gap = r.onMs - maxOff;
-      if (gap > 100) over100++;
-      if (gap > 300) { over300++; over300Ms += gap; }
-    }
-    maxOff = Math.max(maxOff, r.offMs);
-  }
-  return { over100, over300, over300Sec: over300Ms / 1000 };
-}
-
-/**
  * 不變量（任何按鍵速度、任何人數都該成立）：
  *   releasedMissing＝0：該放行的音都發聲了（你的音：它所屬的 segment 已放行；電腦的音：它那一段已被按鍵啟動）；
  *   unpaired／strayOff／badVelocity＝0：每個 noteOn 一個 noteOff、不送 velocity 0（hold 著、等你按下一個起音的音不算沒收，見 held）；
