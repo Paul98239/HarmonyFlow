@@ -554,7 +554,7 @@ body, html {
   font-size: 1em;
 }
 .file-picker-name {
-  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1; min-width: 0;
   font-size: 1em; color: var(--text-muted);
 }
 
@@ -667,12 +667,10 @@ body, html {
   transition: border-color var(--dur-fast), background var(--dur-fast);
 }
 .score-part-row.is-mine { border-color: var(--accent); background: #2a2410; }
-/* 譜表名稱附有音域與音數（「大鋼琴・譜表 1（A3–E6，339 音）」），比面板給的寬度長，所以允許換行、不截斷：
-   截斷會把音域吃掉，名稱就失去用途。overflow-wrap:anywhere 讓超長的名稱在任何字元斷行，min-width:0 讓 flex 子項可以縮小；
-   text-wrap:pretty 避免最後一行只剩「音）」這種孤字（不支援的瀏覽器就忽略，只是換行位置難看一點）。 */
+/* 譜表名稱附有音域與音數（「大鋼琴・譜表 1（A3–E6，339 音）」），比面板給的寬度長：單行顯示，超出時由 .mq 跑馬燈 loop
+   （截斷會把音域吃掉，名稱就失去用途）。min-width:0 讓 flex 子項可以縮小到比文字窄。 */
 .score-part-name {
   font-size: 1em; font-weight: 700; color: var(--text);
-  overflow-wrap: anywhere; text-wrap: pretty;
   flex: 1 1 auto; min-width: 0;
 }
 /* 指派下拉：沿用 .player-input 的外觀（含 padding，跟同一個面板裡的分類／歌曲下拉文字
@@ -682,6 +680,52 @@ body, html {
   width: auto; min-width: 7em;
 }
 .score-part-row.is-mine .score-part-id { border-color: var(--accent); color: var(--accent); }
+
+/* ── 跑馬燈（.mq）：文字超出欄位寬度時頭尾相連 loop，放得下就一動不動 ──
+   純 CSS，沒有 JS 計時或量測（Chromium 系限定；不支援的瀏覽器只是不 loop，退回 prefers-reduced-motion 同款的截斷顯示）。
+   結構（index.html 的靜態 markup，文字由 ui.js 的 setMarqueeText() 寫入）：
+     .mq            欄位本身：overflow:hidden 的 scroll-state 容器，只放原文（.mq-main）一份，所以它的「可捲動」＝原文超出欄位
+       .mq-main     原文：量寬度用，也是讀屏讀到的文字
+       .mq-loop     絕對定位、自己 overflow:hidden 的疊層（所以它的內容不會讓 .mq 變成「可捲動」，不然放得下的字也會被判成超出）
+         .mq-track  原文複本×2（::before／::after 各畫 data-text 一份，中間隔 2em），往左移動一份的寬度（-50%）剛好銜接回起點
+   超出時（@container scroll-state(scrollable: inline)）原文改成透明、疊層顯示；放得下時疊層維持 display:none。
+   面板關閉（hidden → display:none）時瀏覽器不跑動畫，重新打開從頭再來。繞一圈的秒數＝字寬權重（data-len）× 0.3s，
+   字越多越久，捲動速度大致固定；開頭停 1 秒再開始，先看得到名稱的開頭。 */
+.mq {
+  position: relative; display: block; overflow: hidden; white-space: nowrap;
+  container-type: scroll-state;
+}
+.mq-main { display: inline-block; }
+.mq-loop { position: absolute; inset: 0; overflow: hidden; display: none; }
+.mq-track {
+  display: inline-block;
+  animation: mq-scroll max(5s, calc(attr(data-len type(<number>), 20) * 0.3s)) 1s linear infinite;
+}
+.mq-track::before, .mq-track::after { content: attr(data-text); padding-inline-end: 2em; }
+@keyframes mq-scroll { to { transform: translateX(-50%); } }
+@container scroll-state(scrollable: inline) {
+  .mq-main { color: transparent; }   /* 不用 visibility:hidden：它會把原文從讀屏的無障礙樹拿掉 */
+  .mq-loop { display: block; }
+}
+@media (prefers-reduced-motion: reduce) {
+  @container scroll-state(scrollable: inline) {
+    .mq-main { color: inherit; }
+    .mq-loop { display: none; }
+  }
+  .mq { text-overflow: ellipsis; }
+}
+
+/* 歌曲下拉：原生 <select> 關著時的已選歌名超出會被瀏覽器截斷、CSS 沒辦法讓它捲動，所以在它上面疊一份鏡像文字（.mq）：
+   底色同下拉、蓋住被截斷的原文，位置對齊下拉的文字區（左邊＝邊框＋左 padding，右邊留給下拉箭頭），不吃點擊。
+   展開後的選項清單仍是原生的、完全不動。停用時下拉整個變淡（opacity），鏡像文字用混色模擬同樣的淡度（不能用 opacity：
+   半透明的底色會讓底下的原文透出來變成重影）。 */
+.select-mq { position: relative; width: 100%; }
+.select-mq > select { font: inherit; }   /* 下拉與鏡像文字都從 .select-mq 繼承字型，才會一模一樣（原生下拉預設用自己的字型） */
+.select-mq > .mq {
+  position: absolute; left: calc(var(--line) + 0.65em); right: 2.2em; top: 50%; transform: translateY(-50%);
+  pointer-events: none; background: var(--bg); color: var(--text); font: inherit;
+}
+.select-mq:has(select:disabled) > .mq { color: color-mix(in srgb, var(--text) 35%, var(--bg)); }
 
 }
 

@@ -27,7 +27,7 @@
 //  作用在演奏，'preview'＝▶ ❚❚ ↻ 作用在試聽；哪顆鈕能按照同一張狀態表（transportButtonState）。
 // ============================================================
 
-import { Store, rafThrottle } from '../ui.js';
+import { Store, rafThrottle, setMarqueeText } from '../ui.js';
 import * as synth from './synth.js';
 import { parseMidi, midiNoteName } from './midiParser.js';
 import { downloadMidiFile, fetchCategories, searchSongs } from './midiApi.js';
@@ -626,6 +626,7 @@ const SEARCH_DEBOUNCE_MS = 300;
 const categoryEl = document.getElementById('midiCategory');
 const queryEl = document.getElementById('midiSongQuery');
 const songSelectEl = document.getElementById('midiSongSelect');
+const songMirrorEl = document.getElementById('midiSongMirror');
 
 const categorySet = new Set();
 let requestToken = 0;     // 搜尋的請求代號：晚回來的舊結果不能蓋掉新的
@@ -745,6 +746,9 @@ function renderLibraryPicker({ player }) {
   }
   songSelectEl.disabled = lib.status !== 'ready';
   if (songSelectEl.value !== lib.selectedId) songSelectEl.value = lib.selectedId;
+  // 鏡像文字＝下拉目前顯示的那一項（placeholder 也算）：原生下拉關著時會把超出的歌名截斷，改由上面這層跑馬燈顯示
+  const shown = songSelectEl.selectedOptions[0]?.text ?? '';
+  setMarqueeText(songMirrorEl, shown, songSelectEl.selectedIndex > 0 ? shown : '');
 }
 
 /* ═══════════════════════════════════════════
@@ -773,9 +777,7 @@ const songPanelFields = {
 function buildPartRow(unit, playerCount) {
   const row = partRowTemplate.content.firstElementChild.cloneNode(true);
   row.dataset.partId = unit.id;
-  const name = row.querySelector('.score-part-name');
-  name.textContent = unit.name;
-  name.title = unit.name;
+  setMarqueeText(row.querySelector('.score-part-name'), unit.name);
   const select = row.querySelector('.score-part-id');
   select.dataset.partId = unit.id;
   select.append(new Option('無', ''), new Option('PC 鍵盤手', KEYBOARD_SLOT));
@@ -794,10 +796,7 @@ function renderSongPanel({ player }) {
   const isLocal = player.source?.kind === 'local';
   const name = isLocal ? player.source.name : '';
   const shown = name || '未選擇檔案';
-  if (localFileName.textContent !== shown) {
-    localFileName.textContent = shown;
-    localFileName.title = name;
-  }
+  setMarqueeText(localFileName, shown, name);
   // 來源不是本地檔案（雲端曲目、取消、格式不支援）就把檔案輸入清掉，同一個檔案才能再次觸發 change。
   if (!isLocal && localInput.value) localInput.value = '';
 

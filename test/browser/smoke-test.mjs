@@ -723,6 +723,72 @@ async function driveAssignmentUnits(page, problems) {
   await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 5000 });
 }
 
+// 跑馬燈（.mq，純 CSS）：選歌面板裡超出欄位寬度的名稱（本地檔名、歌曲下拉的已選歌名、分譜名稱）頭尾相連 loop，放得下的不動；
+// 面板關閉時動畫停止（display:none），重新打開再開始。
+async function driveMarquee(page, problems) {
+  console.log('▶ 跑馬燈：超出欄位才 loop、放得下不動、面板關閉就停…');
+  const LONG_NAME = '帕海貝爾卡農 D 大調管弦樂改編版 Pachelbel Canon in D (orchestral arrangement).mid';
+  const panelOpen = () => page.evaluate(() => !document.getElementById('panel-song').hidden);
+  const marquee = (sel) => page.evaluate((s) => {
+    const el = document.querySelector(s), track = el.querySelector('.mq-track');
+    return { loop: getComputedStyle(el.querySelector('.mq-loop')).display, copy: getComputedStyle(track, '::before').content, main: el.querySelector('.mq-main').textContent,
+      title: el.title, dur: parseFloat(getComputedStyle(track).animationDuration) };
+  }, sel);
+  const running = () => page.evaluate(() => document.getAnimations().filter((a) => a.effect?.target?.classList?.contains('mq-track') && a.playState === 'running').length);
+  if (!(await panelOpen())) await page.click('#song-toggle');
+
+  // 本地檔名：長的 loop（複本文字、速度依字數、title 是完整名稱），短的不動
+  await loadLocalFile(page, { ...TINY_MIDI, name: LONG_NAME });
+  await page.waitForTimeout(300);
+  let m = await marquee('#localMidiFileName');
+  check(m.loop === 'block' && m.copy.includes('帕海貝爾') && m.main === LONG_NAME && m.title === LONG_NAME && m.dur > 5, '超出欄位的本地檔名 loop（複本是完整名稱、title 是完整名稱、繞一圈超過 5 秒）', problems, JSON.stringify(m));
+  check(await running() >= 1, '面板開著、有超出的名稱：loop 動畫執行中', problems);
+  await loadLocalFile(page, { ...TINY_MIDI, name: 'a.mid' });
+  await page.waitForTimeout(300);
+  m = await marquee('#localMidiFileName');
+  check(m.loop === 'none', '放得下的本地檔名不 loop', problems, JSON.stringify(m));
+
+  // 歌曲下拉的鏡像文字：已選歌名超出欄位 loop，placeholder 放得下不動（直接寫 store，不經網路）
+  const LONG_SONG = '卡農 D 大調（Canon in D）— 帕海貝爾 Johann Pachelbel 管弦樂改編版';
+  const savedLibrary = await page.evaluate((title) => {
+    const s = window.__hf.store, prev = s.state.library;
+    s.set({ library: { ...prev, status: 'ready', items: [{ id: 'mq1', title, composer: '' }], selectedId: 'mq1' } });
+    return prev;
+  }, LONG_SONG);
+  await page.waitForTimeout(300);
+  m = await marquee('#midiSongMirror');
+  check(m.loop === 'block' && m.main === LONG_SONG && m.copy.includes('卡農'), '歌曲下拉：超出欄位的已選歌名由鏡像文字 loop', problems, JSON.stringify(m));
+  await page.evaluate((prev) => window.__hf.store.set({ library: { ...prev, status: 'ready', items: [], selectedId: '' } }), savedLibrary);
+  await page.waitForTimeout(300);
+  m = await marquee('#midiSongMirror');
+  check(m.loop === 'none' && m.main.length > 0, '歌曲下拉：退回 placeholder（放得下）不 loop', problems, JSON.stringify(m));
+
+  // 分譜名稱：單聲部兩譜表的名稱（附音域與音數）在面板寬度下超出，loop；title 是完整名稱
+  await loadLocalFile(page, PIANO_MIDI);
+  await page.waitForTimeout(300);
+  const names = await page.evaluate(() => [...document.querySelectorAll('#scorePartList .score-part-name')].map((el) => ({ loop: getComputedStyle(el.querySelector('.mq-loop')).display, main: el.querySelector('.mq-main').textContent, title: el.title, track: el.querySelector('.mq-track').dataset.text })));
+  check(names.length === 2 && names.every((n) => n.title === n.main && n.track === n.main && n.main.startsWith('大鋼琴・譜表')), '分譜名稱的原文、複本、title 一致', problems, JSON.stringify(names));
+  // 面板寬度下兩個譜表名稱放得下與否取決於字級，這裡只驗「超出的才 loop」這個不變量：loop 顯示 ⇔ 原文寬度大於欄位
+  const consistent = await page.evaluate(() => [...document.querySelectorAll('#panel-song .mq')].every((el) => {
+    const overflow = el.querySelector('.mq-main').getBoundingClientRect().width > el.clientWidth + 0.5;
+    return (getComputedStyle(el.querySelector('.mq-loop')).display === 'block') === overflow;
+  }));
+  check(consistent, '面板裡每個跑馬燈欄位：超出欄位寬度 ⇔ loop 顯示', problems);
+
+  // 面板關閉：動畫全停；重新打開：長名稱又開始
+  await loadLocalFile(page, { ...TINY_MIDI, name: LONG_NAME });
+  await page.waitForTimeout(300);
+  await page.click('#panel-song .tl-close');
+  await page.waitForTimeout(300);
+  check(await running() === 0, '關閉選歌面板：所有 loop 動畫停止', problems);
+  await page.click('#song-toggle');
+  await page.waitForTimeout(300);
+  check(await running() >= 1, '重新打開選歌面板：超出的名稱又開始 loop', problems);
+
+  // 還原：換回範例樂譜（後面的流程照舊）
+  await loadLocalFile(page, { name: 'canon-violin-cello.mid', mimeType: 'audio/midi', buffer: readFileSync(SAMPLE_MIDI) });
+}
+
 // 不先選現場人數、不碰攝影機：另開頁面，載入單聲部的歌，下拉只有「無／PC 鍵盤手」，指派給 PC 鍵盤手後 ▶ 、按鍵就放行。
 async function driveKeyboardWithoutPoseCount(browser, problems) {
   console.log('▶ 沒選現場人數：單聲部的歌指派給 PC 鍵盤手，▶ 後按鍵放行（另開頁面）…');
@@ -995,6 +1061,7 @@ async function main() {
     await drivePreviewBadBytes(page, problems);
     await driveTransportTable(page, problems);
     await driveAssignmentUnits(page, problems);
+    await driveMarquee(page, problems);
     await drivePreviewEngineFailure(browser, problems);
     await driveKeyboardWithoutPoseCount(browser, problems);
 

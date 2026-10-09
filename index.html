@@ -108,16 +108,22 @@
                 <div class="file-picker">
                   <label for="localMidiInput" class="btn file-picker-btn">選擇檔案</label>
                   <input type="file" id="localMidiInput" accept=".mid,.midi" class="file-picker-input" data-field="local-file">
-                  <span id="localMidiFileName" class="file-picker-name">未選擇檔案</span>
+                  <!-- 超出欄位寬度的名稱用 .mq 跑馬燈頭尾相連 loop（見 styles.css 的「跑馬燈」）；文字由 ui.js 的 setMarqueeText() 寫入 -->
+                  <span id="localMidiFileName" class="mq file-picker-name"><span class="mq-main">未選擇檔案</span><span class="mq-loop" aria-hidden="true"><span class="mq-track" data-text="未選擇檔案"></span></span></span>
                 </div>
                 <div class="player-row">
                   <select id="midiCategory" class="player-input" data-field="category"></select>
                   <input type="text" id="midiSongQuery" class="player-input" data-field="song-query" placeholder="搜尋歌曲" autocomplete="off">
                 </div>
-                <!-- 原生 <select>：展開後的選項清單寬度由瀏覽器自己決定，刻意不做自訂下拉。 -->
-                <select id="midiSongSelect" class="player-input" data-field="song" disabled>
-                  <option value="">請選擇歌曲</option>
-                </select>
+                <!-- 原生 <select>：展開後的選項清單寬度由瀏覽器自己決定，刻意不做自訂下拉。關著時顯示的已選歌名，
+                     超出欄位寬度的部分原生下拉會直接截斷，所以在它上面疊一份鏡像文字（#midiSongMirror，.mq 跑馬燈，不吃點擊、
+                     對讀屏隱藏），文字由 midiPlayer.js 跟著選項同步。 -->
+                <div class="select-mq">
+                  <select id="midiSongSelect" class="player-input" data-field="song" disabled>
+                    <option value="">請選擇歌曲</option>
+                  </select>
+                  <span id="midiSongMirror" class="mq" aria-hidden="true"><span class="mq-main">請選擇歌曲</span><span class="mq-loop"><span class="mq-track" data-text="請選擇歌曲"></span></span></span>
+                </div>
               </div>
               <div id="scorePartSection" hidden>
                 <div id="scoreInfoText" class="score-info-text"></div>
@@ -146,7 +152,7 @@
        src/midi/midiPlayer.js clone 這個 template，用 textContent 填名字、new Option 填選項。 -->
   <template id="tpl-part-row">
     <div class="score-part-row">
-      <span class="score-part-name"></span>
+      <span class="mq score-part-name"><span class="mq-main"></span><span class="mq-loop" aria-hidden="true"><span class="mq-track" data-text=""></span></span></span>
       <select class="score-part-id player-input" data-field="part-assign" aria-label="指派演奏者"></select>
     </div>
   </template>

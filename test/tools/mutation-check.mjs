@@ -303,6 +303,15 @@ const MUTATIONS = [
     expect: ['單聲部的歌也列出指派下拉'] },
   { name: '指派：譜表名稱不附音域與音數', target: PLAYER, suites: ['smoke'], edits: [['      if (Number.isInteger(staff.noteCount)) facts.push(`${staff.noteCount} 音`);', '      void 0;']],
     expect: ['單聲部的多行譜（鋼琴兩行）改列兩個譜表，名稱附音域與音數'] },
+  // ── 跑馬燈（選歌面板裡超出欄位的名稱）──
+  { name: '跑馬燈：超出時 loop 疊層不顯示（名稱照樣被截斷）', target: 'src/styles.css', suites: ['smoke'], edits: [['  .mq-loop { display: block; }', '  .mq-loop { display: none; }']],
+    expect: ['超出欄位的本地檔名 loop'] },
+  { name: '跑馬燈：放得下的名稱也 loop（疊層一直顯示）', target: 'src/styles.css', suites: ['smoke'], edits: [['.mq-loop { position: absolute; inset: 0; overflow: hidden; display: none; }', '.mq-loop { position: absolute; inset: 0; overflow: hidden; display: block; }']],
+    expect: ['放得下的本地檔名不 loop', '歌曲下拉：退回 placeholder'] },
+  { name: '跑馬燈：不寫 loop 用的複本文字（data-text）', target: 'src/ui.js', suites: ['smoke'], edits: [['  track.dataset.text = text;', '  void 0;']],
+    expect: ['超出欄位的本地檔名 loop', '分譜名稱的原文、複本、title 一致'] },
+  { name: '歌曲下拉：鏡像文字不跟選項同步', target: PLAYER, suites: ['smoke'], edits: [["  setMarqueeText(songMirrorEl, shown, songSelectEl.selectedIndex > 0 ? shown : '');", '  void shown;']],
+    expect: ['歌曲下拉：超出欄位的已選歌名由鏡像文字 loop'] },
   // ── 試聽：播放列與引擎接線（瀏覽器測試，每個一分多鐘）──
   { name: '換來源時不把播放列切回演奏（試聽 mode 殘留）', target: PLAYER, suites: ['smoke'], edits: [["playerStore.set({ mode: 'perform', transport: 'idle', notice: null, started: false, finished: false, previewDuration: 0 });", "playerStore.set({ transport: 'idle', notice: null, started: false, finished: false, previewDuration: 0 });"]],
     expect: ['換歌', '按鈕狀態'] },

@@ -64,6 +64,22 @@ export function rafThrottle(fn) {
   };
 }
 
+// 跑馬燈欄位（.mq，樣式與運作原理見 styles.css 的「跑馬燈」）寫入文字：
+//  · .mq-main 放原文：CSS 用它的寬度判斷「有沒有超出欄位」，也是讀屏讀到的文字；
+//  · .mq-track 的 data-text 是頭尾相連 loop 用的複本（CSS 的 ::before／::after 各畫一份，所以要寫在屬性裡）；
+//  · data-len 是字寬的權重（全形字 1、其餘 0.55，約等於 em 數），CSS 用它換算動畫時間：字越多繞一圈越久，捲動速度大致固定。
+// title 讓滑鼠停著時能看到完整名稱。只在文字變了才寫 DOM。
+const WIDE_CHAR = /[\u2E80-\uFFEF]/;
+export function setMarqueeText(el, text, title = text) {
+  const main = el.querySelector('.mq-main');
+  if (main.textContent === text) return;
+  const track = el.querySelector('.mq-track');
+  main.textContent = text;
+  track.dataset.text = text;
+  track.dataset.len = String(Math.round([...text].reduce((sum, ch) => sum + (WIDE_CHAR.test(ch) ? 1 : 0.55), 0) * 10) / 10);
+  el.title = title;
+}
+
 /* ═══════════════════════════════════════════
    🗂️ 外殼自己的 UI 狀態
    ═══════════════════════════════════════════ */
