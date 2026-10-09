@@ -737,12 +737,22 @@ async function driveMarquee(page, problems) {
   const running = () => page.evaluate(() => document.getAnimations().filter((a) => a.effect?.target?.classList?.contains('mq-track') && a.playState === 'running').length);
   if (!(await panelOpen())) await page.click('#song-toggle');
 
+  const progressMs = (sel) => page.evaluate((s) => { const a = document.querySelector(s + ' .mq-track').getAnimations()[0]; return a ? a.currentTime : null; }, sel);
   // 本地檔名：長的 loop（複本文字、速度依字數、title 是完整名稱），短的不動
   await loadLocalFile(page, { ...TINY_MIDI, name: LONG_NAME });
   await page.waitForTimeout(300);
   let m = await marquee('#localMidiFileName');
   check(m.loop === 'block' && m.copy.includes('帕海貝爾') && m.main === LONG_NAME && m.title === LONG_NAME && m.dur > 5, '超出欄位的本地檔名 loop（複本是完整名稱、title 是完整名稱、繞一圈超過 5 秒）', problems, JSON.stringify(m));
   check(await running() >= 1, '面板開著、有超出的名稱：loop 動畫執行中', problems);
+  // 換歌：另一個也很長的名稱，loop 要從頭開始，不能接續上一首已經跑到的位置
+  await page.waitForTimeout(2500);
+  const played = await progressMs('#localMidiFileName');
+  await loadLocalFile(page, { ...TINY_MIDI, name: '第二首也很長 ' + LONG_NAME });
+  await page.waitForTimeout(300);
+  const restarted = await progressMs('#localMidiFileName');
+  check(played > 2500 && restarted !== null && restarted < 1500, '連續換成另一首長名稱：loop 從頭開始（不接續上一首的位置）', problems, `換歌前 ${played}ms、換歌 0.3 秒後 ${restarted}ms`);
+  await loadLocalFile(page, { ...TINY_MIDI, name: LONG_NAME });
+  await page.waitForTimeout(300);
   await loadLocalFile(page, { ...TINY_MIDI, name: 'a.mid' });
   await page.waitForTimeout(300);
   m = await marquee('#localMidiFileName');
@@ -778,12 +788,16 @@ async function driveMarquee(page, problems) {
   // 面板關閉：動畫全停；重新打開：長名稱又開始
   await loadLocalFile(page, { ...TINY_MIDI, name: LONG_NAME });
   await page.waitForTimeout(300);
+  await page.waitForTimeout(2800);
+  const playedBeforeClose = await progressMs('#localMidiFileName');
   await page.click('#panel-song .tl-close');
   await page.waitForTimeout(300);
   check(await running() === 0, '關閉選歌面板：所有 loop 動畫停止', problems);
   await page.click('#song-toggle');
   await page.waitForTimeout(300);
   check(await running() >= 1, '重新打開選歌面板：超出的名稱又開始 loop', problems);
+  const reopened = await progressMs('#localMidiFileName');
+  check(reopened !== null && reopened < 1500 && playedBeforeClose > 2500, '重新打開選歌面板：loop 從頭開始（不接續關閉前的位置）', problems, `關閉前 ${playedBeforeClose}ms、重新打開 0.3 秒後 ${reopened}ms`);
 
   // 還原：換回範例樂譜（後面的流程照舊）
   await loadLocalFile(page, { name: 'canon-violin-cello.mid', mimeType: 'audio/midi', buffer: readFileSync(SAMPLE_MIDI) });

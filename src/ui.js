@@ -68,6 +68,7 @@ export function rafThrottle(fn) {
 //  · .mq-main 放原文：CSS 用它的寬度判斷「有沒有超出欄位」，也是讀屏讀到的文字；
 //  · .mq-track 的 data-text 是頭尾相連 loop 用的複本（CSS 的 ::before／::after 各畫一份，所以要寫在屬性裡）；
 //  · data-len 是字寬的權重（全形字 1、其餘 0.55，約等於 em 數），CSS 用它換算動畫時間：字越多繞一圈越久，捲動速度大致固定。
+// data-phase 每次換字翻轉一次：CSS 靠它換動畫名稱，讓 loop 從頭開始（見 styles.css 的「跑馬燈」）。
 // title 讓滑鼠停著時能看到完整名稱。只在文字變了才寫 DOM。
 const WIDE_CHAR = /[\u2E80-\uFFEF]/;
 export function setMarqueeText(el, text, title = text) {
@@ -76,6 +77,7 @@ export function setMarqueeText(el, text, title = text) {
   const track = el.querySelector('.mq-track');
   main.textContent = text;
   track.dataset.text = text;
+  track.dataset.phase = track.dataset.phase === 'b' ? 'a' : 'b';
   track.dataset.len = String(Math.round([...text].reduce((sum, ch) => sum + (WIDE_CHAR.test(ch) ? 1 : 0.55), 0) * 10) / 10);
   el.title = title;
 }

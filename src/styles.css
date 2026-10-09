@@ -689,8 +689,11 @@ body, html {
        .mq-loop     絕對定位、自己 overflow:hidden 的疊層（所以它的內容不會讓 .mq 變成「可捲動」，不然放得下的字也會被判成超出）
          .mq-track  原文複本×2（::before／::after 各畫 data-text 一份，中間隔 2em），往左移動一份的寬度（-50%）剛好銜接回起點
    超出時（@container scroll-state(scrollable: inline)）原文改成透明、疊層顯示；放得下時疊層維持 display:none。
-   面板關閉（hidden → display:none）時瀏覽器不跑動畫，重新打開從頭再來。繞一圈的秒數＝字寬權重（data-len）× 0.3s，
-   字越多越久，捲動速度大致固定；開頭停 1 秒再開始，先看得到名稱的開頭。 */
+   面板關閉（hidden → display:none）時瀏覽器不跑動畫，重新打開從頭再來。繞一圈的秒數＝字寬權重（data-len）× 0.4s，
+   字越多越久，捲動速度大致固定；開頭停 1 秒再開始，先看得到名稱的開頭。
+   換文字（換歌）時要從頭再來：CSS 看不到「文字內容變了」，所以 setMarqueeText() 每次換字就翻轉 .mq-track 的 data-phase，
+   兩個內容完全一樣、名字不同的 keyframes（mq-scroll-a／b）交替——瀏覽器看到動畫名稱換了就取消舊的、從頭開始新的，
+   重啟本身仍是 CSS 在做。 */
 .mq {
   position: relative; display: block; overflow: hidden; white-space: nowrap;
   container-type: scroll-state;
@@ -699,10 +702,12 @@ body, html {
 .mq-loop { position: absolute; inset: 0; overflow: hidden; display: none; }
 .mq-track {
   display: inline-block;
-  animation: mq-scroll max(5s, calc(attr(data-len type(<number>), 20) * 0.3s)) 1s linear infinite;
+  animation: mq-scroll-a max(6.5s, calc(attr(data-len type(<number>), 20) * 0.4s)) 1s linear infinite;
 }
+.mq-track[data-phase="b"] { animation-name: mq-scroll-b; }
 .mq-track::before, .mq-track::after { content: attr(data-text); padding-inline-end: 2em; }
-@keyframes mq-scroll { to { transform: translateX(-50%); } }
+@keyframes mq-scroll-a { to { transform: translateX(-50%); } }
+@keyframes mq-scroll-b { to { transform: translateX(-50%); } }   /* 跟 a 一模一樣，只為了換名字重啟動畫 */
 @container scroll-state(scrollable: inline) {
   .mq-main { color: transparent; }   /* 不用 visibility:hidden：它會把原文從讀屏的無障礙樹拿掉 */
   .mq-loop { display: block; }

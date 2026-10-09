@@ -310,6 +310,8 @@ const MUTATIONS = [
     expect: ['放得下的本地檔名不 loop', '歌曲下拉：退回 placeholder'] },
   { name: '跑馬燈：不寫 loop 用的複本文字（data-text）', target: 'src/ui.js', suites: ['smoke'], edits: [['  track.dataset.text = text;', '  void 0;']],
     expect: ['超出欄位的本地檔名 loop', '分譜名稱的原文、複本、title 一致'] },
+  { name: '跑馬燈：換文字時不重啟 loop（接續上一首的位置）', target: 'src/ui.js', suites: ['smoke'], edits: [["  track.dataset.phase = track.dataset.phase === 'b' ? 'a' : 'b';", '  void 0;']],
+    expect: ['連續換成另一首長名稱：loop 從頭開始'] },
   { name: '歌曲下拉：鏡像文字不跟選項同步', target: PLAYER, suites: ['smoke'], edits: [["  setMarqueeText(songMirrorEl, shown, songSelectEl.selectedIndex > 0 ? shown : '');", '  void shown;']],
     expect: ['歌曲下拉：超出欄位的已選歌名由鏡像文字 loop'] },
   // ── 試聽：播放列與引擎接線（瀏覽器測試，每個一分多鐘）──
