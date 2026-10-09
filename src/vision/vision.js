@@ -26,8 +26,14 @@ const CONFIG = {
   maxUsers: 4, // 最多鎖定並顯示的目標人數
 };
 
-// 只用 lite 模型（最快、抖動也最明顯，但足夠用）。
-const POSE_MODEL_PATH = "./src/assets/pose_landmarker_lite.task";
+// 只用 lite 模型（最快、抖動也最明顯，但足夠用）。CDN 為主、本地副本為備用：Google 官方 storage 的 /1/ 是釘死的版本（內容與
+// 本地副本逐位元相同），實測比 GitHub Pages 快得多（0.6 秒 vs 100 秒以上）；CDN 失敗（網路錯誤、HTTP 錯誤、下載到一半斷線、
+// 檔案壞了）才改載本地。不用逾時當備援條件——慢不等於壞，慢速連線下載本體本來就可能很久。
+const POSE_MODEL_URLS = [
+  "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
+  "./src/assets/pose_landmarker_lite.task",
+];
+let poseModelIndex = 0; // 目前採用的來源（POSE_MODEL_URLS 的索引）；CDN 失敗改用本地之後不再重試已經壞掉的那個
 
 // MediaPipe 的 numPoses（同時追幾個人）。這個數字決定 MediaPipe 的工作模式：「追到的人數 ≥
 // numPoses」時偵測器跳過、每個人的 ROI 由上一幀的 landmark 延續——沒有幽靈骨架、節點最穩；
@@ -840,18 +846,30 @@ function refreshStageHint() {
    ═══════════════════════════════════════════ */
 // 純粹建置，不動任何模組層狀態。
 async function loadPoseModel(numPoses) {
-  return PoseLandmarker.createFromOptions(visionFileset, {
-    // 不設 baseOptions.canvas：GPU delegate 官方文件說「GPU 處理時要綁」，但那是指把畫面
-    // 交給 MediaPipe 用 GPU texture 處理的情境；我們只吃 landmark 座標，畫面渲染是自己另外
-    // 管理的 WebGL context（見檔案開頭），兩邊搶同一個 canvas 反而會衝突，所以刻意不設。
-    baseOptions: { modelAssetPath: POSE_MODEL_PATH, delegate: "GPU" },
-    runningMode: "VIDEO",
-    numPoses,
-    minPoseDetectionConfidence: 0.5,
-    minPosePresenceConfidence: 0.5,
-    minTrackingConfidence: 0.5,
-    outputSegmentationMasks: false // 不需要分割遮罩，明寫掉而不是靠預設值
-  });
+  for (;;) {
+    const idx = poseModelIndex;
+    try {
+      return await PoseLandmarker.createFromOptions(visionFileset, {
+        // 不設 baseOptions.canvas：GPU delegate 官方文件說「GPU 處理時要綁」，但那是指把畫面
+        // 交給 MediaPipe 用 GPU texture 處理的情境；我們只吃 landmark 座標，畫面渲染是自己另外
+        // 管理的 WebGL context（見檔案開頭），兩邊搶同一個 canvas 反而會衝突，所以刻意不設。
+        baseOptions: { modelAssetPath: POSE_MODEL_URLS[idx], delegate: "GPU" },
+        runningMode: "VIDEO",
+        numPoses,
+        minPoseDetectionConfidence: 0.5,
+        minPosePresenceConfidence: 0.5,
+        minTrackingConfidence: 0.5,
+        outputSegmentationMasks: false // 不需要分割遮罩，明寫掉而不是靠預設值
+      });
+    } catch (err) {
+      if (idx >= POSE_MODEL_URLS.length - 1) throw err; // 最後一個來源也失敗：真的失敗，往上拋
+      // 同時有兩個建置在飛、同一個來源都失敗時，只前進一次（poseModelIndex 沒變才前進），不會跳過本地
+      if (poseModelIndex === idx) {
+        console.warn(`姿勢模型載入失敗（${POSE_MODEL_URLS[idx]}），改用 ${POSE_MODEL_URLS[idx + 1]}`, err);
+        poseModelIndex = idx + 1;
+      }
+    }
+  }
 }
 
 // 唯一的建置入口。回傳：建好的 landmarker，或 null ＝「等待期間被更新的請求取代，這次不算

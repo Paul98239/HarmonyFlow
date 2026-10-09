@@ -20,8 +20,14 @@ import { PreviewPlayer } from './previewPlayer.js';
 /* ═══════════════════════════════════════════
    常數
    ═══════════════════════════════════════════ */
-const SOUNDFONT_URL = './src/assets/GeneralUserGS.sf3';
-const FETCH_TIMEOUT_MS = 15000;
+// 音色庫：CDN 的 2.0.3 為主、本地的 2.0.1 為備用（依序試，任何一步失敗就換下一個）。CDN 網址釘在 SpessaSynth 官方 repo 的 commit
+// （6f75050 ＝「Update GeneralUser GS to 2.0.3」），不可變，不會無預警換內容。兩版的 preset 清單（bank／program／名稱）逐筆相同。
+// 不用逾時當備援條件：GitHub Pages 載 10.6MB 實測要 200 秒以上，慢不等於壞；只有網路錯誤、HTTP 錯誤、下載到一半斷線、
+// 檔案壞了載不進合成器才會換來源。
+const SOUNDFONT_URLS = [
+  'https://cdn.jsdelivr.net/gh/spessasus/SpessaSynth@6f75050/soundfonts/GeneralUserGS.sf3',
+  './src/assets/GeneralUserGS.sf3',
+];
 
 // spessasynth_lib 直接從 CDN 匯入（不經 import map）：jsDelivr 的 +esm 端點把 CJS/UMD
 // 套件轉成瀏覽器能 import 的 ESM。AudioWorklet 處理器跟套件入口在同一個套件目錄下，
@@ -103,16 +109,6 @@ function isDrumChannelIndex(ch) {
   return ch % CHANNELS_PER_PORT === DRUM_CHANNEL_OFFSET;
 }
 
-// 逾時只涵蓋「收到回應標頭」：`await fetch()` 在標頭到達時就 resolve、clearTimeout 也在那一刻
-// 執行，所以 ms 不限制 body 要下載多久。soundfont 有 10.6MB，慢速連線花一兩分鐘是正常的；
-// 不要把 `res.arrayBuffer()` 之類的 body 讀取搬進這個函式裡。
-async function fetchWithTimeout(url, ms = FETCH_TIMEOUT_MS) {
-  const c = new AbortController();
-  const t = setTimeout(() => c.abort(), ms);
-  try { return await fetch(url, { signal: c.signal }); }
-  finally { clearTimeout(t); }
-}
-
 export async function initEngine() {
   if (isReady) return true;
   if (initPromise) return initPromise;
@@ -152,14 +148,27 @@ export async function initEngine() {
       compressor.connect(masterGain);
       masterGain.connect(audioCtx.destination);
 
-      const res = await fetchWithTimeout(SOUNDFONT_URL);
-      if (!res.ok) throw new Error(`SoundFont 失敗 HTTP ${res.status}`);
-      const sfBuf = await res.arrayBuffer();
-      // addSoundBank 可能把 ArrayBuffer transfer 進 worklet 而 detach 掉，所以先複製一份
-      // 給第二個合成器，不能在第一次 add 之後才 slice。
-      const sfBufHuman = sfBuf.slice(0);
-      await synth.soundBankManager.addSoundBank(sfBuf, 'main');
-      await synthHuman.soundBankManager.addSoundBank(sfBufHuman, 'main');
+      // 依序試每個來源。同一個 id 'main' 重複加入會取代前一個（spessasynth_core 的 addSoundBank：「新增或取代同 ID 的音色庫」），
+      // 所以第一個來源只裝進一個合成器就失敗時，換下一個來源不會留下混版本的狀態。
+      let lastErr;
+      for (const url of SOUNDFONT_URLS) {
+        try {
+          const res = await fetch(url);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const sfBuf = await res.arrayBuffer();
+          // addSoundBank 可能把 ArrayBuffer transfer 進 worklet 而 detach 掉，所以先複製一份
+          // 給第二個合成器，不能在第一次 add 之後才 slice。
+          const sfBufHuman = sfBuf.slice(0);
+          await synth.soundBankManager.addSoundBank(sfBuf, 'main');
+          await synthHuman.soundBankManager.addSoundBank(sfBufHuman, 'main');
+          lastErr = undefined;
+          break;
+        } catch (err) {
+          lastErr = err;
+          console.warn(`SoundFont 載入失敗（${url}）`, err);
+        }
+      }
+      if (lastErr) throw new Error(`SoundFont 所有來源都失敗：${lastErr.message}`);
       if (synth.isReady) await synth.isReady;
       if (synthHuman.isReady) await synthHuman.isReady;
 

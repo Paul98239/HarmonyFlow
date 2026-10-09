@@ -1,7 +1,7 @@
 // ============================================================
 //  library-scan.mjs — 曲庫全掃：用整個遠端 MIDI 曲庫驗證排程器（手動執行，不進 CI，純 Node）
 //
-//  五種掃描（--only=parse,autoplay,perform,perpart,scenarios，預設全跑）：
+//  六種掃描（--only=parse,autoplay,perform,perpart,scenarios,notes，預設全跑）：
 //    parse      每首歌解析與聲部切分：沒有例外、至少 1 個 part、每個 staff 都分得到輸出 channel、警告分類統計、
 //               多聲部（可指派）的歌有幾首；〈蝸牛與黃鸝鳥〉必須切成「長笛、大鋼琴」（使用者用原始 MuseScore 檔確認過的金標準）；
 //               另外印出按鍵負擔：只有被指派的聲部要按（這裡取音符最多的聲部），每首歌要按幾下、原速下每秒要按幾下。
@@ -15,11 +15,15 @@
 //               （不再回來／回來）、第一下提早按——
 //               每個情境都用同一組不變量判定通過與否。
 //
+//    notes      loop 的音符分類統計（不演奏，只看排程器對每顆電腦音的 hold 判斷）：以音符最多的聲部當你的聲部，統計其餘電腦音
+//               ① 段內音（照自己的長度收）／② 對齊音（結尾對齊或接著你的起音，loop 到你按下那個起音）／③ 橫跨音（跨過你的起音，
+//               按下結尾之前最後一個起音後再響剩餘長度）／零長度的音／結尾超過最後一個起音的音各有多少，並列出對齊音最多與最少的歌。
+//
 //  曲庫：預設放在 test/tools/library/（不進 git）。第一次先 `--download` 從遠端曲庫抓下來（單連線＋間隔，已有的
 //  檔案會略過）；也可以用 --dir 指到別的資料夾。--limit=N 只掃前 N 首。
 //
 //  用法：node test/tools/library-scan.mjs --download
-//        node test/tools/library-scan.mjs [--dir=資料夾] [--only=parse,autoplay,perform,perpart,scenarios] [--limit=N]
+//        node test/tools/library-scan.mjs [--dir=資料夾] [--only=parse,autoplay,perform,perpart,scenarios,notes] [--limit=N]
 // ============================================================
 
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -31,7 +35,7 @@ import { autoPlayStats, driverPressLoad, driverSecs, makeRng, measure, onsetPres
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const [k, v = true] = a.replace(/^--/, '').split('='); return [k, v]; }));
 const DIR = resolve(args.dir || join(dirname(fileURLToPath(import.meta.url)), 'library'));
-const ONLY = new Set(String(args.only || 'parse,autoplay,perform,perpart,scenarios').split(','));
+const ONLY = new Set(String(args.only || 'parse,autoplay,perform,perpart,scenarios,notes').split(','));
 const LIMIT = Number(args.limit) || Infinity;
 const TICK_TOL_MS = 12.5;                          // 一個排程 tick（12ms）加浮點容差
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -151,9 +155,9 @@ function scanAutoplay(songs) {
 const STYLES = [['準時', 1, 0], ['快 20％', 0.8, 0], ['快 3 倍＋抖動 30％', 0.3, 0.3], ['慢 25％＋抖動 15％', 1.25, 0.15], ['慢 2 倍＋抖動 20％', 2, 0.2]];
 
 // 每次模擬共用的不變量（任何按鍵速度與人數都成立，沒有放寬的選項）：該放行的都發聲（你的音與電腦的音）、每個 noteOn 一個 noteOff、
-// 你的每顆音都在按鍵當下發聲、同一個 tick 的音同刻（差 0ms）；completePresses＝你的每個起音都有被按到，這時一個都不能沒被放行。
+// 你的每顆音都在按鍵當下發聲、同一個 tick 的音同刻（準時按時差 0ms；你早按時電腦段鎖讓電腦這一段晚起算，容許的差是記錄下來的電腦段落後）、電腦音依樂譜順序發聲不倒序；completePresses＝你的每個起音都有被按到，這時一個都不能沒被放行。
 const violations = (m, { completePresses = true } = {}) => m.releasedMissing || m.unpaired || m.strayOff || m.badVelocity
-  || m.offTrigger || m.syncMax > 0 || (completePresses && m.notReleased);
+  || m.offTrigger || m.syncMax > 0 || m.reversed || (completePresses && m.notReleased);
 
 function scanPerform(songs) {
   const multi = songs.filter((s) => s.score.parts.length >= 2 && rankedParts(s.score).length);
@@ -169,7 +173,7 @@ function scanPerform(songs) {
   console.log(`\n=== 多聲部歌曲 ${multi.length} 首 × ${STYLES.length} 種按鍵風格 ＝ ${rows.length} 次模擬（各指派音符最多的聲部）===`);
   console.log(`該放行卻沒發聲的音：${sum('releasedMissing')} 顆（${count((m) => m.releasedMissing)} 次模擬）；沒被放行的音（按得不夠多）：${sum('notReleased')} 顆；被去抖擋掉再重按的次數：${sum('blocked')}`);
   console.log(`每個 noteOn 一個 noteOff：沒收的音 ${sum('unpaired')} 個（${count((m) => m.unpaired)} 次）、多餘的 noteOff ${sum('strayOff')} 個、velocity 0 的 noteOn ${sum('badVelocity')} 個`);
-  console.log(`你的音不在按鍵當下發聲：${sum('offTrigger')} 顆；同刻音發聲差 > 0ms：${count((m) => m.syncMax > 0)} 次模擬（最大 ${Math.max(...rows.map((r) => r.m.syncMax))}ms）`);
+  console.log(`你的音不在按鍵當下發聲：${sum('offTrigger')} 顆；同刻音發聲差 > 0ms：${count((m) => m.syncMax > 0)} 次模擬（最大 ${Math.max(...rows.map((r) => r.m.syncMax))}ms）；電腦音倒序：${sum("reversed")} 顆（${count((m) => m.reversed)} 次）；電腦段落後最大 ${Math.max(...rows.map((r) => r.m.lagMax))}ms`);
   const bad = rows.filter((r) => violations(r.m));
   for (const r of bad.slice(0, 8)) console.log('  ✗', r.s.title, r.main.name, r.styleName, JSON.stringify(r.m));
   return bad.length;
@@ -236,6 +240,42 @@ function buildScenarios(score, rnd) {
   return out;
 }
 
+// loop 的音符分類：直接問排程器對每顆電腦音的 hold 判斷（_holdOf，游標在開頭＝所有起音都還沒放行），不演奏。不是違規檢查，只印統計。
+function scanNotes(songs) {
+  const total = { notes: 0, natural: 0, aligned: 0, spanning: 0, zero: 0, pastLast: 0 };
+  const perSong = [];
+  for (const s of songs) {
+    const main = rankedParts(s.score)[0];
+    if (!main || !s.score.timeDivision) continue;
+    const hp = new Scheduler();
+    hp.setSynths({ controllerChange() {}, programChange() {}, noteOn() {}, noteOff() {} }, { controllerChange() {}, programChange() {}, noteOn() {}, noteOff() {} });
+    hp.load(s.score, new Map([[main.id, 1]]));
+    if (hp._driverTicks.length < 20) continue;
+    const lastOnset = hp._driverTicks[hp._driverTicks.length - 1];
+    const c = { notes: 0, natural: 0, aligned: 0, spanning: 0, zero: 0, pastLast: 0 };
+    for (const { note } of hp._followers) {
+      c.notes++;
+      if (note.endTick <= note.startTick) c.zero++;
+      if (note.endTick > lastOnset) c.pastLast++;
+      const h = hp._holdOf(note);
+      if (!h) c.natural++; else if (h.tailSec > 0) c.spanning++; else c.aligned++;
+    }
+    for (const k of Object.keys(total)) total[k] += c[k];
+    perSong.push({ title: s.title, ...c });
+  }
+  const pc = (n) => `${((100 * n) / Math.max(1, total.notes)).toFixed(1)}%`;
+  console.log(`
+=== loop 的音符分類（${perSong.length} 首，各取音符最多的聲部當你的聲部，統計其餘 ${total.notes} 顆電腦音）===`);
+  console.log(`① 段內音（照自己的長度收）${total.natural}（${pc(total.natural)}）；② 對齊音（loop 到你按下那個起音）${total.aligned}（${pc(total.aligned)}）；③ 橫跨音（按下後再響剩餘長度）${total.spanning}（${pc(total.spanning)}）`);
+  console.log(`零長度的音 ${total.zero}；結尾超過最後一個起音的音 ${total.pastLast}（其中橫跨最後一個起音的算 ③，其餘照自己的長度收）`);
+  const ratio = (r) => r.aligned / Math.max(1, r.notes);
+  const sorted = perSong.filter((r) => r.notes >= 10).sort((a, b) => ratio(b) - ratio(a));   // 電腦音太少（單聲部的歌）的不排名
+  const show = (r) => `${r.title}（電腦音 ${r.notes}，對齊 ${(100 * ratio(r)).toFixed(0)}%、橫跨 ${(100 * r.spanning / Math.max(1, r.notes)).toFixed(0)}%）`;
+  console.log('對齊音比例最高：', sorted.slice(0, 3).map(show).join('；'));
+  console.log('對齊音比例最低：', sorted.slice(-3).map(show).join('；'));
+  return 0;
+}
+
 function scanScenarios(songs) {
   const byName = new Map();
   for (const s of songs.filter((x) => rankedParts(x.score).length >= 1)) {
@@ -251,7 +291,7 @@ function scanScenarios(songs) {
     const sum = (key) => runs.reduce((a, r) => a + r.m[key], 0);
     const bad = runs.filter((r) => violations(r.m, r.opts));
     failures += bad.length;
-    console.log(`${bad.length ? '✗' : '✓'} ${name}：${runs.length} 首；該放行卻沒發聲 ${sum('releasedMissing')}、沒收的音 ${sum('unpaired')}、非觸發當下發聲 ${sum('offTrigger')}、同刻音差最大 ${Math.max(...runs.map((r) => r.m.syncMax))}ms；曲末沒被放行的音 ${sum('notReleased')} 顆（${runs.filter((r) => r.m.notReleased).length} 首）`);
+    console.log(`${bad.length ? '✗' : '✓'} ${name}：${runs.length} 首；該放行卻沒發聲 ${sum('releasedMissing')}、沒收的音 ${sum('unpaired')}、非觸發當下發聲 ${sum('offTrigger')}、同刻音差最大 ${Math.max(...runs.map((r) => r.m.syncMax))}ms、電腦音倒序 ${sum("reversed")} 顆、電腦段落後最大 ${Math.max(...runs.map((r) => r.m.lagMax))}ms；曲末沒被放行的音 ${sum('notReleased')} 顆（${runs.filter((r) => r.m.notReleased).length} 首）`);
     for (const r of bad.slice(0, 3)) console.log('    ', r.s.title, JSON.stringify(r.m));
   }
   return failures;
@@ -271,5 +311,6 @@ if (ONLY.has('autoplay')) problems += scanAutoplay(songs);
 if (ONLY.has('perform')) problems += scanPerform(songs);
 if (ONLY.has('perpart')) problems += scanPerPart(songs);
 if (ONLY.has('scenarios')) problems += scanScenarios(songs);
+if (ONLY.has('notes')) problems += scanNotes(songs);
 console.log(`\n${problems ? `有 ${problems} 筆不符合` : '全部符合'}（${((Date.now() - started) / 1000).toFixed(0)} 秒）`);
 process.exitCode = problems ? 1 : 0;

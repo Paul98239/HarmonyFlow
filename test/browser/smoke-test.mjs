@@ -1017,6 +1017,52 @@ async function drivePreviewEngineFailure(browser, problems) {
   check(stray.length === 0, '引擎載入失敗的頁面沒有預期之外的 console error／warning／pageerror', problems, stray.join('；'));
 }
 
+// 兩個大檔（音色庫、姿勢模型）的 CDN 主檔在測試裡改由本地副本代答：CDN 的速度浮動很大（實測 2～150 秒），而每開一個新頁面都會
+// 重載一次，載入逾時就變得不可預測。CDN 失敗改載本地備用的路徑由 driveResourceFallback() 驗證（用沒有代答的頁面）。
+const BIG_FILES = [
+  { pattern: /cdn\.jsdelivr\.net\/gh\/spessasus\/SpessaSynth@[0-9a-f]+\/soundfonts\/GeneralUserGS\.sf3/, file: 'src/assets/GeneralUserGS.sf3' },
+  { pattern: /storage\.googleapis\.com\/mediapipe-models\/.+\/pose_landmarker_lite\.task/, file: 'src/assets/pose_landmarker_lite.task' },
+];
+async function serveBigFilesLocally(page) {
+  await page.route((url) => BIG_FILES.some((f) => f.pattern.test(url.href)), async (route) => {
+    const f = BIG_FILES.find((x) => x.pattern.test(route.request().url()));
+    await route.fulfill({ status: 200, contentType: 'application/octet-stream', headers: { 'access-control-allow-origin': '*' }, body: await readFile(join(REPO_ROOT, f.file)) });
+  });
+}
+
+// 資源載入備援：把兩個 CDN 主檔的網址擋掉（另開頁面、不代答）→ 音色庫與姿勢模型都改載 src/assets 的本地備用副本，各留一則 warn，
+// 引擎照常可用（載入樂譜後 ▶ 可按）。擋掉的請求會在 console 留下 net::ERR_FAILED，是預期的。
+async function driveResourceFallback(browser, problems) {
+  console.log('▶ 資源載入備援：擋掉音色庫與姿勢模型的 CDN 網址，改載本地備用（另開頁面）…');
+  const page = await browser.newPageRaw();
+  const stray = [], warns = [], reqs = [];
+  const EXPECTED = [/Failed to load resource/, /net::ERR/];
+  page.on('request', (r) => { if (/GeneralUserGS\.sf3|pose_landmarker_lite\.task/.test(r.url())) reqs.push(r.url()); });
+  page.on('console', (msg) => {
+    const text = msg.text();
+    if (isBenign(text) || EXPECTED.some((re) => re.test(text))) return;
+    if (msg.type() === 'warning' && /SoundFont 載入失敗|姿勢模型載入失敗/.test(text)) { warns.push(text); return; }
+    if (msg.type() === 'error' || msg.type() === 'warning') stray.push(`console.${msg.type()}: ${text}`);
+  });
+  page.on('pageerror', (err) => stray.push(`pageerror: ${err.message}`));
+  try {
+    await page.route((url) => BIG_FILES.some((f) => f.pattern.test(url.href)), (route) => route.abort());
+    await page.goto(`http://127.0.0.1:${PORT}/`, { waitUntil: 'load' });
+    await page.waitForFunction(() => !document.getElementById('app-shell')?.inert, { timeout: 60000 });
+    await page.selectOption('#poseCountSelect', '1');   // 姿勢模型是懶惰載入：選現場人數才建置
+    await page.waitForFunction(() => performance.getEntriesByType('resource').some((e) => e.name.endsWith('/src/assets/pose_landmarker_lite.task')), null, { timeout: 120000 });
+    check(reqs.some((u) => u.endsWith('/src/assets/GeneralUserGS.sf3')), '音色庫 CDN 失敗：改載本地備用副本', problems, reqs.join('；'));
+    check(reqs.some((u) => u.endsWith('/src/assets/pose_landmarker_lite.task')), '姿勢模型 CDN 失敗：改載本地備用副本', problems, reqs.join('；'));
+    check(warns.filter((w) => /SoundFont 載入失敗/.test(w)).length === 1 && warns.filter((w) => /姿勢模型載入失敗/.test(w)).length === 1, '備援各只留一則 warn（音色庫、姿勢模型）', problems, warns.join('；'));
+    await page.setInputFiles('#localMidiInput', SAMPLE_MIDI);
+    await page.waitForSelector('#btnPlay:not([disabled])', { timeout: 10000 });
+    check(true, '備援載入的音色庫讓引擎照常可用（載入樂譜後 ▶ 可按）', problems);
+  } finally {
+    await page.close();
+  }
+  check(stray.length === 0, '資源載入備援的頁面沒有預期之外的 console error／warning／pageerror', problems, stray.join('；'));
+}
+
 // 差異測試（test/unit/oracle.test.mjs）用的是 devDependency 釘住版本的 spessasynth_core；app 走 CDN 的
 // @latest，兩邊版本可能漂移。這裡只印出來、版本不同就提醒，不算測試失敗。
 async function reportOfficialVersions() {
@@ -1046,6 +1092,10 @@ async function main() {
   }
 
   const browser = await chromium.launch({ args: launchArgs });
+  // 之後每個新頁面都先裝上「兩個大檔的 CDN 主檔由本地副本代答」；沒有代答的頁面（資源載入備援）用 newPageRaw
+  const rawNewPage = browser.newPage.bind(browser);
+  browser.newPageRaw = rawNewPage;
+  browser.newPage = async (...a) => { const p = await rawNewPage(...a); await serveBigFilesLocally(p); return p; };
   const page = await browser.newPage();
 
   const problems = [];
@@ -1085,6 +1135,7 @@ async function main() {
     await driveMarquee(page, problems);
     await drivePreviewEngineFailure(browser, problems);
     await driveKeyboardWithoutPoseCount(browser, problems);
+    await driveResourceFallback(browser, problems);
 
     console.log(`▶ 靜置觀察 ${args.duration}ms，收集 console 訊息…`);
     await page.waitForTimeout(args.duration);

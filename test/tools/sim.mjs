@@ -189,7 +189,8 @@ export function onsetPresses(secs, { factor = 1, jitter = 0, rnd = Math.random, 
  *   releasedMissing＝0：該放行的音都發聲了（你的音：它所屬的 segment 已放行；電腦的音：它那一段已被按鍵啟動）；
  *   unpaired／strayOff／badVelocity＝0：每個 noteOn 一個 noteOff、不送 velocity 0（hold 著、等你按下一個起音的音不算沒收，見 held）；
  *   offTrigger＝0：你的每顆音都在某一次成功按鍵的那一刻發聲（0ms）；例外是前奏鎖：前奏中預按的第一個起音，在前奏播完那一刻放行；
- *   syncMax＝0：同一個 tick 的音（你的與電腦的）同刻發聲。
+ *   syncMax＝0：同一個 tick 的音（你的與電腦的）同刻發聲；你早按、電腦段鎖讓這一段晚起算時，容許的差是記錄下來的電腦段落後（再加一個 tick）；
+ *   reversed＝0：電腦音依樂譜順序發聲，不倒序（倒序＝電腦聲部往前跳）。lagMax 只是資訊：電腦段落後的最大值。
  * notReleased：曲末還沒被放行／啟動的音（按得不夠多、中途停手）——不是違規，由情境決定要不要求完整放行。
  * held：曲末還 hold 著、等你按到它結尾對齊的起音才會收的音（你中途停手時才會有；按完整首之後一定是 0）。
  */
@@ -212,8 +213,26 @@ export function measure(sim) {
     if (!byStart.has(r.note.startTick)) byStart.set(r.note.startTick, []);
     byStart.get(r.note.startTick).push(r.onMs);
   }
+  // 同刻：你早按時電腦段鎖會讓這一段的電腦音接在上一段殘餘的電腦音後面，同 tick 的電腦音因此比你晚「電腦段落後」那麼多（第 j 次放行
+  // 記一筆 hp._lagMs[j]，電腦音落在第一個 ≥ 錨點的 tick，再多一個 tick）；沒有落後（準時按）時仍要求嚴格 0ms。
+  const lagOfTick = new Map(hp._driverSegs.map((seg, i) => [seg.ticks, hp._lagMs[i] ?? 0]));
   let syncMax = 0;
-  for (const list of byStart.values()) if (list.length > 1) syncMax = Math.max(syncMax, Math.max(...list) - Math.min(...list));
+  for (const [ticks, list] of byStart) {
+    if (list.length < 2) continue;
+    const lag = lagOfTick.get(ticks) ?? 0;
+    syncMax = Math.max(syncMax, Math.max(...list) - Math.min(...list) - (lag > 0 ? lag + TICK_MS : 0));
+  }
+  syncMax = Math.max(0, syncMax);
+  // 電腦音不倒序：電腦音依 startTick 排，發聲時刻不能比前面（startTick 較小）的任何一顆更早——倒序就是電腦聲部往前跳
+  const assistRecs = records.filter((r) => r.label === 'assist').sort((a, b) => a.note.startTick - b.note.startTick);
+  let reversed = 0, maxOn = -Infinity;
+  for (let i = 0; i < assistRecs.length; ) {
+    let k = i;                                                   // 同 startTick 的一組（彼此不比）
+    while (k < assistRecs.length && assistRecs[k].note.startTick === assistRecs[i].note.startTick) k++;
+    for (let m = i; m < k; m++) if (assistRecs[m].onMs < maxOn) reversed++;
+    for (let m = i; m < k; m++) maxOn = Math.max(maxOn, assistRecs[m].onMs);
+    i = k;
+  }
   const pressedMs = new Set(pressLog.filter((p) => p.released).map((p) => p.ms));
   // 唯一的例外：前奏鎖期間被擋下的預按（released＝false），播放頭到入場點時由 tick() 自動放行第一個起音（第 0 個 driver segment）
   const prePressRelease = (r) => segOf.get(r.note) === 0 && pressLog.some((p) => !p.released && p.ms <= r.onMs);
@@ -223,7 +242,7 @@ export function measure(sim) {
   return {
     total, sounded: records.length, releasedMissing, notReleased, held,
     unpaired: records.filter((r) => r.offMs == null).length - held, strayOff: stats.strayOff, badVelocity: stats.badVelocity,
-    syncMax: Math.round(syncMax), offTrigger,
+    syncMax: Math.round(syncMax), reversed, lagMax: Math.round(Math.max(0, ...hp._lagMs)), offTrigger,
     pressCount: pressLog.length, released: pressLog.filter((p) => p.released).length, blocked: pressLog.filter((p) => !p.released).length,
     finished: hp.isFinished(),
   };

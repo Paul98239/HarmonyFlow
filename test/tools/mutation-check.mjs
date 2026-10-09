@@ -7,7 +7,7 @@
 //  跑被破壞的複本（HF_ROOT），每個要一分多鐘，所以只放確實要靠瀏覽器才抓得到的破壞。
 //  破壞用的字串必須在原始碼裡剛好出現一次；原始碼改了找不到就會直接報錯，提醒更新這張表。
 //
-//  用法：node test/tools/mutation-check.mjs [--only=關鍵字] [--skip-smoke | --only-smoke]
+//  用法：node test/tools/mutation-check.mjs [--only=關鍵字] [--skip-smoke | --only-smoke] [--suites=測試檔,測試檔]
 // ============================================================
 
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -22,18 +22,19 @@ const PRESS = 'src/midi/pressTiming.js', PREVIEW = 'src/midi/previewPlayer.js', 
 const ONLY = (process.argv.find((a) => a.startsWith('--only=')) || '').slice(7);
 const SKIP_SMOKE = process.argv.includes('--skip-smoke'); // 只跑單元測試抓得到的變異（快）
 const ONLY_SMOKE = process.argv.includes('--only-smoke'); // 只跑要靠瀏覽器測試抓的變異（慢）
+const SUITES = (process.argv.find((a) => a.startsWith('--suites=')) || '').slice(9).split(',').filter(Boolean); // 覆寫每個變異要跑的測試檔（例如 --suites=note-matrix：看這支單獨能抓到哪些變異）
 
 // edits：[原始碼裡的那一行（或片段）, 換成什麼]。expect：應該變紅的測試名稱關鍵字（任何一個變紅就算抓到）；
-// suites：要跑哪些測試檔（預設只跑排程器的單元測試）；target：破壞哪個檔（預設排程器）。
+// suites：要跑哪些測試檔（預設只跑排程器的單元測試）；matrix：true＝同時跑音符矩陣測試（所有音值×tick 解析度的收音時刻），它變紅也算抓到；target：破壞哪個檔（預設排程器）。
 const MUTATIONS = [
   // ── 排程器：driver／follower、按鍵啟動它負責的那一段、去抖、收音 ──
-  { name: 'FIFO 改回以音高為鍵（同音高的新音蓋掉舊音）', edits: [['queue.push({ endTick: note.endTick, offMs: hold ? Infinity : offMs, origOffMs: offMs, holdIdx: hold ? hold.idx : null, tailMs: hold ? hold.tailMs : 0, note, onTime: opts?.time, capped: false });', 'queue.length = 0; queue.push({ endTick: note.endTick, offMs: hold ? Infinity : offMs, origOffMs: offMs, holdIdx: hold ? hold.idx : null, tailMs: hold ? hold.tailMs : 0, note, onTime: opts?.time, capped: false });']],
+  { name: 'FIFO 改回以音高為鍵（同音高的新音蓋掉舊音）', edits: [['queue.push({ endTick: note.endTick, offMs: hold ? Infinity : offMs, holdIdx: hold ? hold.idx : null, tailSec: hold ? hold.tailSec : 0, note, onTime: opts?.time, capped: false });', 'queue.length = 0; queue.push({ endTick: note.endTick, offMs: hold ? Infinity : offMs, holdIdx: hold ? hold.idx : null, tailSec: hold ? hold.tailSec : 0, note, onTime: opts?.time, capped: false });']],
     expect: ['同音高重疊（先進先出）', '壓力測試'], suites: ['scheduler', 'oracle'] },
   { name: '一次按鍵放行兩個 driver segment', edits: [['this._segIndex = j + 1;', 'this._segIndex = j + 2;']],
     expect: ['按一下放行 driver 的下一個 segment'] },
   { name: 'parser：相同 startTick 的音不併成同一個 segment', target: PARSER, suites: ['midi-parser', 'scheduler'], edits: [['if (last && last.ticks === note.startTick) last.notes.push(note);', 'if (false) last.notes.push(note);']],
     expect: ['segments：相同 startTick', '按一下放行 driver 的下一個 segment'] },
-  { name: '同 tick 的電腦音晚一個排程 tick 才發聲（跟你的音沒有對齊）', edits: [['* 1000, clock);\n    this._emitPending();', '* 1000, clock);\n    void 0;']],
+  { name: '同 tick 的電腦音晚一個排程 tick 才發聲（跟你的音沒有對齊）', edits: [['* 1000) / this.playbackRate, clock);\n    this._emitPending();', '* 1000) / this.playbackRate, clock);\n    void 0;']],
     expect: ['按一下放行 driver 的下一個 segment', 'L3 同步', 'L2 完美演奏者'], suites: ['scheduler', 'oracle'] },
   { name: '沒在播放也放行（trigger 不檢查 playing）', edits: [['if (!this._playing || !this._assignedSlots.has(slot) ||', 'if (!this._assignedSlots.has(slot) ||']],
     expect: ['沒有放行的情況'] },
@@ -61,16 +62,18 @@ const MUTATIONS = [
     expect: ['lookahead：沒有交 AudioContext 時間'] },
   { name: '暫停不清掉預按', edits: [['this._preludeCredit = false; // 預按作廢：續播後要重新按', 'void 0;']],
     expect: ['預按後暫停再播放'] },
-  { name: '電腦音的發聲時刻不依 playbackRate 換算（起音沒有跟著你的速度）', edits: [['const dueMs = clockMs + ((startSec - scoreSec) * 1000) / rate;', 'const dueMs = clockMs + ((startSec - scoreSec) * 1000);']],
-    expect: ['音長不依速度換算'] },
-  { name: '電腦音的長度又依 playbackRate 換算（音長隨你的速度伸縮）', edits: [['offMs: dueMs + (this._secOf(note.endTick) - startSec) * 1000,', 'offMs: dueMs + ((this._secOf(note.endTick) - startSec) * 1000) / rate,']],
-    expect: ['音長不依速度換算'] },
-  { name: '你的音長度又依 playbackRate 換算（音長隨你的速度伸縮）', edits: [['clock + (this._secOf(note.endTick) - scoreSec) * 1000, clock);', 'clock + ((this._secOf(note.endTick) - scoreSec) * 1000) / this.playbackRate, clock);']],
-    expect: ['音長就是 MIDI 的音符長度', '音長不依速度換算'] },
+  { name: '電腦音的發聲時刻不依 playbackRate 換算（起音沒有跟著你的速度）', matrix: true, edits: [['const dueMs = clockMs + ((startSec - scoreSec) * 1000) / rate;', 'const dueMs = clockMs + ((startSec - scoreSec) * 1000);']],
+    expect: ['音長依你的速度等比例縮放'] },
+  { name: '電腦音的長度不依 playbackRate 換算（退回檔案長度：極慢時斷奏、極快時疊音）', matrix: true, edits: [['offMs: dueMs + ((this._secOf(note.endTick) - startSec) * 1000) / rate,', 'offMs: dueMs + (this._secOf(note.endTick) - startSec) * 1000,']],
+    expect: ['音長依你的速度等比例縮放'] },
+  { name: '你的音長度不依 playbackRate 換算（退回檔案長度）', matrix: true, edits: [['clock + ((this._secOf(note.endTick) - scoreSec) * 1000) / this.playbackRate, clock);', 'clock + (this._secOf(note.endTick) - scoreSec) * 1000, clock);']],
+    expect: ['音長依你的速度等比例縮放'] },
   { name: '新的一段啟動時丟掉上一段沒放完的電腦音（提早按就丟音）', edits: [['    this._pending = merged;', '    this._pending = fresh;']],
     expect: ['提早按：上一段沒放完的電腦音', '壓力測試'] },
+  // 電腦段鎖保證新一段的時刻不早於上一段的最後一顆，一般按鍵下 concat 與合併結果相同；只有 reassign 之後留下的舊音（排定時刻可能晚於
+  // 新計畫這一段的第一顆）才需要真的依 dueMs 合併
   { name: '新的一段的電腦音直接接在佇列後面（不依 dueMs 合併排序）', edits: [['    this._pending = merged;', '    this._pending = old.concat(fresh);']],
-    expect: ['提早按：上一段沒放完的電腦音', '壓力測試'] },
+    expect: ['reassign：留下的舊音與新計畫這一段'] },
   { name: '每一段的第一個電腦音位置只設一次（跳過沒有電腦音的段）', edits: [['      while (s <= slice) this._sliceFirst[s++] = i;', '      if (s <= slice) this._sliceFirst[s++] = i;']],
     expect: ['按一下放行 driver 的下一個 segment', '壓力測試'] },
   { name: '播放頭可以越過你的下一個起音（拿掉停格上限）', edits: [['    if (next) sec = Math.min(sec, this._secOf(next.ticks));', '    void next;']],
@@ -80,7 +83,7 @@ const MUTATIONS = [
   { name: '去抖的「上一次按鍵間隔」不算被忽略的按鍵（一開始就比檔案快的人永遠被擋）', edits: [['    if (this._lastAttemptClock != null) this._lastAttemptIntervalMs = clock - this._lastAttemptClock;\n    this._lastAttemptClock = clock;\n    this._logPress(slot, clock, !blocked);   // 被擋掉記 false，放行記 true（放行必定接著 _release()）\n    if (blocked) return false;', '    this._logPress(slot, clock, !blocked);   // 被擋掉記 false，放行記 true（放行必定接著 _release()）\n    if (blocked) return false;\n    if (this._lastAttemptClock != null) this._lastAttemptIntervalMs = clock - this._lastAttemptClock;\n    this._lastAttemptClock = clock;']],
     expect: ['去抖不會把「一開始就比檔案快」的人永遠擋住'] },
   { name: 'playbackRate 不估速（永遠 1×）', edits: [['this.playbackRate = estimatePlaybackRate(this._history, this.playbackRate);', 'this.playbackRate = 1;']],
-    expect: ['playbackRate：第一次按之前', '音長不依速度換算', '提早按'] },
+    expect: ['playbackRate：第一次按之前', '音長依你的速度等比例縮放', '提早按'] },
   { name: '停手超過閒置門檻之後的間隔也拿來估速', edits: [['    if (this._isIdleBreak(clock)) this._history = [];', '    void 0;']],
     expect: ['慢按：電腦聲部放完這一段就停'] },
   { name: '放行 segment 時先開後收（拿掉開始前的收音）', edits: [['this._closeByTick(seg.ticks);', 'void 0;']],
@@ -96,24 +99,41 @@ const MUTATIONS = [
   { name: '拿掉尾巴收尾（同譜表新音發聲時舊音照原排程收，疊音比檔案多）', edits: [['if (capMs < entry.offMs - EPS_MS) { entry.offMs = capMs; entry.capped = true; entry.holdIdx = null; }', 'if (false) { entry.offMs = capMs; entry.capped = true; entry.holdIdx = null; }']],
     expect: ['尾巴收尾：你按得比預估早', '尾巴收尾：檔案裡本來就有的重疊', '尾巴收尾對你的聲部同樣適用', '尾巴收尾：同音高', 'hold：同譜表的新音發聲時'] },
   // ── hold（loop 等你按下一個起音）──
-  { name: '拿掉 hold（結尾對齊起音的音也照原長收）', edits: [['    for (let c = lo - 1; c >= this._segIndex && a[c] > note.startTick; c--) {', '    for (let c = lo - 1; false; c--) {']],
+  { name: '拿掉 hold（結尾對齊起音的音也照原長收）', matrix: true, edits: [['    for (let c = lo - 1; c >= this._segIndex && a[c] > note.startTick; c--) {', '    for (let c = lo - 1; false; c--) {']],
     expect: ['hold：結尾接著你下一個起音', 'hold：同一個 tick', 'hold：前奏', 'hold：跨過多個起音', '相連音 hold'] },
-  { name: 'hold 容差：比例拿掉（匯出器統一縮短約 5% 的相連音不 hold，只剩 2 tick）', edits: [['const HOLD_GAP_RATIO = 1 / 8;', 'const HOLD_GAP_RATIO = 0;']],
+  { name: 'hold 容差：比例拿掉（匯出器統一縮短約 5% 的相連音不 hold，只剩 2 tick）', matrix: true, edits: [['const HOLD_GAP_RATIO = 1 / 8;', 'const HOLD_GAP_RATIO = 0;']],
     expect: ['hold 容差：匯出器統一縮短'] },
-  { name: 'hold 容差：上限拿掉（長音後面的短休止被填滿）', edits: [['if (a[mid] <= note.endTick + this._holdCapTicks) lo = mid + 1;', 'if (a[mid] <= note.endTick + 1e9) lo = mid + 1;']],
+  { name: 'hold 容差：上限拿掉（長音後面的短休止被填滿）', matrix: true, edits: [['if (a[mid] <= note.endTick + this._holdCapTicks) lo = mid + 1;', 'if (a[mid] <= note.endTick + 1e9) lo = mid + 1;']],
     expect: ['hold 容差：匯出器統一縮短'] },
-  { name: 'hold 容差：SMPTE 算不出上限（沒有 tick per quarter 的檔案相連音不 hold）', edits: [['this._score.secondsToMIDITicks?.(HOLD_GAP_MAX_SECONDS)', 'undefined']],
+  { name: 'hold 容差：SMPTE 算不出上限（沒有 tick per quarter 的檔案相連音不 hold）', matrix: true, edits: [['this._score.secondsToMIDITicks?.(HOLD_GAP_MAX_SECONDS)', 'undefined']],
     expect: ['沒有 tick per quarter'] },
-  { name: 'hold：橫跨起音的音不 hold（只看結尾對齊）', edits: [['if (gap <= 0) return { idx: c, tailMs: (this._secOf(note.endTick) - this._secOf(a[c])) * 1000 };', 'if (gap === 0) return { idx: c, tailMs: 0 }; if (gap < 0) return null;']],
+  { name: 'hold：橫跨起音的音不 hold（只看結尾對齊）', matrix: true, edits: [['if (gap <= 0) return { idx: c, tailSec: this._secOf(note.endTick) - this._secOf(a[c]) };', 'if (gap === 0) return { idx: c, tailSec: 0 }; if (gap < 0) return null;']],
     expect: ['hold：橫跨起音、結尾不對齊', '橫跨你下一個起音的長音不被閒置收音切掉', '橫跨多個起音的音，剩餘長度'] },
-  { name: 'hold：橫跨起音的音按下去就收（不再響完檔案裡剩下的長度）', edits: [['entry.offMs = Math.max(entry.origOffMs, clock + entry.tailMs);', 'entry.offMs = Math.max(entry.origOffMs, clock);']],
+  { name: 'hold：橫跨起音的音按下去就收（不再響完檔案裡剩下的長度）', matrix: true, edits: [['entry.offMs = clock + (entry.tailSec * 1000) / this.playbackRate;', 'entry.offMs = clock;']],
     expect: ['hold：橫跨起音、結尾不對齊', '橫跨多個起音的音，剩餘長度'] },
   { name: 'hold：已經放行的起音也 hold（早按之後才發聲的音永遠不收）', edits: [['    for (let c = lo - 1; c >= this._segIndex && a[c] > note.startTick; c--) {', '    for (let c = lo - 1; c >= 0 && a[c] > note.startTick; c--) {']],
     expect: ['hold：結尾對齊的起音已經按過了'] },
-  { name: 'hold：放行起音時不釋放 hold 的音', edits: [['this._releaseHeld(j, clock);', 'void 0;']],
+  { name: 'hold：放行起音時不釋放 hold 的音', edits: [['this._releaseHeld(j, clock, anchorClock);', 'void 0;']],
     expect: ['hold：結尾接著你下一個起音', 'hold：同一個 tick', 'hold：前奏', '相連音 hold'] },
-  { name: 'hold：釋放時直接用按下的時刻（早按會切斷還沒走完原長的音）', edits: [['entry.offMs = Math.max(entry.origOffMs, clock + entry.tailMs);', 'entry.offMs = clock + entry.tailMs;']],
-    expect: ['hold：你按得比預估早', '橫跨起音的音，你早按時'] },
+  { name: 'hold：剩餘長度不依速度換算（你慢時響得比樂譜短、你快時響得比樂譜長）', matrix: true, edits: [['entry.offMs = clock + (entry.tailSec * 1000) / this.playbackRate;', 'entry.offMs = clock + entry.tailSec * 1000;']],
+    expect: ['hold：橫跨起音、結尾不對齊', '橫跨起音的音，你早按時', '橫跨多個起音的音，剩餘長度'] },
+  { name: 'hold：對齊音在你按下那一刻不收（又多響一段，早按時響過頭）', matrix: true, edits: [['entry.offMs = clock + (entry.tailSec * 1000) / this.playbackRate;', 'entry.offMs = clock + (entry.tailSec * 1000) / this.playbackRate + 300;']],
+    expect: ['hold：你按得比預估早', 'hold：結尾接著你下一個起音'] },
+  // ── 電腦段鎖（你早按時電腦音不倒序，你的音仍 0ms）、多聲部長音保留 hold ──
+  { name: '電腦段鎖拿掉（你早按時，下一段的電腦音從按下的時刻起算，超車上一段還沒輪到的電腦音）', edits: [['const anchorClock = last && last.dueMs > clock', 'const anchorClock = false && last && last.dueMs > clock']],
+    expect: ['電腦段鎖：你早按時', '提早按：上一段沒放完的電腦音'] },
+  { name: '電腦段鎖：上一段還沒發聲的電腦音不加速（剩貨照老速度慢慢放，落後變大）', edits: [['if (LEFTOVER_CATCHUP > 1 && this._lastFollower && this._lastFollower.dueMs > clock)', 'if (false)']],
+    expect: ['提早按：上一段沒放完的電腦音', '電腦段鎖：你早按時'] },
+  { name: '電腦段鎖：有落後的那一段不加速追趕（落後逐段吃不回來）', edits: [['anchorClock > clock ? this.playbackRate * CATCHUP : this.playbackRate', 'this.playbackRate']],
+    expect: ['電腦段鎖：你早按時'] },
+  { name: '電腦段鎖：不記最後排進佇列的電腦音（段鎖永遠看不到殘餘音）', edits: [['if (lastP && (!this._lastFollower ||', 'if (false && lastP && (!this._lastFollower ||']],
+    expect: ['電腦段鎖：你早按時', '提早按：上一段沒放完的電腦音'] },
+  { name: '電腦段鎖：不記落後量（lagStats 沒有資料）', edits: [['this._lagMs.push(anchorClock - clock);', 'void 0;']],
+    expect: ['電腦段鎖：你早按時', '電腦段鎖：沒有殘餘'] },
+  { name: '電腦段鎖：播放頭在錨點之前往回退（沒有夾 0）', edits: [['Math.max(0, this._clockMs - a.clockMs)', '(this._clockMs - a.clockMs)']],
+    expect: ['電腦段鎖：你早按時'] },
+  { name: 'hold：多聲部長音被不同音高的新音修剪（拿掉檔案有重疊的例外）', matrix: true, edits: [['if (entry.holdIdx !== null && entry.note.midiNote !== note.midiNote && entry.endTick > note.startTick) continue;', 'void 0;']],
+    expect: ['hold：同一行譜的多聲部'] },
   { name: 'hold：hold 著的音擋住同音高後面已到期的音（先進先出看佇列最前面）', edits: [['const i = queue.findIndex((e) => e.holdIdx === null);', 'const i = 0;']],
     expect: ['hold：hold 著的音不擋住同音高'] },
   { name: 'hold：被同譜表新音截短之後仍 hold（放行時又蓋掉截短的收音時刻）', edits: [['entry.offMs = capMs; entry.capped = true; entry.holdIdx = null; }', 'entry.offMs = capMs; entry.capped = true; }']],
@@ -403,9 +423,10 @@ try {
       mutated = mutated.replace(find, () => replace);
     }
     writeFileSync(join(tmp, target), mutated);
-    const failed = (m.suites || ['scheduler']).flatMap((suite) => runSuite(tmp, suite));
+    const failed = (SUITES.length ? SUITES : [...(m.suites || ['scheduler']), ...(m.matrix ? ['note-matrix'] : [])]).flatMap((suite) => runSuite(tmp, suite));
     writeFileSync(join(tmp, target), originalOf(target)); // 還原，下一個變異從乾淨的複本開始
-    const caught = m.expect.filter((k) => failed.some((f) => f.includes(k)));
+    const expected = m.matrix ? [...m.expect, '穩定彈', '停手 4 秒', '手抖亂按'] : m.expect;   // matrix：音符矩陣測試（note-matrix.test.mjs）變紅也算抓到
+    const caught = expected.filter((k) => failed.some((f) => f.includes(k)));
     if (!caught.length) bad++;
     console.log(`${caught.length ? '✓' : '✗'} ${m.name}\n    指定的測試變紅：${caught.length ? caught.join('、') : '沒有！'}；全部變紅的測試 ${failed.length} 個${failed.length ? `：${failed.slice(0, 4).map((f) => f.slice(0, 40)).join('、')}${failed.length > 4 ? '…' : ''}` : ''}`);
   }

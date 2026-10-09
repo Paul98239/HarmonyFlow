@@ -2,8 +2,8 @@
 //  midiApi.js — 遠端 MIDI 曲庫 client（分類／搜尋／下載），純資料層、無 DOM
 //
 //  所有請求都有逾時保護；曲庫 API 回傳的每一筆都當成可能是壞的（型別檢查後跳過）。
-//  這裡的逾時涵蓋「連線 ＋ 整個 body 下載」（MIDI 檔只有幾 KB），跟 synth.js 的
-//  fetchWithTimeout 只涵蓋回應標頭不同——那邊擋的是 10.6MB 的 soundfont。
+//  這裡的逾時涵蓋「連線 ＋ 整個 body 下載」（MIDI 檔只有幾 KB）。大檔（音色庫、姿勢模型）不用逾時：
+//  慢不等於壞，只有真的出錯才換來源（見 synth.js 的 SOUNDFONT_URLS、vision.js 的 POSE_MODEL_URLS）。
 // ============================================================
 
 const MIDI_LIBRARY_API = "https://imuse.ncnu.edu.tw/Midi-library/api";

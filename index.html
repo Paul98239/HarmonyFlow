@@ -13,9 +13,11 @@
   <!-- ── 開場資源背景預先載入（瀏覽器原生機制，不經任何自訂 JS）──
        preload 在 HTML 解析階段就把請求發出去；之後 MediaPipe（modelAssetPath）與 SpessaSynth
        （fetch soundfont）載入同一個 URL 時直接沿用背景下載好的回應，不會重抓。
+       兩個大檔都是 CDN 為主（網址必須跟 src/vision/vision.js 的 POSE_MODEL_URLS[0]、src/midi/synth.js 的 SOUNDFONT_URLS[0]
+       逐字相同，不然預載白費）；本地副本只在 CDN 失敗時才載，不預載。
        modulepreload 讓本地 module graph 平行下載而不是逐層瀑布。 -->
-  <link rel="preload" as="fetch" href="./src/assets/pose_landmarker_lite.task" crossorigin>
-  <link rel="preload" as="fetch" href="./src/assets/GeneralUserGS.sf3" crossorigin>
+  <link rel="preload" as="fetch" href="https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task" crossorigin>
+  <link rel="preload" as="fetch" href="https://cdn.jsdelivr.net/gh/spessasus/SpessaSynth@6f75050/soundfonts/GeneralUserGS.sf3" crossorigin>
 
   <link rel="modulepreload" href="./src/main.js">
   <link rel="modulepreload" href="./src/ui.js">

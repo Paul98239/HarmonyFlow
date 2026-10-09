@@ -165,6 +165,11 @@ export function lateStats() {
   return synth.scheduler.lateStats();
 }
 
+// 量測（同上）：你早按時電腦段鎖讓電腦這一段比你按下的時刻晚了多少，見 scheduler.js 的 lagStats()。
+export function lagStats() {
+  return synth.scheduler.lagStats();
+}
+
 // 量測（同上）：你現在的速度估計（樂譜秒 ÷ 真實秒，見 scheduler.js 的 playbackRate）。<1 ＝ 比檔案慢，音長是檔案音長 ÷ 這個值。
 export function playbackRate() {
   return synth.scheduler.playbackRate;
