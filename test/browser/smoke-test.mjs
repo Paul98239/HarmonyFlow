@@ -48,7 +48,6 @@ const BENIGN_PATTERNS = [
                                           // app 自己的 JS console.warn／error 不會長這樣，用格式辨識
                                           // 比列舉每一種訊息內容更不容易漏
   /GL Driver Message/i,                  // 軟體／虛擬 GPU 算繪管線常見的效能提示，非 app 邏輯錯誤
-  /was preloaded using link preload but not used/i, // headcount 還沒選之前 pose 模型本來就不會被用到
 ];
 const isBenign = (text) => BENIGN_PATTERNS.some((re) => re.test(text));
 

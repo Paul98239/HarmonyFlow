@@ -35,6 +35,15 @@ const POSE_MODEL_URLS = [
 ];
 let poseModelIndex = 0; // 目前採用的來源（POSE_MODEL_URLS 的索引）；CDN 失敗改用本地之後不再重試已經壞掉的那個
 
+// 暖機：載入畫面收起之後，用低優先序的 fetch 把姿勢模型（約 5.8MB）先抓進瀏覽器的 HTTP 快取（Google storage 的
+// Cache-Control: public, max-age=3600），使用者第一次選現場人數時 MediaPipe 對同一個 URL 的請求直接命中快取。
+// 不用 <link rel="preload">：模型要等選了人數才會用到，沒在幾秒內用掉 Chrome 會在 console 報黃色警告；呼叫端也刻意等開機完成
+// 才叫，不跟開頁時 8.4MB 的音色庫搶頻寬。失敗不處理：之後真的載入時會走備援並留下 warn。
+export function warmPoseModel() {
+  if (poseModelIndex !== 0) return;   // 已改用本地副本，不必暖 CDN
+  fetch(POSE_MODEL_URLS[0], { priority: "low" }).then((r) => r.arrayBuffer()).catch(() => {});
+}
+
 // MediaPipe 的 numPoses（同時追幾個人）。這個數字決定 MediaPipe 的工作模式：「追到的人數 ≥
 // numPoses」時偵測器跳過、每個人的 ROI 由上一幀的 landmark 延續——沒有幽靈骨架、節點最穩；
 // 「追到的人數 < numPoses」時偵測器每幀重跑，幽靈與抖動都是這個狀態的產物。

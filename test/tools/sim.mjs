@@ -189,8 +189,9 @@ export function onsetPresses(secs, { factor = 1, jitter = 0, rnd = Math.random, 
  *   releasedMissing＝0：該放行的音都發聲了（你的音：它所屬的 segment 已放行；電腦的音：它那一段已被按鍵啟動）；
  *   unpaired／strayOff／badVelocity＝0：每個 noteOn 一個 noteOff、不送 velocity 0（hold 著、等你按下一個起音的音不算沒收，見 held）；
  *   offTrigger＝0：你的每顆音都在某一次成功按鍵的那一刻發聲（0ms）；例外是前奏鎖：前奏中預按的第一個起音，在前奏播完那一刻放行；
- *   syncMax＝0：同一個 tick 的音（你的與電腦的）同刻發聲；你早按、電腦段鎖讓這一段晚起算時，容許的差是記錄下來的電腦段落後（再加一個 tick）；
- *   reversed＝0：電腦音依樂譜順序發聲，不倒序（倒序＝電腦聲部往前跳）。lagMax 只是資訊：電腦段落後的最大值。
+ *   syncMax＝0：同一個 tick 的音（你的與電腦的）同刻發聲，沒有任何放寬——你早按時也一樣（早按的處理是追音或跳過，不讓這一段晚起算）；
+ *   reversed＝0：電腦音依樂譜順序發聲，不倒序（倒序＝電腦聲部往前跳；模擬沒有 lookahead，所以早按也沒有殘留的倒序）。
+ *   skipped／chased 只是資訊：你早按時整顆在你身後而跳過的電腦音、與 T_k 還該響著而追音的顆數（見 scheduler.js 的 _chaseOrSkip）。
  * notReleased：曲末還沒被放行／啟動的音（按得不夠多、中途停手）——不是違規，由情境決定要不要求完整放行。
  * held：曲末還 hold 著、等你按到它結尾對齊的起音才會收的音（你中途停手時才會有；按完整首之後一定是 0）。
  */
@@ -203,7 +204,7 @@ export function measure(sim) {
   for (const v of hp._staves.values()) {
     for (const n of v.notes) {
       total++;
-      if (sounded.has(n)) continue;
+      if (sounded.has(n) || hp._skipped.has(n)) continue;       // 早按跳過的音沒有發聲，但算處理過
       const released = v.kind === 'human' ? segOf.get(n) < hp._segIndex : hp._sliceOfTick(n.startTick) <= hp._anchoredSlice;
       if (released) releasedMissing++; else notReleased++;
     }
@@ -213,16 +214,12 @@ export function measure(sim) {
     if (!byStart.has(r.note.startTick)) byStart.set(r.note.startTick, []);
     byStart.get(r.note.startTick).push(r.onMs);
   }
-  // 同刻：你早按時電腦段鎖會讓這一段的電腦音接在上一段殘餘的電腦音後面，同 tick 的電腦音因此比你晚「電腦段落後」那麼多（第 j 次放行
-  // 記一筆 hp._lagMs[j]，電腦音落在第一個 ≥ 錨點的 tick，再多一個 tick）；沒有落後（準時按）時仍要求嚴格 0ms。
-  const lagOfTick = new Map(hp._driverSegs.map((seg, i) => [seg.ticks, hp._lagMs[i] ?? 0]));
+  // 同刻：同一個 startTick 的音一律嚴格 0ms（早按的追音也是一整組在按下的那一刻發聲，沒有任何容許量）
   let syncMax = 0;
-  for (const [ticks, list] of byStart) {
+  for (const list of byStart.values()) {
     if (list.length < 2) continue;
-    const lag = lagOfTick.get(ticks) ?? 0;
-    syncMax = Math.max(syncMax, Math.max(...list) - Math.min(...list) - (lag > 0 ? lag + TICK_MS : 0));
+    syncMax = Math.max(syncMax, Math.max(...list) - Math.min(...list));
   }
-  syncMax = Math.max(0, syncMax);
   // 電腦音不倒序：電腦音依 startTick 排，發聲時刻不能比前面（startTick 較小）的任何一顆更早——倒序就是電腦聲部往前跳
   const assistRecs = records.filter((r) => r.label === 'assist').sort((a, b) => a.note.startTick - b.note.startTick);
   let reversed = 0, maxOn = -Infinity;
@@ -242,7 +239,7 @@ export function measure(sim) {
   return {
     total, sounded: records.length, releasedMissing, notReleased, held,
     unpaired: records.filter((r) => r.offMs == null).length - held, strayOff: stats.strayOff, badVelocity: stats.badVelocity,
-    syncMax: Math.round(syncMax), reversed, lagMax: Math.round(Math.max(0, ...hp._lagMs)), offTrigger,
+    syncMax: Math.round(syncMax), reversed, skipped: hp._skipped.size, chased: hp.chaseStats().chased, offTrigger,
     pressCount: pressLog.length, released: pressLog.filter((p) => p.released).length, blocked: pressLog.filter((p) => !p.released).length,
     finished: hp.isFinished(),
   };

@@ -53,10 +53,11 @@ run('視窗內的手抖互相抵銷：用頭尾比值而不是逐個間隔平均
   assert(Math.abs(win - 1) < Math.abs(last - 1) && Math.abs(win - 1) < 0.03, `視窗法 ${win.toFixed(3)} 應比單一間隔 ${last.toFixed(3)} 更接近 1（誤差 < 3%）`);
 });
 
-run('夾在 [0.25, 4]：同一毫秒連按不會除以 0、隔很久也不會趨近 0', () => {
-  assert(MIN_PLAYBACK_RATE === 0.25 && MAX_PLAYBACK_RATE === 4, '範圍是 [0.25, 4]');
+run('夾在 [0.1, 4]：同一毫秒連按不會除以 0、隔很久也不會趨近 0', () => {
+  assert(MIN_PLAYBACK_RATE === 0.1 && MAX_PLAYBACK_RATE === 4, '範圍是 [0.1, 4]');
   assert(estimatePlaybackRate([{ scoreSec: 0, ms: 5 }, { scoreSec: 0.5, ms: 5 }]) === 4, '同一毫秒 → 上限 4（不是 Infinity）');
-  assert(estimatePlaybackRate([{ scoreSec: 0, ms: 0 }, { scoreSec: 0.5, ms: 600000 }]) === 0.25, '隔 10 分鐘 → 下限 0.25');
+  assert(estimatePlaybackRate([{ scoreSec: 0, ms: 0 }, { scoreSec: 0.5, ms: 600000 }]) === 0.1, '隔 10 分鐘 → 下限 0.1');
+  assert(Math.abs(estimatePlaybackRate([{ scoreSec: 0, ms: 0 }, { scoreSec: 0.5, ms: 5000 }]) - 0.1) < 1e-9, '慢 10 倍（每個起音隔 5 秒、樂譜 0.5 秒）剛好是 0.1，不被舊下限 0.25 夾住');
 });
 
 /* ═══════════════════════════════════════════

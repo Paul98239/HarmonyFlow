@@ -12,7 +12,7 @@
 // 固定檔案速度在你的速度偏離檔案時誤差高達 100～200ms；視窗 4～8 個按鍵在所有情境都穩，8 個最好。
 export const RATE_WINDOW_INTERVALS = 8;
 // 速度的合理範圍：同一毫秒連按（估出趨近無限大）或隔很久才按（趨近 0）都夾在這個範圍。
-export const MIN_PLAYBACK_RATE = 0.25;
+export const MIN_PLAYBACK_RATE = 0.1;
 export const MAX_PLAYBACK_RATE = 4;
 
 // 去抖窗口＝預估這一步真實長度的 60%（取自同事 SmartEnsemble 的做法），夾在 [50, 500]ms。下限比它的 150ms 低：

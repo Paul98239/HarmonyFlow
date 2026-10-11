@@ -1,19 +1,19 @@
 // ============================================================
 //  main.js — 進入點（composition root）：把各功能接在一起，功能之間不互相 import。
 //
-//  資源下載交給瀏覽器原生機制：index.html 的 <link rel="preload"> 在背景抓 src/assets/ 的
-//  pose 模型與 soundfont，MediaPipe／SpessaSynth 依官方用法取同一個 URL，不會重抓。
+//  資源下載交給瀏覽器原生機制：index.html 的 <link rel="preload"> 在背景抓 soundfont，SpessaSynth 依官方用法取
+//  同一個 URL，不會重抓；pose 模型要等選了現場人數才用到，不預載，開機完成後由 warmPoseModel() 低優先序暖機。
 // ============================================================
 
 import * as midiPlayer from './midi/midiPlayer.js';
 import { initUi, setLoadingStatus, dismissLoading, showError } from './ui.js';
-import { startVision, setPoseCountListener } from './vision/vision.js';
+import { startVision, setPoseCountListener, warmPoseModel } from './vision/vision.js';
 import { startKeyboardTrigger, getInputDelays } from './keyboard.js';
 import { summarizeMs } from './midi/pressTiming.js';
 
 // 開發用量測：在 console 輸入 __stats() 讀取。電腦音遲到量（12ms 的排程 tick 放出電腦音，比排好的時刻晚多少）與鍵盤事件
 // 在主執行緒佇列裡等待的時間——用來判斷影像算繪／姿勢推論把主執行緒卡住的程度，在你的機器上是不是真的聽得出來。
-// 「電腦段落後」是另一回事：你早按時，電腦段鎖讓電腦這一段接在上一段還沒輪到的電腦音後面，比你按下的時刻晚多少（準時按是 0）。
+// 「早按處理」是另一回事：你早按時，上一段還沒輪到的電腦音，在你按下的那一刻依垂直 tick 處理——還該響著的追音、整顆在身後的跳過（準時按都是 0）。
 // 這兩個只量 JS 層；音訊這一段（worklet 的 render quantum、AudioContext 的內部與輸出延遲）由「音訊輸出」補上，
 // 「估計按下到出聲ms」＝每個按鍵的事件等待 ＋ 固定的音訊段，把整條路串起來，看延遲主要落在哪一段。
 window.__stats = () => {
@@ -24,7 +24,7 @@ window.__stats = () => {
   return {
     速度倍率: Math.round(midiPlayer.playbackRate() * 100) / 100,
     電腦音遲到ms: midiPlayer.lateStats(),
-    電腦段落後ms: midiPlayer.lagStats(),
+    早按處理: midiPlayer.chaseStats(),
     按鍵事件等待ms: summarizeMs(keyWaits),
     音訊輸出: audio,
     估計按下到出聲ms: audioFixedMs === null ? null : { 固定音訊段ms: audioFixedMs, ...summarizeMs(keyWaits.map((x) => x + audioFixedMs)) },
@@ -59,6 +59,7 @@ async function bootSystem() {
   // 音源初始化失敗不擋進場（攝影機、骨架都還能用），狀態列由播放器寫明。
   setLoadingStatus(midiOk ? '✅ 準備就緒' : '⚠️ 已就緒，但音源引擎載入失敗');
   dismissLoading();
+  warmPoseModel(); // 開機完成之後才在背景暖機姿勢模型，使用者第一次選現場人數時不必等下載
 }
 
 // 舊版頁面曾註冊 Service Worker 並留下 Cache Storage；一次性清掉，讓曾開過舊版的瀏覽器

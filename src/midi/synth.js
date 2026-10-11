@@ -51,9 +51,9 @@ const DRUM_CHANNEL_OFFSET = 9;
 // DEFAULT_PORTS 個 port（scheduler.js 的單一來源），歌曲需要更多時在 load() 依 portsNeeded() 補，只增不減。
 
 const GATE_RAMP_TC = 0.03;   // humanGain on/off 的 setTargetAtTime 時間常數（防 click）
-const HUMAN_EMPHASIS_GAIN = 1.4; // humanGain 開啟時的目標值（電腦輔助軌固定是 1.0 基準，沒有額外
+const HUMAN_EMPHASIS_GAIN = 1.2; // humanGain 開啟時的目標值（電腦輔助軌固定是 1.0 基準，沒有額外
                                   // gain）：使用者控制的聲部整體調大聲，凸顯真人正在演奏的部分；
-                                  // 實測後可能還要繼續調整。
+                                  // 1.4 時真人實測高音太突出、蓋過電腦的低音，所以降到 1.2（約 +1.6 dB）。
 
 /* ═══════════════════════════════════════════
    引擎狀態

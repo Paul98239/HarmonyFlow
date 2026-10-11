@@ -155,7 +155,7 @@ function scanAutoplay(songs) {
 const STYLES = [['準時', 1, 0], ['快 20％', 0.8, 0], ['快 3 倍＋抖動 30％', 0.3, 0.3], ['慢 25％＋抖動 15％', 1.25, 0.15], ['慢 2 倍＋抖動 20％', 2, 0.2]];
 
 // 每次模擬共用的不變量（任何按鍵速度與人數都成立，沒有放寬的選項）：該放行的都發聲（你的音與電腦的音）、每個 noteOn 一個 noteOff、
-// 你的每顆音都在按鍵當下發聲、同一個 tick 的音同刻（準時按時差 0ms；你早按時電腦段鎖讓電腦這一段晚起算，容許的差是記錄下來的電腦段落後）、電腦音依樂譜順序發聲不倒序；completePresses＝你的每個起音都有被按到，這時一個都不能沒被放行。
+// 你的每顆音都在按鍵當下發聲、同一個 tick 的音同刻（嚴格 0ms，早按也一樣：早按的處理是追音或跳過）、電腦音依樂譜順序發聲不倒序；completePresses＝你的每個起音都有被按到，這時一個都不能沒被放行。
 const violations = (m, { completePresses = true } = {}) => m.releasedMissing || m.unpaired || m.strayOff || m.badVelocity
   || m.offTrigger || m.syncMax > 0 || m.reversed || (completePresses && m.notReleased);
 
@@ -173,7 +173,7 @@ function scanPerform(songs) {
   console.log(`\n=== 多聲部歌曲 ${multi.length} 首 × ${STYLES.length} 種按鍵風格 ＝ ${rows.length} 次模擬（各指派音符最多的聲部）===`);
   console.log(`該放行卻沒發聲的音：${sum('releasedMissing')} 顆（${count((m) => m.releasedMissing)} 次模擬）；沒被放行的音（按得不夠多）：${sum('notReleased')} 顆；被去抖擋掉再重按的次數：${sum('blocked')}`);
   console.log(`每個 noteOn 一個 noteOff：沒收的音 ${sum('unpaired')} 個（${count((m) => m.unpaired)} 次）、多餘的 noteOff ${sum('strayOff')} 個、velocity 0 的 noteOn ${sum('badVelocity')} 個`);
-  console.log(`你的音不在按鍵當下發聲：${sum('offTrigger')} 顆；同刻音發聲差 > 0ms：${count((m) => m.syncMax > 0)} 次模擬（最大 ${Math.max(...rows.map((r) => r.m.syncMax))}ms）；電腦音倒序：${sum("reversed")} 顆（${count((m) => m.reversed)} 次）；電腦段落後最大 ${Math.max(...rows.map((r) => r.m.lagMax))}ms`);
+  console.log(`你的音不在按鍵當下發聲：${sum('offTrigger')} 顆；同刻音發聲差 > 0ms：${count((m) => m.syncMax > 0)} 次模擬（最大 ${Math.max(...rows.map((r) => r.m.syncMax))}ms）；電腦音倒序：${sum("reversed")} 顆（${count((m) => m.reversed)} 次）；早按跳過 ${sum('skipped')} 顆、追音 ${sum('chased')} 顆（佔全部音 ${((100 * (sum('skipped') + sum('chased'))) / Math.max(1, sum('total'))).toFixed(2)}%）`);
   const bad = rows.filter((r) => violations(r.m));
   for (const r of bad.slice(0, 8)) console.log('  ✗', r.s.title, r.main.name, r.styleName, JSON.stringify(r.m));
   return bad.length;
@@ -291,7 +291,7 @@ function scanScenarios(songs) {
     const sum = (key) => runs.reduce((a, r) => a + r.m[key], 0);
     const bad = runs.filter((r) => violations(r.m, r.opts));
     failures += bad.length;
-    console.log(`${bad.length ? '✗' : '✓'} ${name}：${runs.length} 首；該放行卻沒發聲 ${sum('releasedMissing')}、沒收的音 ${sum('unpaired')}、非觸發當下發聲 ${sum('offTrigger')}、同刻音差最大 ${Math.max(...runs.map((r) => r.m.syncMax))}ms、電腦音倒序 ${sum("reversed")} 顆、電腦段落後最大 ${Math.max(...runs.map((r) => r.m.lagMax))}ms；曲末沒被放行的音 ${sum('notReleased')} 顆（${runs.filter((r) => r.m.notReleased).length} 首）`);
+    console.log(`${bad.length ? '✗' : '✓'} ${name}：${runs.length} 首；該放行卻沒發聲 ${sum('releasedMissing')}、沒收的音 ${sum('unpaired')}、非觸發當下發聲 ${sum('offTrigger')}、同刻音差最大 ${Math.max(...runs.map((r) => r.m.syncMax))}ms、電腦音倒序 ${sum("reversed")} 顆、早按跳過 ${sum('skipped')} 顆／追音 ${sum('chased')} 顆；曲末沒被放行的音 ${sum('notReleased')} 顆（${runs.filter((r) => r.m.notReleased).length} 首）`);
     for (const r of bad.slice(0, 3)) console.log('    ', r.s.title, JSON.stringify(r.m));
   }
   return failures;
