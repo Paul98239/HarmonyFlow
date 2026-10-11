@@ -22,7 +22,8 @@ window.__stats = () => {
   // 固定音訊段：worklet 平均等半個渲染區塊 ＋ 內部延遲 ＋ 輸出延遲。瀏覽器沒提供的欄位（null）算 0，所以是下限、不是上限。
   const audioFixedMs = audio ? Math.round(((audio.渲染區塊ms ?? 0) / 2 + (audio.內部延遲ms ?? 0) + (audio.輸出延遲ms ?? 0)) * 10) / 10 : null;
   return {
-    速度倍率: Math.round(midiPlayer.playbackRate() * 100) / 100,
+    速度倍率: Math.round(midiPlayer.playbackRate() * 1000) / 1000,
+    速度範圍: (({ lo, hi }) => ({ 下限: Math.round(lo * 1000) / 1000, 上限: Math.round(hi * 100) / 100 }))(midiPlayer.rateBounds()),
     電腦音遲到ms: midiPlayer.lateStats(),
     早按處理: midiPlayer.chaseStats(),
     按鍵事件等待ms: summarizeMs(keyWaits),

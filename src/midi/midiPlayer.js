@@ -170,6 +170,11 @@ export function chaseStats() {
   return synth.scheduler.chaseStats();
 }
 
+// 量測（同上）：這首歌目前的速度區間 { lo, hi }，見 scheduler.js 的 rateBounds()。
+export function rateBounds() {
+  return synth.scheduler.rateBounds();
+}
+
 // 量測（同上）：你現在的速度估計（樂譜秒 ÷ 真實秒，見 scheduler.js 的 playbackRate）。<1 ＝ 比檔案慢，音長是檔案音長 ÷ 這個值。
 export function playbackRate() {
   return synth.scheduler.playbackRate;

@@ -1,7 +1,7 @@
 // ============================================================
 //  library-scan.mjs — 曲庫全掃：用整個遠端 MIDI 曲庫驗證排程器（手動執行，不進 CI，純 Node）
 //
-//  六種掃描（--only=parse,autoplay,perform,perpart,scenarios,notes，預設全跑）：
+//  七種掃描（--only=parse,autoplay,perform,perpart,scenarios,notes,range，預設全跑）：
 //    parse      每首歌解析與聲部切分：沒有例外、至少 1 個 part、每個 staff 都分得到輸出 channel、警告分類統計、
 //               多聲部（可指派）的歌有幾首；〈蝸牛與黃鸝鳥〉必須切成「長笛、大鋼琴」（使用者用原始 MuseScore 檔確認過的金標準）；
 //               另外印出按鍵負擔：只有被指派的聲部要按（這裡取音符最多的聲部），每首歌要按幾下、原速下每秒要按幾下。
@@ -19,11 +19,15 @@
 //               ① 段內音（照自己的長度收）／② 對齊音（結尾對齊或接著你的起音，loop 到你按下那個起音）／③ 橫跨音（跨過你的起音，
 //               按下結尾之前最後一個起音後再響剩餘長度）／零長度的音／結尾超過最後一個起音的音各有多少，並列出對齊音最多與最少的歌。
 //
+//    range      速度區間：每首歌（音符最多的聲部當你的聲部）的區間 [g ÷ 30 秒, g ÷ 0.06 秒]（pressTiming.js 的 rateBoundsFor）要有效，且涵蓋
+//               「每秒按 0.1～10 下」；再各跑一次前 50 個起音的模擬：每下平均 10 秒（極慢）、每下平均 0.1 秒（極快，最小間隔也 ≥ 0.07 秒）、
+//               連按轉每下 10 秒——不變量全過，最後的速度收斂到真值 ±35%。
+//
 //  曲庫：預設放在 test/tools/library/（不進 git）。第一次先 `--download` 從遠端曲庫抓下來（單連線＋間隔，已有的
 //  檔案會略過）；也可以用 --dir 指到別的資料夾。--limit=N 只掃前 N 首。
 //
 //  用法：node test/tools/library-scan.mjs --download
-//        node test/tools/library-scan.mjs [--dir=資料夾] [--only=parse,autoplay,perform,perpart,scenarios,notes] [--limit=N]
+//        node test/tools/library-scan.mjs [--dir=資料夾] [--only=parse,autoplay,perform,perpart,scenarios,notes,range] [--limit=N]
 // ============================================================
 
 import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
@@ -31,11 +35,12 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { parseMidi } from '../../src/midi/midiParser.js';
 import { Scheduler } from '../../src/midi/scheduler.js';
+import { rateBoundsFor } from '../../src/midi/pressTiming.js';
 import { autoPlayStats, driverPressLoad, driverSecs, makeRng, measure, onsetPresses, rankedParts, simulate } from './sim.mjs';
 
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const [k, v = true] = a.replace(/^--/, '').split('='); return [k, v]; }));
 const DIR = resolve(args.dir || join(dirname(fileURLToPath(import.meta.url)), 'library'));
-const ONLY = new Set(String(args.only || 'parse,autoplay,perform,perpart,scenarios,notes').split(','));
+const ONLY = new Set(String(args.only || 'parse,autoplay,perform,perpart,scenarios,notes,range').split(','));
 const LIMIT = Number(args.limit) || Infinity;
 const TICK_TOL_MS = 12.5;                          // 一個排程 tick（12ms）加浮點容差
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -298,6 +303,63 @@ function scanScenarios(songs) {
 }
 
 /* ═══════════════════════════════════════════
+   掃描：速度區間（極快～極慢）
+   ═══════════════════════════════════════════ */
+
+// 時間表：plan＝[[個數, factor], …]，每個起音的按鍵間隔 ＝ 樂譜間隔 × factor × (1 ± 0.15)，所以隱含的真正速度 ＝ 1 ÷ factor。
+function rangePresses(secs, plan, rnd) {
+  const out = [];
+  let t = 500 + secs[0] * 1000, i = 0;                      // 第一下落在入場點（有前奏的歌，前奏播完才輪到你；前奏中的按鍵只是預按，不放行）
+  for (const [count, factor] of plan) {
+    for (let k = 0; k < count && i < secs.length; k++, i++) {
+      out.push(t);
+      if (i + 1 < secs.length) t += (secs[i + 1] - secs[i]) * 1000 * factor * (1 + 0.15 * (rnd() * 2 - 1));
+    }
+  }
+  return out;
+}
+
+function scanRange(songs) {
+  console.log('\n=== 速度區間（每首歌依自己的起音間隔算）：涵蓋與極快／極慢模擬 ===');
+  const rows = [];
+  let problems = 0;
+  for (const s of songs) {
+    const rp = rankedParts(s.score);
+    if (!rp.length) continue;
+    const secs = driverSecs(s.score, [rp[0].id]);
+    if (secs.length < 40) continue;
+    const gaps = secs.slice(1).map((t, i) => t - secs[i]);
+    const B = rateBoundsFor(gaps);
+    const good = gaps.filter((x) => x >= 0.02).sort((a, b) => a - b);
+    const g = good[Math.floor((good.length - 1) / 2)] ?? 0.3;
+    const dAvg = (secs.length - 1) / (secs[secs.length - 1] - secs[0]);
+    const row = { s, B, g, ok: Number.isFinite(B.lo) && Number.isFinite(B.hi) && B.lo > 0 && B.hi > B.lo, cover: dAvg * B.lo <= 0.1 && dAvg * B.hi >= 10 };
+    // 三種模擬：只取前 50 個起音（極慢每下 10 秒，全曲太久）。極快的 factor 取「平均每下 0.1 秒」與「第 10 百分位的小間隔也 ≥ 0.07 秒」中較大的
+    // （否則每個密集的小間隔都比去抖窗口短、被擋掉，那是去抖的事，不是估速的事）；被擋掉的按鍵過一會兒重按，時間表才不會錯位。
+    const head = secs.slice(0, 50);
+    const small = good[Math.floor((good.length - 1) * 0.1)] ?? g;
+    const slowF = 10 / g, fastF = Math.max(0.1 / g, 0.07 / small);
+    const plans = { 極慢: [[50, slowF]], 極快: [[50, fastF]], 連按轉極慢: [[25, fastF], [25, slowF]] };
+    for (const [name, plan] of Object.entries(plans)) {
+      const presses = rangePresses(head, plan, makeRng(31));
+      const sim = simulate(s.score, [{ partIds: [rp[0].id], presses, retryBlocked: true }], { tailMs: 3000 });
+      const m = measure(sim);
+      const target = 1 / plan[plan.length - 1][1];
+      const rate = sim.hp.playbackRate;
+      row[name] = { rate, target, inv: violations(m, { completePresses: false }), off: Math.abs(Math.log(Math.min(B.hi, Math.max(B.lo, target)) / rate)) > 0.35 };
+    }
+    rows.push(row);
+  }
+  const bad = rows.filter((r) => !r.ok || ['極慢', '極快', '連按轉極慢'].some((k) => r[k].inv || r[k].off));
+  const q = (a, p) => { const x = [...a].sort((m, n) => m - n); return x[Math.floor((x.length - 1) * p)]; };
+  console.log(`曲數 ${rows.length}；區間有效 ${rows.filter((r) => r.ok).length}；以平均每秒起音數換算，涵蓋「每秒按 0.1～10 下」${rows.filter((r) => r.cover).length}（${((100 * rows.filter((r) => r.cover).length) / Math.max(1, rows.length)).toFixed(0)}%；含長休止的歌平均密度偏低，不是區間不夠——以典型起音間隔換算，區間恆為每秒 0.033～16.7 下）`);
+  console.log(`區間下限 中位 ${q(rows.map((r) => r.B.lo), 0.5).toFixed(4)}（最低 ${q(rows.map((r) => r.B.lo), 0).toFixed(4)}）／上限 中位 ${q(rows.map((r) => r.B.hi), 0.5).toFixed(2)}（最高 ${q(rows.map((r) => r.B.hi), 1).toFixed(1)}）`);
+  for (const k of ['極慢', '極快', '連按轉極慢']) console.log(`${k}：不變量違規 ${rows.filter((r) => r[k].inv).length} 首、速度沒收斂到真值 ±35% ${rows.filter((r) => r[k].off).length} 首`);
+  for (const r of bad.slice(0, 8)) console.log('  ✗', r.s.title, JSON.stringify({ B: r.B, g: +r.g.toFixed(3), 極慢: r.極慢.rate, 極快: r.極快.rate, 連按轉極慢: r.連按轉極慢.rate }));
+  return bad.length;
+}
+
+/* ═══════════════════════════════════════════
    主程式
    ═══════════════════════════════════════════ */
 
@@ -312,5 +374,6 @@ if (ONLY.has('perform')) problems += scanPerform(songs);
 if (ONLY.has('perpart')) problems += scanPerPart(songs);
 if (ONLY.has('scenarios')) problems += scanScenarios(songs);
 if (ONLY.has('notes')) problems += scanNotes(songs);
+if (ONLY.has('range')) problems += scanRange(songs);
 console.log(`\n${problems ? `有 ${problems} 筆不符合` : '全部符合'}（${((Date.now() - started) / 1000).toFixed(0)} 秒）`);
 process.exitCode = problems ? 1 : 0;

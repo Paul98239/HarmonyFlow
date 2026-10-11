@@ -5,8 +5,8 @@
 // ============================================================
 
 import {
-  estimatePlaybackRate, debounceWindowMs, pressLoad, summarizeMs,
-  RATE_WINDOW_INTERVALS, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE, DEBOUNCE_MIN_MS, DEBOUNCE_MAX_MS,
+  estimatePlaybackRate, rateBoundsFor, debounceWindowMs, pressLoad, summarizeMs,
+  RATE_WINDOW_INTERVALS, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE, PRESS_PERIOD_MIN_S, PRESS_PERIOD_MAX_S, DEBOUNCE_MIN_MS, DEBOUNCE_MAX_MS,
 } from '../../src/midi/pressTiming.js';
 
 function run(name, fn) {
@@ -53,11 +53,33 @@ run('視窗內的手抖互相抵銷：用頭尾比值而不是逐個間隔平均
   assert(Math.abs(win - 1) < Math.abs(last - 1) && Math.abs(win - 1) < 0.03, `視窗法 ${win.toFixed(3)} 應比單一間隔 ${last.toFixed(3)} 更接近 1（誤差 < 3%）`);
 });
 
-run('夾在 [0.1, 4]：同一毫秒連按不會除以 0、隔很久也不會趨近 0', () => {
-  assert(MIN_PLAYBACK_RATE === 0.1 && MAX_PLAYBACK_RATE === 4, '範圍是 [0.1, 4]');
-  assert(estimatePlaybackRate([{ scoreSec: 0, ms: 5 }, { scoreSec: 0.5, ms: 5 }]) === 4, '同一毫秒 → 上限 4（不是 Infinity）');
-  assert(estimatePlaybackRate([{ scoreSec: 0, ms: 0 }, { scoreSec: 0.5, ms: 600000 }]) === 0.1, '隔 10 分鐘 → 下限 0.1');
-  assert(Math.abs(estimatePlaybackRate([{ scoreSec: 0, ms: 0 }, { scoreSec: 0.5, ms: 5000 }]) - 0.1) < 1e-9, '慢 10 倍（每個起音隔 5 秒、樂譜 0.5 秒）剛好是 0.1，不被舊下限 0.25 夾住');
+run('夾在絕對保險範圍 [1/256, 64]：同一毫秒連按不會除以 0、隔幾分鐘也不會趨近 0', () => {
+  assert(MIN_PLAYBACK_RATE === 1 / 256 && MAX_PLAYBACK_RATE === 64, '絕對保險範圍是 [1/256, 64]');
+  assert(estimatePlaybackRate([{ scoreSec: 0, ms: 5 }, { scoreSec: 0.5, ms: 5 }]) === 64, '同一毫秒 → 上限 64（不是 Infinity）');
+  assert(estimatePlaybackRate([{ scoreSec: 0, ms: 0 }, { scoreSec: 0.5, ms: 6000000 }]) === 1 / 256, '隔 100 分鐘 → 下限 1/256');
+});
+
+run('rateBoundsFor：每首歌的速度區間 ＝ [g ÷ 30 秒, g ÷ 0.06 秒]（g＝典型起音間隔的中位數），中心依這首歌平移、對數寬度固定', () => {
+  assert(PRESS_PERIOD_MIN_S === 0.06 && PRESS_PERIOD_MAX_S === 30, '按鍵真實間隔區間 [0.06, 30] 秒');
+  const canon = rateBoundsFor([0.444, 0.444, 0.888, 0.444, 0.444]);                     // 卡農大提琴 g ≈ 0.444
+  assert(Math.abs(canon.lo - 0.444 / 30) < 1e-9 && Math.abs(canon.hi - 0.444 / 0.06) < 1e-9, `卡農區間 [0.0148, 7.4]，實際 ${JSON.stringify(canon)}`);
+  assert(canon.hi >= 4 && canon.lo <= 0.044, '涵蓋舊上限 4×（連按 7～10 下/秒）與每下 10 秒的 0.044×');
+  const dense = rateBoundsFor([0.2, 0.2, 0.2]), sparse = rateBoundsFor([2, 2, 2]);
+  assert(dense.hi < sparse.hi && dense.lo < sparse.lo, '密集的歌區間整體比稀疏的歌慢');
+  assert(Math.abs(Math.log(dense.hi / dense.lo) - Math.log(sparse.hi / sparse.lo)) < 1e-9, '對數寬度（ln 500）相同：只是平移');
+  const chord = rateBoundsFor([0.002, 0.003, 0.5, 0.5, 0.5]);
+  assert(Math.abs(chord.hi - 0.5 / 0.06) < 1e-9, '和弦錯位的小間隔（< 20ms）不算典型間隔');
+  const none = rateBoundsFor([]);
+  assert(none.lo === MIN_PLAYBACK_RATE && none.hi === MAX_PLAYBACK_RATE, '沒有間隔（單一起音）：絕對保險範圍');
+  const tiny = rateBoundsFor([0.02, 0.02]);
+  assert(tiny.lo < tiny.hi && tiny.lo >= MIN_PLAYBACK_RATE, `極端密集也是有效區間（lo < hi），實際 ${JSON.stringify(tiny)}`);
+});
+
+run('estimatePlaybackRate 帶區間：快過區間上緣、慢過下緣的估計夾在區間邊界', () => {
+  const B = { lo: 0.0148, hi: 7.4 };
+  assert(estimatePlaybackRate([{ scoreSec: 0, ms: 0 }, { scoreSec: 0.444, ms: 40 }], 1, B) === 7.4, '極快夾在上緣');
+  assert(estimatePlaybackRate([{ scoreSec: 0, ms: 0 }, { scoreSec: 0.444, ms: 60000 }], 1, B) === 0.0148, '極慢夾在下緣');
+  assert(Math.abs(estimatePlaybackRate([{ scoreSec: 0, ms: 0 }, { scoreSec: 0.444, ms: 10000 }], 1, B) - 0.0444) < 1e-9, '每下 10 秒＝0.0444，在區間內不被夾');
 });
 
 /* ═══════════════════════════════════════════

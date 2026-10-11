@@ -702,12 +702,12 @@ run('你的音在下一次按鍵時，endTick ≤ 新起音的先收：按得比
 });
 
 run('慢按：電腦聲部放完這一段就停，不越過你的下一個起音；你停手太久這次間隔不拿來估速', () => {
-  // 速度還沒學到（只按過一下）時，停格要超過預測間隔的 10 倍（2000ms × 10，跟速度下限 0.1× 連動）才算停手，所以停 25 秒
+  // 這首歌的典型起音間隔 g ＝ 2 秒，速度區間下緣 ＝ g ÷ 30 秒 ＝ 0.0667；兩個起音相隔 2 樂譜秒，隔超過 30 秒（隱含速度 < 0.0667）才算停手，所以停 40 秒
   const { hp, log, d } = makeHp(buildBeatScore({ p0: [0, 4], a1: [0, 1, 2, 3, 4, 5, 6, 7] }), [['p0', 1]]);
   d.tick();
   const t0 = d.nowMs;
   d.press();
-  d.runMs(25000);
+  d.runMs(40000);
   [0, 1, 2, 3].forEach((b) => assert(near(onMs(log, 52 + b, 'assist') - t0, b * 500, TICK_MS), `第 ${b} 拍的電腦音照時刻發聲`));
   assert(onMs(log, 56) === undefined && onMs(log, 41) === undefined, '拍 4 是你的下一個起音，電腦音 56 與你的 41 都要等你按');
   assert(near(hp.getPositionTicks(), 1920, 1e-6), `播放頭停在下一個起音（tick 1920），實際 ${hp.getPositionTicks()}`);
@@ -745,13 +745,111 @@ run('速度還沒學到時，慢到速度下限（0.1×）以內都學得到：�
   assert(near(onMs(log, 59, 'assist') - t3, 2000, TICK_MS), `拍 3.5 的電腦音（59）${(onMs(log, 59, 'assist') - t3)}ms 後發聲（應約 2000ms）`);
 });
 
-run('速度還沒學到時，停格超過預測的 10 倍才算停手：這次間隔不拿來估速', () => {
-  const { hp, d } = makeHp(buildBeatScore({ p0: [0, 1, 2, 3] }), [['p0', 1]]);
+run('連按之後轉成極慢（每下約 10 秒）：連續兩下一致的長空檔是你很慢、不是停手，速度要學到 g ÷ 10 秒而不是鎖在連按時的快速', () => {
+  // 拍長 150ms 的譜（g＝0.15 秒，區間 [0.005, 2.5]），連按 6 下（每 150ms）學到約 1×；接著每下停 10 秒（隱含速度 0.015）。
+  // 第一次長空檔（速度已學到）先不信（驚訝）、速度維持；第二下的隱含速度跟它一致才接受（變速）：不能一直當停手而鎖在連按時的快速
+  const { hp, d } = makeHp(buildBeatScore({ p0: Array.from({ length: 20 }, (_, i) => i) }, 0.15), [['p0', 1]]);
   d.tick();
   const t0 = d.nowMs;
   d.press();
-  assert(d.pressAt(t0 + 10000) === true, '第二下');        // 預測 500ms，停格 9500ms > 5000ms
-  assert(hp.playbackRate === 1, `停手：速度維持 1，實際 ${hp.playbackRate}`);
+  for (let k = 1; k <= 5; k++) assert(d.pressAt(t0 + 150 * k) === true, `連按第 ${k + 1} 下`);
+  assert(near(hp.playbackRate, 1, 0.05), `連按後學到約 1×，實際 ${hp.playbackRate}`);
+  const t5 = t0 + 750;
+  d.pressAt(t5 + 10000);
+  assert(near(hp.playbackRate, 1, 0.05), `第一次長空檔先不信：速度維持，實際 ${hp.playbackRate}`);
+  d.pressAt(t5 + 20000);
+  assert(near(hp.playbackRate, 0.015, 1e-9), `第二下一致：你很慢，速度學到 0.15 ÷ 10 ＝ 0.015，實際 ${hp.playbackRate}`);
+  d.pressAt(t5 + 30000);
+  assert(near(hp.playbackRate, 0.015, 1e-9), `之後維持（歷史沒有再被清掉），實際 ${hp.playbackRate}`);
+});
+
+run('速度還沒學到時，空檔超過 30 秒對應的長度才算停手：這次間隔不拿來估速；30 秒以內都是你很慢', () => {
+  // g＝0.5 秒，區間下緣 ＝ 0.5 ÷ 30 ＝ 0.0167：隔 25 秒（隱含 0.02）是很慢、隔 40 秒（隱含 0.0125）是停手
+  const a = makeHp(buildBeatScore({ p0: [0, 1, 2, 3] }), [['p0', 1]]);
+  a.d.tick();
+  const t0 = a.d.nowMs;
+  a.d.press();
+  assert(a.d.pressAt(t0 + 25000) === true, '第二下');
+  assert(near(a.hp.playbackRate, 0.02, 1e-9), `隔 25 秒：學到 0.02，實際 ${a.hp.playbackRate}`);
+  const b = makeHp(buildBeatScore({ p0: [0, 1, 2, 3] }), [['p0', 1]]);
+  b.d.tick();
+  const s0 = b.d.nowMs;
+  b.d.press();
+  assert(b.d.pressAt(s0 + 40000) === true, '第二下');
+  assert(b.hp.playbackRate === 1, `隔 40 秒：停手，速度維持 1，實際 ${b.hp.playbackRate}`);
+});
+
+run('每首歌的速度區間依你的聲部起音間隔算：換指派（reassign）後重算，新 MIDI 不必手調', () => {
+  // me 每 0.5 秒一個起音（g＝0.5）、slow 每 2 秒一個（g＝2）；區間 ＝ [g ÷ 30, g ÷ 0.06]
+  const { hp } = makeHp(buildBeatScore({ me: Array.from({ length: 30 }, (_, i) => i), slow: Array.from({ length: 8 }, (_, i) => i * 4) }), [['me', 1]]);
+  assert(near(hp._rateBounds.lo, 0.5 / 30, 1e-9) && near(hp._rateBounds.hi, 0.5 / 0.06, 1e-9), `me：[0.0167, 8.33]，實際 ${JSON.stringify(hp._rateBounds)}`);
+  assert(hp.rateBounds().lo === hp._rateBounds.lo && hp.rateBounds() !== hp._rateBounds, 'rateBounds() 回傳複本');
+  hp.reassign(new Map([['slow', 1]]));
+  assert(near(hp._rateBounds.lo, 2 / 30, 1e-9) && near(hp._rateBounds.hi, 2 / 0.06, 1e-9), `改指派 slow 之後重算：[0.0667, 33.3]，實際 ${JSON.stringify(hp._rateBounds)}`);
+});
+
+run('極快：連按每 100ms（每 0.5 拍秒的譜 ＝ 5×，超過舊上限 4×）也學得到，不被夾在 4×', () => {
+  const { hp, d } = makeHp(buildBeatScore({ me: Array.from({ length: 40 }, (_, i) => i) }), [['me', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  for (let k = 1; k <= 30; k++) d.pressAt(t0 + 100 * k);
+  assert(near(hp.playbackRate, 5, 0.5), `連按每 100ms 的速度倍率約 5，實際 ${hp.playbackRate}`);
+});
+
+run('極快的上緣：連按每 55ms（隱含 9.09×，超過這首歌的區間上緣 8.33×）速度夾在區間上緣，不超過', () => {
+  const { hp, d } = makeHp(buildBeatScore({ me: Array.from({ length: 60 }, (_, i) => i) }), [['me', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  for (let k = 1; k <= 40; k++) d.pressAt(t0 + 55 * k);
+  assert(near(hp.rateBounds().hi, 0.5 / 0.06, 1e-9), `區間上緣 8.33，實際 ${hp.rateBounds().hi}`);
+  assert(near(hp.playbackRate, hp.rateBounds().hi, 1e-6), `速度夾在區間上緣 8.33，實際 ${hp.playbackRate}`);
+});
+
+run('變速：你真的變慢 4×——第一下先不信（速度維持），第二下一致才接受，之後電腦音跟著新速度', () => {
+  const { hp, d } = makeHp(buildBeatScore({ me: Array.from({ length: 30 }, (_, i) => i) }), [['me', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  for (let k = 1; k <= 6; k++) d.pressAt(t0 + 500 * k);
+  assert(near(hp.playbackRate, 1, 0.05), `學到約 1×，實際 ${hp.playbackRate}`);
+  d.pressAt(t0 + 3000 + 2000);                                // 第一個 2 秒的間隔：驚訝（隱含 0.25 比 1 差 4 倍），先不信
+  assert(near(hp.playbackRate, 1, 0.05), `第一下先不信：速度維持，實際 ${hp.playbackRate}`);
+  d.pressAt(t0 + 3000 + 4000);                                // 第二個 2 秒的間隔：一致，接受
+  assert(near(hp.playbackRate, 0.25, 0.01), `第二下一致：接受變速，速度 0.25，實際 ${hp.playbackRate}`);
+});
+
+run('停手／失誤：只有一個長空檔、之後回到原本速度——速度不被拖慢（驚訝的那一下不拿來估速）', () => {
+  const { hp, d } = makeHp(buildBeatScore({ me: Array.from({ length: 30 }, (_, i) => i) }), [['me', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  for (let k = 1; k <= 6; k++) d.pressAt(t0 + 500 * k);
+  d.pressAt(t0 + 3000 + 6000);                                // 停 6 秒
+  assert(near(hp.playbackRate, 1, 0.05), `停手那一下：速度維持，實際 ${hp.playbackRate}`);
+  for (let k = 1; k <= 4; k++) d.pressAt(t0 + 9000 + 500 * k); // 回到原速
+  assert(near(hp.playbackRate, 1, 0.1), `回到原速之後仍是 1×（空檔沒有混進估速），實際 ${hp.playbackRate}`);
+});
+
+run('音長上限不短於檔案本身的長度：整首自動播放（1×）檔案裡 12 秒的長音照 12 秒收，不被 8 秒上限切短', () => {
+  const { log, d } = makeHp(buildBeatScore({ a: [{ beat: 0, dur: 12, note: 60 }] }), []);
+  d.tick();
+  d.runMs(14000);
+  assert(near(offMs(log, 60, 'assist') - onMs(log, 60, 'assist'), 12000, TICK_MS), `12 秒的長音照 12 秒收，實際 ${offMs(log, 60, 'assist') - onMs(log, 60, 'assist')}ms`);
+});
+
+run('極慢的音長上限 8 秒：速度 0.02× 時 0.2 秒的段內音響 8 秒（不是 10 秒）；起音位置仍照完整速度排開', () => {
+  // 隔 25 秒（隱含 0.02）學到 0.02；電腦的 70 在拍 1.1（0.05s 後）、長 0.2s 的段內音（結尾離下一個起音很遠，不 hold）
+  const { hp, log, d } = makeHp(buildBeatScore({ me: [0, 1, 2, 3], cpu: [{ beat: 1.1, dur: 0.2, note: 70 }] }), [['me', 1]]);
+  d.tick();
+  const t0 = d.nowMs;
+  d.press();
+  d.pressAt(t0 + 25000);
+  assert(near(hp.playbackRate, 0.02, 1e-9), `速度 0.02，實際 ${hp.playbackRate}`);
+  d.runMs(14000);
+  assert(near(onMs(log, 70, 'assist') - (t0 + 25000), 2500, TICK_MS), `70 的起音照完整速度：（拍 1.1 − 拍 1）＝ 0.05 樂譜秒 ÷ 0.02 ＝ 2.5 秒，實際 ${onMs(log, 70, 'assist') - (t0 + 25000)}ms`);
+  assert(near(offMs(log, 70, 'assist') - onMs(log, 70, 'assist'), 8000, TICK_MS), `音長 0.2s ÷ 0.02 ＝ 10 秒，上限 8 秒，實際 ${offMs(log, 70, 'assist') - onMs(log, 70, 'assist')}ms`);
 });
 
 run('速度學到之後（≥ 3 個間隔），停格超過 800ms 就算停手：這次間隔不拿來估速', () => {
@@ -768,10 +866,12 @@ run('停格超過閒置門檻（800ms）：橫跨你下一個起音的長音不�
   const { log, d } = makeHp(buildBeatScore({ p0: [{ beat: 0, dur: 5 }, 1] }), [['p0', 1]]); // 長音 5s，下一個起音在 0.5s
   d.tick();
   d.press();
-  d.runMs(2500);                                              // 0.5s 到達下一個起音停格，停格已 2s：早就超過門檻
+  d.runMs(2500);                                              // 0.5s 到達下一個起音停格，停格已 2s：早就超過 800ms
   assert(count(log, 'off', 40) === 0, '停格超過 800ms，長音還沒到它自己的結尾，不能被閒置收音切掉');
   d.runMs(3000);                                              // 5500ms：原長（5000ms）早就過了，但拍 1 還沒按，檔案裡這顆音此刻還在響
   assert(count(log, 'off', 40) === 0, '原長過了、你還沒按它橫跨的起音：繼續等');
+  d.runMs(30000);                                             // 再等到 35.5 秒：空檔超過 30 秒＝停手（速度維持 1×），剩餘長度照 1× 算
+  assert(count(log, 'off', 40) === 0, '空檔再久也沒有時間上限：一直 hold 到你按下去');
   const t1 = d.nowMs;
   d.press();
   assert(count(log, 'on', 41) === 1 && count(log, 'off', 40) === 0, '之後照常放行；長音在你按下那個起音後再響完剩下的 4500ms');

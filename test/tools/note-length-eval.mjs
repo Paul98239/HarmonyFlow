@@ -41,7 +41,7 @@ const SCENARIOS = [
   { name: '慢 2×、手抖 15%', factor: 2, jitter: 0.15 },
   { name: '快 2×（factor 0.5）、手抖 15%', factor: 0.5, jitter: 0.15 },
   { name: '極快 4×（factor 0.25）、手抖 15%', factor: 0.25, jitter: 0.15 },
-  { name: '超慢 10×（factor 10，速度下限 0.1×）、手抖 15%', factor: 10, jitter: 0.15 },
+  { name: '超慢 10×（factor 10）、手抖 15%', factor: 10, jitter: 0.15 },
 ];
 const SHORT_MS = 250;
 

@@ -48,7 +48,7 @@
 //  沒有 staves 的 part（手工組的舊資料形狀）自動視為單一 staff。
 // ============================================================
 
-import { estimatePlaybackRate, debounceWindowMs, summarizeMs, MIN_PLAYBACK_RATE } from './pressTiming.js';
+import { estimatePlaybackRate, debounceWindowMs, summarizeMs, rateBoundsFor, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE } from './pressTiming.js';
 
 export const DEFAULT_SCHEDULER_CONFIG = Object.freeze({
   drumChannel: 9, // MIDI 規格：第 10 個 channel（索引 9）是打擊
@@ -68,15 +68,20 @@ export const KEYBOARD_SLOT = 'kb';
 /* ═══════════════════════════════════════════
    應用層常數——不是規格
    ═══════════════════════════════════════════ */
-// 「播放頭停在你的下一個起音多久」算停手的門檻：這次間隔不拿來估速。800ms 吸收你按鍵的停頓；你完全停手時電腦聲部放完這一段
-// 就靜止，已經開始的音照音長收完（閒置不切音）。
-const IDLE_MS = 800;
-// 速度還沒學到（歷史裡的間隔不到 IDLE_LEARNED_INTERVALS 個）時，「實際間隔 − 預測間隔」變大可能只是預測太快（你很慢），
-// 不是你停手：停格要超過預測間隔的 IDLE_UNLEARNED_FACTOR 倍才算停手，不然慢速演奏者的歷史每一下都被清掉、永遠學不到速度
-// （速度停在 1×＝原譜 BPM，電腦音就照原速在每一格開頭連續出完，然後安靜等你）。倍數跟速度下限連動：1 ÷ MIN_PLAYBACK_RATE
-// ＝比預測慢到速度下限（0.1×）都還學得到；比這更慢的空檔才當停手（速度估計本來就夾在下限，學不到比下限更慢的）。
-const IDLE_LEARNED_INTERVALS = 3;
-const IDLE_UNLEARNED_FACTOR = 1 / MIN_PLAYBACK_RATE;
+// 停手與變速的判斷（_updateRate）：這一下隱含的速度 x ＝ Δ樂譜秒 ÷ Δ真實秒。
+//  · x 低於這首歌的速度區間下緣（兩次按鍵隔超過 30 秒對應的長度，見 pressTiming.js 的 rateBoundsFor）＝停手：歷史清掉、速度維持。
+//  · 已經學到速度（歷史裡至少 LEARNED_INTERVALS 個間隔）時，x 跟目前估計差超過 SURPRISE_RATIO 倍＝「驚訝」，先不拿來估速；
+//    下一下的隱含速度若跟它差在 CONFIRM_RATIO 倍以內就兩下一起接受（你真的變速了，歷史從驚訝那一下重新開始），否則當成停手／失誤。
+//  · 還沒學到速度時一律接受：區間內的任何速度都學得到。不用「預測間隔的幾倍」當門檻：預測間隔是用目前速度算的，連按之後只有 0.1 秒，
+//    慢下來的人每一下都超過門檻、被當成停手，速度就永遠鎖在連按時的快速。
+const LEARNED_INTERVALS = 3;
+const SURPRISE_RATIO = 3;
+const CONFIRM_RATIO = 1.6;
+// 有限的音長（檔案音長 ÷ 速度）上限：極慢（例如 0.015×）時 0.1 秒的短音會被拉成 6 秒，所以被「拉長」的部分最多到 NOTE_MAX_MS；
+// 但不會比檔案本身的長度更短（檔案裡 12 秒的長音在 1× 就是 12 秒，整首自動播放與你彈得跟原譜一樣快時都不能被切）。
+// 起音位置仍用完整速度排開，hold 著等你按的音照舊響到你按下去。
+const NOTE_MAX_MS = 8000;
+const scaledMs = (lenSec, rate) => Math.min((lenSec * 1000) / rate, Math.max(NOTE_MAX_MS, lenSec * 1000));
 // 每個 tick 的時間步長上限：分頁被瀏覽器節流（背景分頁的計時器可能隔好幾秒才醒來）後恢復時，時鐘最多只前進這麼多，
 // 不會一次把空窗期的音全部放出來或收掉。
 const MAX_TICK_DT_MS = 100;
@@ -270,6 +275,8 @@ export class Scheduler {
     this._lastAcceptClock = null;     // 上一次有效按鍵的時鐘（去抖用）
     this._lastAttemptClock = null;    // 上一次按鍵嘗試（含被忽略的）的時鐘
     this._lastAttemptIntervalMs = Infinity; // 前兩次按鍵嘗試之間的間隔（去抖窗口用）
+    this._surprise = null;     // 驚訝的那一下 { x: 隱含速度, press: { scoreSec, ms } }，等下一下確認是變速還是停手（見 _updateRate）
+    this._rateBounds = { lo: MIN_PLAYBACK_RATE, hi: MAX_PLAYBACK_RATE }; // 這首歌的速度區間（rateBoundsFor，_buildPlan 依你的聲部起音間隔算）
   }
 
   setSynths(assistSynth, humanSynth) {
@@ -361,6 +368,9 @@ export class Scheduler {
     }
     // 第 0 段（第一個 driver 起音之前）有 follower 的音就是前奏。純 tick 比較，沒有誤差；沒有 driver 時（整首自動播放）不鎖。
     this._hasPrelude = this._driverSegs.length > 0 && this._sliceFirst[1] > this._sliceFirst[0];
+    // 這首歌的速度區間：你的聲部（含多個聲部的聯集）相鄰起音的樂譜間隔取中位數換算，見 pressTiming.js 的 rateBoundsFor()
+    const driverSecsList = this._driverTicks.map((t) => this._secOf(t));
+    this._rateBounds = rateBoundsFor(driverSecsList.slice(1).map((t, i) => t - driverSecsList[i]));
     // hold 容差的上限：有 ticks per quarter 就是十六分音符；SMPTE（timeDivision 是 null）用固定秒數換成 tick
     const cap = this._score.timeDivision ? this._score.timeDivision * HOLD_GAP_MAX_QUARTER : this._score.secondsToMIDITicks?.(HOLD_GAP_MAX_SECONDS);
     this._holdCapTicks = Number.isFinite(cap) ? Math.max(HOLD_GAP_TICKS, Math.round(cap)) : HOLD_GAP_TICKS;
@@ -427,6 +437,7 @@ export class Scheduler {
     this._lastAcceptClock = null;
     this._lastAttemptClock = null;
     this._lastAttemptIntervalMs = Infinity;
+    this._surprise = null;
     this._lastTickMs = null;
     // 這一段的編號＝已經放行的 driver 起音數；第 0 段（前奏）一律 1× 起算
     this._anchorSlice(this._segIndex, this._clockMs, this._secOf(Math.max(0, boundary)), this._segIndex === 0 ? 1 : rate, boundary);
@@ -499,6 +510,7 @@ export class Scheduler {
     this._lastAcceptClock = null;
     this._lastAttemptClock = null;
     this._lastAttemptIntervalMs = Infinity;
+    this._surprise = null;
     this.playbackRate = 1;
   }
 
@@ -569,7 +581,7 @@ export class Scheduler {
       if (note.startTick < fromTick) continue;
       const startSec = this._secOf(note.startTick);
       const dueMs = clockMs + ((startSec - scoreSec) * 1000) / rate;
-      fresh.push({ dueMs, offMs: dueMs + ((this._secOf(note.endTick) - startSec) * 1000) / rate, staff, note });   // 起音與音長都依你的速度等比例縮放（整份譜用你的 BPM 演奏）
+      fresh.push({ dueMs, offMs: dueMs + scaledMs(this._secOf(note.endTick) - startSec, rate), staff, note });   // 起音與音長都依你的速度等比例縮放（整份譜用你的 BPM 演奏）
     }
     this._pending = fresh;   // 啟動新的一段時佇列一定是空的（上一段的電腦音在你按下時已經放完、追音或跳過）；fresh 依樂譜順序，dueMs 單調不減
   }
@@ -615,22 +627,36 @@ export class Scheduler {
     return true;
   }
 
-  // 這次按鍵是不是「停手之後」的第一下：播放頭停在你的下一個起音超過門檻。速度已經學到（≥ IDLE_LEARNED_INTERVALS 個間隔）
-  // 時門檻是 IDLE_MS；還沒學到時預測不可靠，門檻放寬到預測間隔的 IDLE_UNLEARNED_FACTOR 倍（見常數的說明）。
-  _isIdleBreak(clock) {
-    if (this._stallMsAt(clock) <= IDLE_MS) return false;
-    const learned = this._history.length - 1 >= IDLE_LEARNED_INTERVALS;
-    const predictedMs = this._reachClockMs() - this._anchor.clockMs;   // 停格 > 0 表示有下一個起音，錨點一定在
-    return learned || this._stallMsAt(clock) > IDLE_UNLEARNED_FACTOR * predictedMs;
+  // 依這一下的按鍵更新 history 與速度估計（停手與變速的判斷見檔頭常數 LEARNED_INTERVALS／SURPRISE_RATIO／CONFIRM_RATIO 的說明）。
+  // j＝這一下放行的 driver segment 編號；上一下的樂譜秒取自 driver segment j−1，時鐘取自 _lastAcceptClock。
+  _updateRate(j, scoreSec, clock) {
+    const B = this._rateBounds, press = { scoreSec, ms: clock };
+    if (j === 0 || this._lastAcceptClock == null) { this._history = [press]; return; }   // 第一下（或改指派後的第一下）：沒有間隔可估
+    const dS = scoreSec - this._secOf(this._driverSegs[j - 1].ticks), dT = Math.max(1e-3, (clock - this._lastAcceptClock) / 1000);
+    const x = dS / dT;                                           // 這一下隱含的速度
+    if (x < B.lo) { this._history = [press]; this._surprise = null; return; }   // 空檔超過區間：停手，這次間隔不拿來估速（速度維持原本的值）
+    const learned = this._history.length - 1 >= LEARNED_INTERVALS;
+    if (learned && Math.abs(Math.log(x / this.playbackRate)) > Math.log(SURPRISE_RATIO)) {
+      const s = this._surprise;
+      if (s && Math.abs(Math.log(x / s.x)) < Math.log(CONFIRM_RATIO)) {
+        this._history = [s.press, press];                        // 連兩下一致：真的變速，歷史從驚訝那一下重新開始
+        this._surprise = null;
+      } else {
+        this._surprise = { x, press };                           // 先不信這一下，等下一下確認
+        return;
+      }
+    } else {
+      if (this._surprise) { this._history = [this._surprise.press]; this._surprise = null; }   // 上一下是停手／失誤：歷史從那一下重新開始
+      this._history.push(press);
+    }
+    this.playbackRate = estimatePlaybackRate(this._history, this.playbackRate, B);
   }
 
   // 放行 _segIndex 這個 driver segment（按鍵 trigger() 與前奏結束時的預按放行共用），時刻 clock（排程器時鐘）。
   _release(clock) {
     const j = this._segIndex, seg = this._driverSegs[j];
     const scoreSec = this._secOf(seg.ticks);
-    if (this._isIdleBreak(clock)) this._history = [];      // 停手：這次間隔不拿來估速（速度維持原本的值）
-    this._history.push({ scoreSec, ms: clock });
-    this.playbackRate = estimatePlaybackRate(this._history, this.playbackRate);
+    this._updateRate(j, scoreSec, clock);
     this._lastAcceptClock = clock;
     this._segIndex = j + 1;
 
@@ -642,7 +668,7 @@ export class Scheduler {
     // 改成跳到 T_k 的垂直狀態：還該響著的追音、整顆在身後的跳過（見 _chaseOrSkip）。錨點因此永遠是按下的時刻，同 tick 的電腦音 0ms 同刻。
     this._chaseOrSkip(seg.ticks, scoreSec, clock);
     this._anchorSlice(j + 1, clock, scoreSec, this.playbackRate);   // 這一段的錨點與電腦音（佇列此時是空的）
-    for (const { staff, note } of seg.items) this._sound(staff, note, clock + ((this._secOf(note.endTick) - scoreSec) * 1000) / this.playbackRate, clock);
+    for (const { staff, note } of seg.items) this._sound(staff, note, clock + scaledMs(this._secOf(note.endTick) - scoreSec, this.playbackRate), clock);
     this._emitPending();                                            // 同 tick 的 follower 音（dueMs ＝ 這一刻）跟你的音同刻
     this._closeDue();                                               // 零長度的音
   }
@@ -662,7 +688,7 @@ export class Scheduler {
     for (const p of left) {
       if (p.note.endTick > ticks) {
         this._early.chased++;
-        this._sound(p.staff, p.note, clock + ((this._secOf(p.note.endTick) - scoreSec) * 1000) / this.playbackRate, clock);
+        this._sound(p.staff, p.note, clock + scaledMs(this._secOf(p.note.endTick) - scoreSec, this.playbackRate), clock);
       } else {
         this._early.skipped++;
         this._skipped.add(p.note);
@@ -699,7 +725,7 @@ export class Scheduler {
         // 例外：檔案裡這兩顆音真的重疊、音高不同（同一行譜的多聲部，長音底下另有音在動），舊音又還在 hold：保留 loop 到它的結尾起音，
         // 不修剪——修剪只用來擋「檔案沒寫的」多疊（你早按造成的），檔案寫了的重疊是樂譜本意。同音高不適用（同一個 key 不能同時有兩個音）
         if (entry.holdIdx !== null && entry.note.midiNote !== note.midiNote && entry.endTick > note.startTick) continue;
-        const capMs = onsetMs + (Math.max(0, this._secOf(entry.endTick) - startSec) * 1000) / this.playbackRate;
+        const capMs = onsetMs + scaledMs(Math.max(0, this._secOf(entry.endTick) - startSec), this.playbackRate);
         // 只有「真的截短」才標成 capped、不再 hold（EPS：capMs 與 offMs 從同一個錨點算出來，相等時只差浮點誤差，不算截短）。
         // 單音旋律的譜表因此不會糊到你下一次按鍵；hold 著的音（offMs＝Infinity）遇到同譜表的新音也在這裡被截成有限值
         if (capMs < entry.offMs - EPS_MS) { entry.offMs = capMs; entry.capped = true; entry.holdIdx = null; }
@@ -759,6 +785,9 @@ export class Scheduler {
    * 按下時補發）的顆數、skipped＝跳過（整顆在你身後）的顆數。重設（stop／restart／換歌）時清空。
    */
   chaseStats() { return { ...this._early }; }
+
+  /** 量測：這首歌目前的速度區間 { lo, hi }（rateBoundsFor 依你的聲部起音間隔算出的複本）。 */
+  rateBounds() { return { ...this._rateBounds }; }
 
   _logPress(slot, clockMs, released) {
     this._pressLog.push({ slot, clockMs, released });
@@ -855,7 +884,7 @@ export class Scheduler {
       for (const queue of staff.sounding.values()) {
         for (const entry of queue) {
           if (entry.holdIdx === null || entry.holdIdx === undefined || entry.holdIdx > j) continue;
-          entry.offMs = clock + (entry.tailSec * 1000) / this.playbackRate;
+          entry.offMs = clock + scaledMs(entry.tailSec, this.playbackRate);
           entry.holdIdx = null;
         }
       }

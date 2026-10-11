@@ -125,6 +125,9 @@ function expectedHold({ lenTicks, tpq, smpte, onsetBeats }) {
 }
 
 const near = (a, b, tol = TOL_MS) => Math.abs(a - b) <= tol;
+// 有限的音長（檔案音長依速度換算）：被拉長的部分最多到 8 秒，但不短於檔案本身的長度（scheduler.js 的 scaledMs／NOTE_MAX_MS）；
+// 對齊／橫跨起音的音等你按，只有「按下之後再響的剩餘長度」套用。fileMs ＝ 檔案裡的長度（這個矩陣的譜 1 拍 ＝ 500ms）
+const capMs = (ms, ticks, tpq) => Math.min(ms, Math.max(8000, (ticks / tpq) * 500));
 
 /* ═══════════════════════════════════════════
    穩定地照拍彈（慢 2×／準時／快 2×）：每顆音的收音時刻都符合模型
@@ -135,7 +138,7 @@ const denseOnsets = Array.from({ length: START_BEAT + 40 }, (_, i) => i);
 const sparseOnsets = [...Array.from({ length: START_BEAT + 1 }, (_, i) => i), ...Array.from({ length: 6 }, (_, i) => START_BEAT + 8 * (i + 1))];
 
 for (const [layout, onsets] of [['每拍一個起音', denseOnsets], ['起音稀疏（第 12 拍之後每 8 拍一下）', sparseOnsets]]) {
-  for (const I of [1000, 500, 250]) {
+  for (const I of [8000, 1000, 500, 250]) {   // 8000＝極慢（0.0625×）：音長上限 8 秒也會生效
     for (const [resName, tpq, smpte] of RESOLUTIONS) {
       for (const [shName, shFn] of SHORTEN) {
         run(`穩定彈（${layout}、每拍 ${I}ms）× ${resName} × ${shName}：${VALUES.length} 種音值的收音時刻，你的音與電腦的一視同仁`, () => {
@@ -149,7 +152,7 @@ for (const [layout, onsets] of [['每拍一個起音', denseOnsets], ['起音稀
           for (const c of chord) {
             const key = `${c.part}:${c.pitch}`, Ts = at(START_BEAT);
             const hold = expectedHold({ lenTicks: c.lenTicks, tpq, smpte, onsetBeats: onsets });
-            const want = hold ? at(hold.onsetBeat) + (hold.tailTicks / tpq) * I : Ts + (c.lenTicks / tpq) * I;
+            const want = hold ? at(hold.onsetBeat) + capMs((hold.tailTicks / tpq) * I, hold.tailTicks, tpq) : Ts + capMs((c.lenTicks / tpq) * I, c.lenTicks, tpq);
             if (!on.has(key)) { bad.push(`${c.part} ${c.name}：沒發聲`); continue; }
             if (!near(on.get(key), Ts)) bad.push(`${c.part} ${c.name}：起音應在 ${Ts}，實際 ${on.get(key)}`);
             if (!off.has(key)) { bad.push(`${c.part} ${c.name}：沒收（想要 ${want.toFixed(0)}）`); continue; }

@@ -11,9 +11,19 @@
 // 估速視窗：最近 8 個間隔（9 個按鍵）。評估結果：只看最近 1 個間隔，手抖會被直接放大（誤差約是視窗法的 2 倍）；
 // 固定檔案速度在你的速度偏離檔案時誤差高達 100～200ms；視窗 4～8 個按鍵在所有情境都穩，8 個最好。
 export const RATE_WINDOW_INTERVALS = 8;
-// 速度的合理範圍：同一毫秒連按（估出趨近無限大）或隔很久才按（趨近 0）都夾在這個範圍。
-export const MIN_PLAYBACK_RATE = 0.1;
-export const MAX_PLAYBACK_RATE = 4;
+// 速度的「絕對保險」範圍：只擋同一毫秒連按（估出趨近無限大）或隔幾分鐘才按（趨近 0）這種沒有意義的極端；真正用的是每首歌自己的區間
+// （rateBoundsFor）。
+export const MIN_PLAYBACK_RATE = 1 / 256;
+export const MAX_PLAYBACK_RATE = 64;
+
+// 每首歌的速度區間：容許「兩次按鍵的真實間隔」落在 [PRESS_PERIOD_MIN_S, PRESS_PERIOD_MAX_S] 之內。
+//  · 下界 0.06 秒 ≈ 16.7 下/秒（持續連按的上限；去抖下限 50ms 在它之內）。
+//  · 上界 30 秒：比這更久的空檔一律當成停手，不是你很慢（使用者決定）。
+// 這首歌的「典型起音間隔」g（樂譜秒）對應的速度區間就是 [g / 30, g / 0.06]——對數域寬度 ln(30 / 0.06) ≈ 6.2 固定，中心依 g 平移：
+// 密集的歌（g 小）整個區間往慢移、稀疏的歌往快移，所以任何新的 MIDI 都自動有合適的區間，不必手調常數。
+export const PRESS_PERIOD_MIN_S = 0.06;
+export const PRESS_PERIOD_MAX_S = 30;
+const CHORD_SKEW_S = 0.02; // 小於這個的起音間隔是和弦各音起點差幾 ms（錄製式檔案），不算「典型間隔」
 
 // 去抖窗口＝預估這一步真實長度的 60%（取自同事 SmartEnsemble 的做法），夾在 [50, 500]ms。下限比它的 150ms 低：
 // 125ms 的十六分音符要彈得出來；再加上取「你上一次的按鍵間隔」較小者，讓你加速時窗口跟著縮小。
@@ -26,19 +36,33 @@ export const DEBOUNCE_MAX_MS = 500;
 const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 
 /**
+ * 這首歌（你的聲部）的速度區間 { lo, hi }。
+ * @param {number[]} gapSecs  你的聲部相鄰起音的樂譜間隔（秒），可以含 0 或和弦錯位的小間隔（會被略過）
+ */
+export function rateBoundsFor(gapSecs) {
+  const gaps = gapSecs.filter((g) => g >= CHORD_SKEW_S).sort((a, b) => a - b);
+  if (!gaps.length) return { lo: MIN_PLAYBACK_RATE, hi: MAX_PLAYBACK_RATE };
+  const g = gaps[Math.floor((gaps.length - 1) / 2)];   // 中位數：休止、長音的極端間隔不影響
+  const lo = clamp(g / PRESS_PERIOD_MAX_S, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
+  const hi = clamp(g / PRESS_PERIOD_MIN_S, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
+  return hi > lo ? { lo, hi } : { lo: MIN_PLAYBACK_RATE, hi: MAX_PLAYBACK_RATE };
+}
+
+/**
  * 依最近的有效按鍵估 playbackRate。
  * 用「視窗頭尾」的比值（Δ樂譜秒 ÷ Δ真實秒），不是逐個間隔的比值再平均：每個按鍵時刻的誤差（手抖）只會在頭尾各出現
  * 一次，不會隨間隔個數累積；逐間隔平均則會把每個短間隔的誤差都放大進來。
  * @param {{ scoreSec: number, ms: number }[]} history  有效按鍵，由舊到新；scoreSec＝該按鍵放行的 segment 的樂譜秒，
  *        ms＝按下時刻（排程器時鐘，不含暫停）
  * @param {number} fallback  不足 2 個按鍵（沒有間隔可估）時回傳的值，通常是目前的 playbackRate
+ * @param {{ lo: number, hi: number }} [bounds]  這首歌的速度區間（rateBoundsFor），預設是絕對保險範圍
  */
-export function estimatePlaybackRate(history, fallback = 1) {
+export function estimatePlaybackRate(history, fallback = 1, bounds = { lo: MIN_PLAYBACK_RATE, hi: MAX_PLAYBACK_RATE }) {
   if (history.length < 2) return fallback;
   const last = history[history.length - 1];
   const first = history[Math.max(0, history.length - 1 - RATE_WINDOW_INTERVALS)];
   const realSec = Math.max(1e-3, (last.ms - first.ms) / 1000); // 同一毫秒連按時避免除以 0
-  return clamp((last.scoreSec - first.scoreSec) / realSec, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);
+  return clamp((last.scoreSec - first.scoreSec) / realSec, bounds.lo, bounds.hi);
 }
 
 /**

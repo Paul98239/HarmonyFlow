@@ -19,7 +19,10 @@ import { readFileSync, readdirSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join, resolve } from 'node:path';
 import { parseMidi } from '../../src/midi/midiParser.js';
-import { estimatePlaybackRate, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE } from '../../src/midi/pressTiming.js';
+import { estimatePlaybackRate } from '../../src/midi/pressTiming.js';
+
+// 這支工具比的是估計方法本身，速度夾在固定範圍 [0.1, 4]（跟每首歌自己的區間無關；區間與極端情境見 range-eval.mjs）
+const MIN_PLAYBACK_RATE = 0.1, MAX_PLAYBACK_RATE = 4;
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const args = Object.fromEntries(process.argv.slice(2).map((a) => { const [k, v = true] = a.replace(/^--/, '').split('='); return [k, v]; }));
@@ -51,7 +54,7 @@ const estimators = {
   '最近 3 秒的頭尾比值': (s, t, i) => { if (i < 1) return 1; let j = i - 1; while (j > 0 && t[i] - t[j - 1] <= 3) j--; return clamp((s[i] - s[j]) / Math.max(1e-3, t[i] - t[j])); },
   '最近 6 個按鍵的最小平方斜率': (s, t, i) => { if (i < 2) return 1; const j = Math.max(0, i - 5), n = i - j + 1; let sx = 0, sy = 0, sxx = 0, sxy = 0; for (let k = j; k <= i; k++) { sx += t[k]; sy += s[k]; sxx += t[k] * t[k]; sxy += t[k] * s[k]; } const d = n * sxx - sx * sx; return d > 0 ? clamp((n * sxy - sx * sy) / d) : 1; },
   // 實際採用的（src/midi/pressTiming.js）：最近 8 個間隔的頭尾比值
-  '最近 8 個間隔的頭尾比值（採用）': (s, t, i, st) => { (st.h ??= []).push({ scoreSec: s[i], ms: t[i] * 1000 }); return estimatePlaybackRate(st.h, 1); },
+  '最近 8 個間隔的頭尾比值（採用）': (s, t, i, st) => { (st.h ??= []).push({ scoreSec: s[i], ms: t[i] * 1000 }); return estimatePlaybackRate(st.h, 1, { lo: MIN_PLAYBACK_RATE, hi: MAX_PLAYBACK_RATE }); },
   // Kalman 濾波（狀態＝對數速度，隨機漫步；觀測＝每個間隔的對數速度）。先驗＝檔案速度 1×（x＝0）、變異數 P0 大，所以前幾下增益大、快速收斂；
   // 之後增益收斂到穩態（約 sqrt(q/r)）。q＝每個間隔速度自己漂移的變異數、r＝單一間隔觀測的變異數（手抖）。
   'Kalman（P0=0.5, q=0.002, r=0.015）': (s, t, i, st) => kalman(s, t, i, st, 0.5, 0.002, 0.015),
