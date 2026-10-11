@@ -10,5 +10,9 @@ docs/
 .vscode/*
 !.vscode/settings.json
 !.vscode/extensions.json
-# 曲庫全掃用的本機快取（test/tools/library-scan.mjs --download 下載的 .mid），不進 git
-test/tools/library/
+# 內部測試（開發者與 Claude 自用，含曲庫全掃的本機快取），不公開；測試用的 npm 相依一併不進 git
+test/
+package.json
+package-lock.json
+# 專案級 Claude Code 指引（內部規格），只在本機
+CLAUDE.md

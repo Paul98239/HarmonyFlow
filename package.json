@@ -1,9 +1,0 @@
-{
-  "name": "harmonyflow-dev-tools",
-  "private": true,
-  "description": "開發／測試用工具（Playwright 瀏覽器自動化測試、用官方 spessasynth_core 當標尺的差異測試）。app 本身仍然零建置、直接從 CDN 匯入相依套件，不受這裡影響——這個 package.json 只服務 test/ 底下的腳本。",
-  "devDependencies": {
-    "playwright": "^1.49.0",
-    "spessasynth_core": "4.3.22"
-  }
-}
