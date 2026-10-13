@@ -6,7 +6,7 @@
 //  與 render(snapshot)——render 只在值不同時寫 DOM。檔尾把三段合成一個區塊模組
 //  { actions, fields, inputs, mount, render } 給 layout.js。
 //
-//  對外（main.js）：startPlayer()、warmUpMidiEngine()、triggerSlot()、setPlayerCount()、KEYBOARD_SLOT；
+//  對外（main.js）：startPlayer()、warmUpMidiEngine()、triggerInput()、triggerSlot()、setPlayerCount()、KEYBOARD_SLOT；
 //  （layout.js）：playerStore 與檔尾的區塊模組。
 //
 //  選歌＝載入，播放鍵才是播放：選取本地檔案或雲端曲目之後，會立刻解析＋更新狀態
@@ -17,7 +17,7 @@
 //  播放中（含暫停）改指派則從目前位置接續（synth.reassign()），不從頭。
 //  指派是持久設定，不隨追蹤雜訊變動：下拉列「無／PC 鍵盤手／演奏者 1~N」，N ＝ 系統控制 bar 選的「現場人數」
 //  （playerCount，還沒選是 0 → 只有「無」和「PC 鍵盤手」；PC 鍵盤手不依賴現場人數），不因當下偵測到幾人而增減。
-//  演奏＝每次觸發（triggerSlot，目前來自鍵盤）放行「全曲的下一個 segment」（同一個 tick 上所有聲部的音），你的聲部與
+//  演奏＝每次觸發（triggerInput，目前來自鍵盤；手勢接回時用 triggerSlot）放行「全曲的下一個 segment」（同一個 tick 上所有聲部的音），你的聲部與
 //  電腦輔助的聲部在同一次呼叫內一起發聲（見 scheduler.js）；指派只決定哪些聲部走真人合成器、哪些演奏者有資格觸發。
 //  完全沒有人指派時整份照時間連續自動播放。
 //
@@ -154,8 +154,14 @@ const updateHumanGate = () => {
   synth.setHumanGate(armed);
 };
 
-// 觸發一次（main.js 把鍵盤接到這裡；日後手勢也走這個入口）：放行全曲的下一個 segment。同步呼叫排程器，
-// 這個 segment 的所有音在這次呼叫內就送進合成器（不經過計時器）。試聽中、暫停中、還沒載入時排程器沒在播放，trigger() 自己會忽略。
+// 觸發一次（main.js 把鍵盤接到這裡）：輸入事件（keyboard.js 產生的 { slot, source, eventTimeMs, receivedMs }）放行這個槽位的
+// 下一個 segment。同步呼叫排程器，這個 segment 的所有音在這次呼叫內就送進合成器（不經過計時器）。試聽中、暫停中、還沒載入時
+// 排程器沒在播放，trigger() 自己會忽略。
+export function triggerInput(input) {
+  synth.scheduler.trigger(input);
+}
+
+// 用槽位觸發一次（日後手勢接回時的入口：觸發序號變動時呼叫）。沒有來源與事件發生的時刻，時刻取現在。
 export function triggerSlot(slot) {
   synth.scheduler.trigger(slot, performance.now());
 }

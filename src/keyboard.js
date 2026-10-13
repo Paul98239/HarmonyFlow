@@ -1,7 +1,8 @@
 // ============================================================
 //  keyboard.js — 鍵盤觸發：電腦鍵盤的文字鍵（四排字元鍵＋空白鍵），每按一下＝「PC 鍵盤手」的一次觸發（放行全曲的下一個 segment，見 scheduler.js 的 trigger()）
 //
-//  這裡只負責「哪些按鍵算觸發」與防呆，按下去之後的事（發聲、時值）全在排程器。不 import 任何其他模組。
+//  這裡只負責「哪些按鍵算觸發」與防呆，並把一次按鍵包成輸入事件 { slot, source: 'keyboard', eventTimeMs, receivedMs } 交給呼叫端；
+//  按下去之後的事（發聲、時值）全在排程器。不 import 任何其他模組。
 // ============================================================
 
 // 用 event.code（實體鍵位）不用 event.key：同一個位置的鍵，不論 Windows／macOS、換輸入法或鍵盤配置（注音、Dvorak），
@@ -27,12 +28,14 @@ const isTyping = (el) => !!el && (el.isContentEditable || el.tagName === 'TEXTAR
   || (el.tagName === 'INPUT' && !['button', 'checkbox', 'radio', 'file', 'range'].includes(el.type)));
 
 /**
- * 掛上 keydown 監聽。每次有效按鍵在 keydown 事件裡同步呼叫 onTrigger(slot)（不經過計時器，發聲才不會晚）。
+ * 掛上 keydown 監聽。每次有效按鍵在 keydown 事件裡同步呼叫 onInput(輸入事件)（不經過計時器，發聲才不會晚）。輸入事件：
+ * slot＝這個鍵盤代表的演奏者槽位、source＝'keyboard'、eventTimeMs＝事件發生的時刻（event.timeStamp）、receivedMs＝handler 開始跑的
+ * 時刻（performance.now()）。兩個時刻同一個時間原點，相減就是事件在主執行緒佇列裡等了多久。
  * slot 由呼叫端交進來（main.js 傳 scheduler.js 的 KEYBOARD_SLOT）：這個模組不 import 其他模組。一個人可以被指派多個聲部。
- * @param {(slot: number|string) => void} onTrigger
+ * @param {(input: { slot: number|string, source: string, eventTimeMs: number, receivedMs: number }) => void} onInput
  * @param {number|string} slot  這個鍵盤代表的演奏者槽位
  */
-export function startKeyboardTrigger(onTrigger, slot) {
+export function startKeyboardTrigger(onInput, slot) {
   window.addEventListener('keydown', (e) => {
     if (!TRIGGER_CODES.has(e.code)) return;
     if (e.repeat) return;                                // 按住不放的自動重複：一次按下只算一次
@@ -41,9 +44,10 @@ export function startKeyboardTrigger(onTrigger, slot) {
     // 焦點停在 <select>（選歌、分譜指派）時，字母鍵會觸發瀏覽器的 type-ahead 跳選項，選歌下拉一跳就換歌，所以擋掉預設行為；
     // 空白鍵同理：滑鼠點過的按鈕會留著焦點，不擋的話空白鍵會連帶「按下」那顆按鈕（例如 ❚❚ 暫停）
     e.preventDefault();
-    inputDelays.push(performance.now() - e.timeStamp); // e.timeStamp 跟 performance.now() 同一個時間原點（事件產生的時刻）
+    const receivedMs = performance.now();
+    inputDelays.push(receivedMs - e.timeStamp); // e.timeStamp 跟 performance.now() 同一個時間原點（事件產生的時刻）
     if (inputDelays.length > INPUT_DELAY_MAX) inputDelays.shift();
-    onTrigger(slot);
+    onInput({ slot, source: 'keyboard', eventTimeMs: e.timeStamp, receivedMs });
   });
 
   // Firefox 是在空白鍵放開（keyup）時才「按下」焦點上的按鈕，只擋 keydown 不夠；其他觸發鍵放開時沒有預設行為，不用擋
