@@ -3,8 +3,8 @@
 //  之後才發給訂閱者（flush）——訂閱者的工作不會擋在你的音前面。訂閱者丟出的例外被隔離（印 console.error 後略過），不影響演奏。
 //  統計（遲到、早按處理、按鍵記錄）是這裡的標準訂閱者；視覺化與測試工具之後也直接訂閱。純邏輯，無 DOM。
 //
-//  事件（press／release／anchor／chase／stall 帶 group：driver 群組編號，現在永遠是 0；noteOn／noteOff 是譜表的事件、finish 是整首的，不帶）：
-//    press    { slot, source, result: 'released'｜'blocked'｜'prelude', clockMs, eventTimeMs }   每一次按鍵嘗試
+//  事件（press／release／anchor／chase／stall／forecast／reanchor 帶 group：driver 群組編號，現在永遠是 0；noteOn／noteOff 是譜表的事件、finish 是整首的，不帶）：
+//    press    { slot, source, result: 'released'｜'blocked'｜'prelude', clockMs, eventTimeMs, receivedMs }   每一次按鍵嘗試
 //    release  { index, ticks, clockMs }                       放行第 index 個 driver segment（你的起音）
 //    anchor   { slice, clockMs, scoreSec, rate }              啟動一段電腦聲部（錨點）
 //    noteOn   { note, noteId, staffId, kind, dueMs, clockMs, timed, fromTick, lateMs }   kind：'human'（你的）｜'assist'（電腦的）
@@ -12,6 +12,8 @@
 //    chase    { ticks, chased: note[], skipped: note[] }      你早按時上一段殘餘的電腦音：追音與跳過
 //    stall    { state: 'start'｜'end', clockMs }              播放頭停在你的下一個起音（等你按）／你按下去
 //    finish   { clockMs }                                     所有音都發過聲而且收完
+//    forecast { index, clockMs, atMs, uncertaintyMs, source, applied }   預報器的預報（每個 tick 一次；applied：有沒有拿來換錨）
+//    reanchor { slice, clockMs, scoreSec, rate, retimed }    段中換錨（retimed：重排了幾顆還沒送出的電腦音）
 // ============================================================
 
 import { summarizeMs } from './pressTiming.js';
@@ -20,6 +22,8 @@ import { summarizeMs } from './pressTiming.js';
 const LATE_SAMPLES_MAX = 5000;
 // 按鍵記錄最多留幾筆（超過就丟最舊的），避免長時間播放無限成長。
 const PRESS_LOG_MAX = 20000;
+// 錄音用的事件記錄最多留幾筆（每顆音一筆，一首最密的歌整首約一萬多筆）。
+const EVENT_LOG_MAX = 100000;
 
 // 每次按鍵都會走過排隊與派送（trigger() 的執行時間直接加在按下到出聲上），所以這裡刻意寫得省：沒有人訂閱的種類不排隊、
 // 佇列裡種類與 payload 交錯放（不另建 [種類, payload] 小陣列）、派送用索引迴圈（不建迭代器）。
@@ -86,8 +90,25 @@ export function chaseStatsSubscriber(events) {
 export function pressLogSubscriber(events) {
   const sub = { entries: [], log() { return this.entries.map((p) => ({ ...p })); }, reset() { this.entries = []; } };
   events.on('press', (e) => {
-    sub.entries.push({ slot: e.slot, clockMs: e.clockMs, released: e.result === 'released', source: e.source, eventTimeMs: e.eventTimeMs });
+    sub.entries.push({ slot: e.slot, clockMs: e.clockMs, released: e.result === 'released', source: e.source, eventTimeMs: e.eventTimeMs, receivedMs: e.receivedMs });
     if (sub.entries.length > PRESS_LOG_MAX) sub.entries.shift();
   });
+  return sub;
+}
+
+/**
+ * 錄音用的事件記錄（排程器的 enableEventLog() 才掛）：錨點與換錨（速度）、放行、每顆音實際發聲的時刻、早按處理，存成可以轉 JSON 的
+ * 小物件，音符用 id（「軌序號:軌內序號」，同一版 parser 解析同一個檔一定相同）。實際發聲時刻（排程器時鐘）：帶時間戳的電腦音在時間戳
+ * 發聲（時間戳已經過去就在送出的當下），其餘在送出的當下。
+ */
+export function eventLogSubscriber(events) {
+  const sub = { entries: [], log() { return this.entries.map((e) => ({ ...e })); }, reset() { this.entries = []; } };
+  const push = (entry) => { sub.entries.push(entry); if (sub.entries.length > EVENT_LOG_MAX) sub.entries.shift(); };
+  const ids = (notes) => notes.map((n) => n.id ?? null);
+  events.on('anchor', (e) => push({ type: 'anchor', group: e.group, slice: e.slice, clockMs: e.clockMs, scoreSec: e.scoreSec, rate: e.rate }));
+  events.on('reanchor', (e) => push({ type: 'reanchor', group: e.group, slice: e.slice, clockMs: e.clockMs, scoreSec: e.scoreSec, rate: e.rate }));
+  events.on('release', (e) => push({ type: 'release', group: e.group, index: e.index, ticks: e.ticks, clockMs: e.clockMs }));
+  events.on('noteOn', (e) => push({ type: 'noteOn', noteId: e.noteId, staffId: e.staffId, kind: e.kind, atMs: e.timed ? Math.max(e.dueMs, e.clockMs) : e.clockMs }));
+  events.on('chase', (e) => push({ type: 'chase', group: e.group, ticks: e.ticks, chased: ids(e.chased), skipped: ids(e.skipped) }));
   return sub;
 }

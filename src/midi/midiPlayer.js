@@ -192,8 +192,19 @@ export function audioLatency() {
 }
 
 // 量測（同上）：這一輪的按鍵記錄與目前的指派，給 main.js 的 window.__pressLog 匯出，離線分析用。
+// 錄音 v2（D）：歌、指派（Map 展開成 [partId, 槽位][]，才能轉成 JSON）、每次按鍵嘗試（事件發生與程式收到的時刻、排程器時鐘、
+// 有沒有放行）、事件串流（錨點、速度、每顆音實際發聲的時刻…）與匯出的時刻。commit 不在這裡（app 不知道），登記到 corpus 時
+// 由 test/tools/recording-register.mjs 補上。
 export function pressLog() {
-  return { assignments: [...playerStore.state.assignments], presses: synth.scheduler.pressLog() };   // Map 展開成 [partId, 槽位][]，才能轉成 JSON
+  const { source, songTitle, assignments } = playerStore.state;
+  return {
+    version: 2,
+    song: { title: songTitle, source: source && { kind: source.kind, name: source.name, id: source.id ?? null } },
+    assignments: [...assignments],
+    presses: synth.scheduler.pressLog(),
+    events: synth.scheduler.eventLog(),
+    recordedAt: new Date().toISOString(),
+  };
 }
 
 /* ═══════════════════════════════════════════
@@ -512,6 +523,7 @@ function schedulerTick() {
 
 // main.js 呼叫一次；不靠 import 副作用啟動。
 export function startPlayer() {
+  synth.scheduler.enableEventLog();   // 錄音 v2 的事件串流（pressLog()）：app 一律記，彈完隨時可以匯出
   setInterval(uiTick, UI_TICK_MS);
   setInterval(schedulerTick, SCHEDULER_TICK_MS);
 }

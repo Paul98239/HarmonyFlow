@@ -32,8 +32,8 @@ window.__stats = () => {
   };
 };
 
-// 開發用：彈完在 console 輸入 copy(__pressLog())，貼進 test/tools/recordings/<名稱>.json 留存，供離線分析。
-// 時間是排程器時鐘（暫停不計），跟 sim.mjs 的座標一樣。
+// 開發用：彈完在 console 輸入 copy(__pressLog())，存成 .json 後用 test/tools/recording-register.mjs 登記到 corpus，供離線重放評估
+// （replay-eval.mjs）。錄音 v2：按鍵與事件串流的時間是排程器時鐘（暫停不計），跟 sim.mjs 的座標一樣；eventTimeMs／receivedMs 是 performance.now()。
 window.__pressLog = midiPlayer.pressLog;
 
 async function bootSystem() {

@@ -44,6 +44,10 @@
 //  velocity 一律用樂譜原值；不重播 CC／pitch-bend，每個 staff 的初始狀態（bank／program 與 CC7／10／91／93）只在 load() 時送一次，
 //  而且一定在該 channel 的第一個 noteOn 之前。
 //
+//  預報入口（段中換錨）：每個 driver 群組可以掛一個預報器（setForecaster()，預設沒有＝行為完全不變）。排程器每個 tick 問它「你會在
+//  什麼時刻按下一個起音」，收到有效的預報就以（現在、此刻的樂譜位置、新速度）換錨，重排這一段還沒送出的電腦音（見 _applyForecast）。
+//  預報只是暫時的：真正按下時照原本的流程（早按走垂直切片、晚按停格等你），下一段的速度照舊來自速度追蹤。
+//
 //  聲部單位（part／staff）與 driver 群組見 performancePlan.js（演奏計畫，載入、改指派時建好，之後不變）。每個 driver 群組在這裡
 //  各有一份執行期狀態：游標、錨點、電腦音佇列、前奏預按、停格旗標、速度追蹤（makeGroupState()）。現在永遠只有一個群組
 //  （所有被指派的槽位共用同一條 driver 序列、擁有全部的 follower）；播放頭、hold 判定、對外的 playbackRate 看第一個群組。
@@ -51,7 +55,7 @@
 
 import { TempoFollower } from './tempoFollower.js';
 import { OutputRouter, portsFor } from './outputRouter.js';
-import { PerformanceEvents, lateStatsSubscriber, chaseStatsSubscriber, pressLogSubscriber } from './performanceEvents.js';
+import { PerformanceEvents, lateStatsSubscriber, chaseStatsSubscriber, pressLogSubscriber, eventLogSubscriber } from './performanceEvents.js';
 import { VoiceLedger, scaledMs, EPS_MS } from './voiceLedger.js';
 import { buildPlan, staffPools, sliceOfTick } from './performancePlan.js';
 
@@ -60,6 +64,8 @@ export { CHANNELS_PER_PORT, DEFAULT_PORTS } from './outputRouter.js';
 
 export const DEFAULT_SCHEDULER_CONFIG = Object.freeze({
   drumChannel: 9, // MIDI 規格：第 10 個 channel（索引 9）是打擊
+  // 預報的到達時刻跟目前預計的差不到這麼多（毫秒）就不換錨：預報器每個 tick 都會更新，免得每個 tick 都重排。應用層數字，評估工具可以調
+  forecastMinChangeMs: 10,
 });
 
 // 鍵盤的演奏者槽位。肢體動作的槽位是數字 1~4（演奏者 ID），鍵盤用字串，兩者不衝突，日後可以並存。
@@ -121,6 +127,7 @@ export class Scheduler {
     this._score = null;
     this._plan = buildPlan(null);   // 載入後不變的計畫（staff、driver 群組、總音數、hold 容差上限；見 performancePlan.js）
     this._groups = this._plan.groups.map((p, i) => makeGroupState(i, p));   // 每個 driver 群組的執行期狀態（現在永遠一個）
+    this._forecasters = [];    // 群組編號 → 預報器（setForecaster()；預設沒有）。是設定不是播放狀態：載入、改指派、重設都不拿掉
     // 播放狀態（_resetPlayback() 要全部重設）
     this._playing = false;
     this._clockMs = 0;         // 排程器時鐘（只在 tick／trigger 前進，暫停不走）
@@ -128,6 +135,7 @@ export class Scheduler {
     this._lateStats = lateStatsSubscriber(this.events);     // 量測：tick() 放出的電腦音比排好的時刻晚了幾毫秒（見 lateStats()）
     this._chaseStats = chaseStatsSubscriber(this.events);   // 量測：早按時的追音與跳過（見 chaseStats()）
     this._pressLog = pressLogSubscriber(this.events);       // 量測：每次按鍵嘗試（含被去抖擋掉、前奏預按），給 pressLog() 匯出、離線重放用
+    this._eventLog = null;     // 錄音用的事件記錄（enableEventLog() 才建：預設不記，不增加每次按鍵的派送成本）
     this._finishSent = false;  // finish 事件已經發過
     this._sounded = new Set(); // 已經發過聲的音（每顆音恰好一次）
     this._skipped = new Set(); // 早按時整顆在你身後而跳過的電腦音（沒有發聲；跟 _sounded 合起來才是「處理過」，見 isFinished）
@@ -139,6 +147,14 @@ export class Scheduler {
 
   setPortCount(ports) {
     this._router.setPortCount(ports);
+  }
+
+  /**
+   * 掛上（或拿掉，傳 null）一個 driver 群組的預報器。排程器每個 tick 呼叫 forecaster.forecast(view)（view 見 _forecastView()），
+   * 回傳 { atMs（預估你按下一個起音的排程器時鐘時刻）, uncertaintyMs?, source } 或 null（不預報）。預設沒有預報器：行為完全不變。
+   */
+  setForecaster(groupIndex, forecaster) {
+    this._forecasters[groupIndex] = forecaster || undefined;
   }
 
   get assistSynth() { return this._router.assistSynth; }   // 電腦輔助聲部（follower）的合成器
@@ -268,6 +284,7 @@ export class Scheduler {
     this._lateStats.reset();
     this._chaseStats.reset();
     this._pressLog.reset();
+    this._eventLog?.reset();
     this._finishSent = false;
     this._sounded.clear();
     this._skipped.clear();
@@ -528,7 +545,7 @@ export class Scheduler {
   // 按鍵嘗試的事件（按鍵記錄 pressLog() 是它的訂閱者）。result：'released' 放行、'blocked' 被去抖擋掉、'prelude' 前奏中的預按。
   // ev 是輸入事件（見 trigger()）：來源與事件發生的時刻原樣記下（用槽位觸發時是 null）。
   _pressEvent(g, ev, clockMs, result) {
-    this.events.queue('press', { group: g.index, slot: ev.slot, source: ev.source ?? null, result, clockMs, eventTimeMs: ev.eventTimeMs ?? null });
+    this.events.queue('press', { group: g.index, slot: ev.slot, source: ev.source ?? null, result, clockMs, eventTimeMs: ev.eventTimeMs ?? null, receivedMs: ev.receivedMs ?? null });
   }
 
   /**
@@ -536,6 +553,14 @@ export class Scheduler {
    * 可以直接拿去重放。重設（stop／restart／換歌）時清空。
    */
   pressLog() { return this._pressLog.log(); }
+
+  /** 開啟錄音用的事件記錄（錨點、換錨、放行、每顆音實際發聲的時刻、早按處理；見 performanceEvents.js 的 eventLogSubscriber）。 */
+  enableEventLog() {
+    if (!this._eventLog) this._eventLog = eventLogSubscriber(this.events);
+  }
+
+  /** 這一輪的事件記錄（複本；沒開就是空陣列）。重設（stop／restart／換歌）時清空。 */
+  eventLog() { return this._eventLog ? this._eventLog.log() : []; }
 
   /**
    * 由 midiPlayer.js 的排程 tick（~12ms）每次呼叫：推進時鐘、放出到時間的 follower 音、收掉到期的音。
@@ -553,6 +578,7 @@ export class Scheduler {
     const timed = Number.isFinite(audioNow);
     this._router.setAudioBase(timed ? { audio: audioNow, clock: this._clockMs } : null);  // 只在這個 tick 內有效：按鍵、暫停的呼叫一律立刻處理
     try {
+      this._askForecasters();   // 先換錨再收音發聲：這個 tick 放出的電腦音就照新的速度
       this._tickBody(timed ? this._clockMs + LOOKAHEAD_MS : this._clockMs);
       this._queueStateEvents();
     } finally {
@@ -575,6 +601,55 @@ export class Scheduler {
       this._finishSent = true;
       this.events.queue('finish', { clockMs: this._clockMs });
     }
+  }
+
+  // 問每個有掛預報器的群組（沒有預報器的群組什麼都不做）
+  _askForecasters() {
+    for (const g of this._groups) {
+      const f = this._forecasters[g.index];
+      if (f) this._applyForecast(g, f.forecast(this._forecastView(g)));
+    }
+  }
+
+  // 給預報器看的唯讀資料：游標（下一個要放行的起音）、時鐘、目前的錨點（可能已經換過錨）、這一段起點與下一個起音的樂譜秒
+  // （前奏時起點是 null、最後一段時下一個起音是 null）、速度追蹤目前的速度與區間。
+  _forecastView(g) {
+    const segs = g.plan.driverSegs;
+    return {
+      group: g.index, cursor: g.cursor, clockMs: this._clockMs, anchor: g.anchor && { ...g.anchor },
+      segmentStartSec: g.cursor > 0 ? this._secOf(segs[g.cursor - 1].ticks) : null,
+      nextOnsetSec: g.cursor < segs.length ? this._secOf(segs[g.cursor].ticks) : null,
+      rate: g.tempo.playbackRate, rateBounds: { ...g.tempo.bounds },
+    };
+  }
+
+  // 段中換錨：預報說你會在 f.atMs 按下一個起音。只在這一段是按鍵啟動的（游標 ≥ 1；前奏照 1× 播到入場點）、還有下一個起音、
+  // 播放頭還沒走到它（還沒停格）、預報在現在之後、而且跟目前預計的到達時刻差到門檻（forecastMinChangeMs）以上時才換。
+  // 新錨點＝（現在, 此刻的樂譜位置 p, r′）：r′＝（下一個起音的樂譜秒 − p）÷（atMs − 現在），夾在這個群組的速度區間（N6）。
+  // 佇列裡（還沒送出）、樂譜位置在 p 之後的電腦音照 r′ 重排發聲與收音時刻（音長上限照 scaledMs）：不會排到現在之前、
+  // 保持樂譜順序、間隔等比例。碰不到的有：跟你同 tick 的音（按下時已經發聲）、lookahead 已經送出的音（已經離開佇列，取消不了）、
+  // 已經在響的音（收音時刻與 hold 照發聲當時的換算），以及已經過期、只是還沒放出的音（p 之前，照原時刻放）。
+  _applyForecast(g, f) {
+    if (!f) return;
+    const now = this._clockMs, next = g.plan.driverSegs[g.cursor], a = g.anchor;
+    const reach = this._reachClockMs(g);
+    const applied = g.cursor >= 1 && !!next && !!a && reach !== null && now < reach && f.atMs > now
+      && Math.abs(f.atMs - reach) >= this.cfg.forecastMinChangeMs;
+    this.events.queue('forecast', { group: g.index, index: g.cursor, clockMs: now, atMs: f.atMs, uncertaintyMs: f.uncertaintyMs ?? null, source: f.source ?? null, applied });
+    if (!applied) return;
+    const p = a.scoreSec + ((now - a.clockMs) * a.rate) / 1000;   // 此刻的樂譜位置（還沒走到下一個起音：now < reach）
+    const { lo, hi } = g.tempo.bounds;
+    const rate = Math.min(hi, Math.max(lo, ((this._secOf(next.ticks) - p) * 1000) / (f.atMs - now)));
+    g.anchor = { slice: a.slice, clockMs: now, scoreSec: p, rate };
+    let retimed = 0;
+    for (const q of g.pending) {
+      const startSec = this._secOf(q.note.startTick);
+      if (startSec <= p) continue;                                    // 已經過期、只是還沒放出：照原時刻（馬上）放
+      q.dueMs = now + ((startSec - p) * 1000) / rate;
+      q.offMs = q.dueMs + scaledMs(this._secOf(q.note.endTick) - startSec, rate);
+      retimed++;
+    }
+    this.events.queue('reanchor', { group: g.index, slice: a.slice, clockMs: now, scoreSec: p, rate, retimed });
   }
 
   _tickBody(horizonMs) {
