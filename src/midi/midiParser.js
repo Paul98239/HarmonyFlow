@@ -27,6 +27,7 @@ export { META, MidiParseError, encodeMidi } from './smf.js';
 export { gmProgramNameZh, midiNoteName } from './gmNames.js';
 export { buildMeasureGrid, buildBeatGrid } from './timeline.js';
 export { buildSegments, ChannelStateTracker, controllerStateAt, chaseEventsAt } from './scoreQueries.js';
+export { byFileOrder } from './instruments.js';
 
 /* ═══════════════════════════════════════════
    資料模型的型別（JSDoc typedef）

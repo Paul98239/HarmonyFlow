@@ -21,9 +21,15 @@ export const MAX_PLAYBACK_RATE = 64;
 //  · 上界 30 秒：比這更久的空檔一律當成停手，不是你很慢（使用者決定）。
 // 這首歌的「典型起音間隔」g（樂譜秒）對應的速度區間就是 [g / 30, g / 0.06]——對數域寬度 ln(30 / 0.06) ≈ 6.2 固定，中心依 g 平移：
 // 密集的歌（g 小）整個區間往慢移、稀疏的歌往快移，所以任何新的 MIDI 都自動有合適的區間，不必手調常數。
+// 比 PRESS_PERIOD_MIN_S 還短的起音間隔不算「典型間隔」：原速時按不及，放行時會併成一下按（近距起音分組，scheduler.js），
+// 不是兩次按鍵的間隔——錄製式檔案的和弦錯位（幾 ms）、一串快音都是；算進去的話中位數被壓小，上限會低於原速。
 export const PRESS_PERIOD_MIN_S = 0.06;
 export const PRESS_PERIOD_MAX_S = 30;
-const CHORD_SKEW_S = 0.02; // 小於這個的起音間隔是和弦各音起點差幾 ms（錄製式檔案），不算「典型間隔」
+
+// 近距起音分組的門檻：一個輸入來源連按兩下最短要隔多久（秒）。比這更近的起音按不及，放行時併成一組（scheduler.js）。
+// 鍵盤＝PRESS_PERIOD_MIN_S（上面速度區間假設的「最快連按」，同一個常數）；手勢接回時量測後再加，其他來源先用鍵盤的值。
+const MIN_PRESS_INTERVAL_S = { keyboard: PRESS_PERIOD_MIN_S };
+export const minPressIntervalSec = (source) => MIN_PRESS_INTERVAL_S[source] ?? PRESS_PERIOD_MIN_S;
 
 // 去抖窗口＝預估這一步真實長度的 60%（取自同事 SmartEnsemble 的做法），夾在 [50, 500]ms。下限比它的 150ms 低：
 // 125ms 的十六分音符要彈得出來；再加上取「你上一次的按鍵間隔」較小者，讓你加速時窗口跟著縮小。
@@ -37,10 +43,10 @@ const clamp = (x, lo, hi) => Math.min(hi, Math.max(lo, x));
 
 /**
  * 這首歌（你的聲部）的速度區間 { lo, hi }。
- * @param {number[]} gapSecs  你的聲部相鄰起音的樂譜間隔（秒），可以含 0 或和弦錯位的小間隔（會被略過）
+ * @param {number[]} gapSecs  你的聲部相鄰起音的樂譜間隔（秒），可以含 0、和弦錯位或快音的小間隔（< PRESS_PERIOD_MIN_S，會被略過）
  */
 export function rateBoundsFor(gapSecs) {
-  const gaps = gapSecs.filter((g) => g >= CHORD_SKEW_S).sort((a, b) => a - b);
+  const gaps = gapSecs.filter((g) => g >= PRESS_PERIOD_MIN_S).sort((a, b) => a - b);
   if (!gaps.length) return { lo: MIN_PLAYBACK_RATE, hi: MAX_PLAYBACK_RATE };
   const g = gaps[Math.floor((gaps.length - 1) / 2)];   // 中位數：休止、長音的極端間隔不影響
   const lo = clamp(g / PRESS_PERIOD_MAX_S, MIN_PLAYBACK_RATE, MAX_PLAYBACK_RATE);

@@ -3,17 +3,23 @@
 //  之後才發給訂閱者（flush）——訂閱者的工作不會擋在你的音前面。訂閱者丟出的例外被隔離（印 console.error 後略過），不影響演奏。
 //  統計（遲到、早按處理、按鍵記錄）是這裡的標準訂閱者；視覺化與測試工具之後也直接訂閱。純邏輯，無 DOM。
 //
-//  事件（press／release／anchor／chase／stall／forecast／reanchor 帶 group：driver 群組編號，現在永遠是 0；noteOn／noteOff 是譜表的事件、finish 是整首的，不帶）：
+//  事件（press／release／group／autoRelease／anchor／chase／stall／forecast／reanchor 帶 group：driver 群組編號，現在永遠是 0；noteOn／noteOff
+//  是譜表的事件、finish 是整首的，不帶）：
 //    press    { slot, source, result: 'released'｜'blocked'｜'prelude', clockMs, eventTimeMs, receivedMs }   每一次按鍵嘗試
-//    release  { index, ticks, clockMs }                       放行第 index 個 driver segment（你的起音）
+//    release  { index, ticks, clockMs }                       放行第 index 個 driver segment（你按的起音＝組頭）
+//    group    { index, ticks, merged: [{ index, ticks }], clockMs }   組頭放行時併入的近距起音（按不及，到點自動放行）
+//    autoRelease { index, ticks, dueMs, clockMs }             組裡被併入的起音到點自動放行（收掉 endTick ≤ 它的你的音、放行等它的 hold）
 //    anchor   { slice, clockMs, scoreSec, rate }              啟動一段電腦聲部（錨點）
 //    noteOn   { note, noteId, staffId, kind, dueMs, clockMs, timed, fromTick, lateMs }   kind：'human'（你的）｜'assist'（電腦的）
 //    noteOff  { note, noteId, staffId, kind, offMs, clockMs, timed }
-//    chase    { ticks, chased: note[], skipped: note[] }      你早按時上一段殘餘的電腦音：追音與跳過
+//    chase    { ticks, chased: note[], skipped: note[], inFlight }   你早按時上一段殘餘的電腦音與組內音：追音與跳過；inFlight＝組裡已經
+//             提早帶時間戳送出、取消不了的你的音（會在按下之後 ≤ 50ms 響）
 //    stall    { state: 'start'｜'end', clockMs }              播放頭停在你的下一個起音（等你按）／你按下去
 //    finish   { clockMs }                                     所有音都發過聲而且收完
 //    forecast { index, clockMs, atMs, uncertaintyMs, source, applied }   預報器的預報（每個 tick 一次；applied：有沒有拿來換錨）
 //    reanchor { slice, clockMs, scoreSec, rate, retimed }    段中換錨（retimed：重排了幾顆還沒送出的電腦音）
+//    control  { id, ticks, type, outputs: [{ kind, channel }], dueMs, clockMs }   送出一個控制器軌的事件（id＝「軌序號:軌內序號」；
+//             outputs＝送到哪些輸出 channel）。控制器可能很密（pitch bend 上萬個），排程器先問 has('control') 才組內容
 // ============================================================
 
 import { summarizeMs } from './pressTiming.js';
@@ -38,6 +44,12 @@ export class PerformanceEvents {
     const subs = this._subscribers.get(type) || [];
     if (!subs.includes(fn)) this._subscribers.set(type, [...subs, fn]);
     return () => this._subscribers.set(type, (this._subscribers.get(type) || []).filter((f) => f !== fn));
+  }
+
+  /** 這種事件現在有沒有人訂閱：內容要另外組、又很頻繁的種類（control）先問，沒有人訂閱就連內容都不組。 */
+  has(type) {
+    const subs = this._subscribers.get(type);
+    return subs !== undefined && subs.length > 0;
   }
 
   // 排一個事件。排隊當下沒有人訂閱的種類直接略過（演奏時只有統計訂閱 noteOn／press／chase，其餘的不排隊也不派送）。
@@ -66,8 +78,9 @@ export class PerformanceEvents {
 export function lateStatsSubscriber(events) {
   const sub = { samples: [], stats() { return summarizeMs(this.samples); }, reset() { this.samples = []; } };
   events.on('noteOn', (e) => {
-    // 只記 tick() 放出的：按鍵呼叫內同刻放出的音（時鐘就是按下的那一刻）沒有「等 tick」這回事，記進去只會把統計稀釋成 0。
-    if (e.fromTick) {
+    // 只記 tick() 放出的電腦音：按鍵呼叫內同刻放出的音（時鐘就是按下的那一刻）沒有「等 tick」這回事，記進去只會把統計稀釋成 0；
+    // 組裡到點放出的你的音不是電腦音。
+    if (e.fromTick && e.kind === 'assist') {
       sub.samples.push(e.lateMs);
       if (sub.samples.length > LATE_SAMPLES_MAX) sub.samples.shift();
     }
@@ -75,13 +88,15 @@ export function lateStatsSubscriber(events) {
   return sub;
 }
 
-/** 標準訂閱者：你早按時的追音與跳過（見 scheduler.js 的 chaseStats()）。 */
+/** 標準訂閱者：你早按時的追音、跳過與取消不了的組內音（見 scheduler.js 的 chaseStats()）。 */
 export function chaseStatsSubscriber(events) {
-  const sub = { counts: { presses: 0, chased: 0, skipped: 0 }, stats() { return { ...this.counts }; }, reset() { this.counts = { presses: 0, chased: 0, skipped: 0 }; } };
+  const zero = () => ({ presses: 0, chased: 0, skipped: 0, inFlight: 0 });
+  const sub = { counts: zero(), stats() { return { ...this.counts }; }, reset() { this.counts = zero(); } };
   events.on('chase', (e) => {
     sub.counts.presses++;
     sub.counts.chased += e.chased.length;
     sub.counts.skipped += e.skipped.length;
+    sub.counts.inFlight += e.inFlight;
   });
   return sub;
 }
@@ -108,6 +123,8 @@ export function eventLogSubscriber(events) {
   events.on('anchor', (e) => push({ type: 'anchor', group: e.group, slice: e.slice, clockMs: e.clockMs, scoreSec: e.scoreSec, rate: e.rate }));
   events.on('reanchor', (e) => push({ type: 'reanchor', group: e.group, slice: e.slice, clockMs: e.clockMs, scoreSec: e.scoreSec, rate: e.rate }));
   events.on('release', (e) => push({ type: 'release', group: e.group, index: e.index, ticks: e.ticks, clockMs: e.clockMs }));
+  events.on('group', (e) => push({ type: 'group', group: e.group, index: e.index, merged: e.merged.map((m) => m.index), clockMs: e.clockMs }));
+  events.on('autoRelease', (e) => push({ type: 'autoRelease', group: e.group, index: e.index, ticks: e.ticks, dueMs: e.dueMs, clockMs: e.clockMs }));
   events.on('noteOn', (e) => push({ type: 'noteOn', noteId: e.noteId, staffId: e.staffId, kind: e.kind, atMs: e.timed ? Math.max(e.dueMs, e.clockMs) : e.clockMs }));
   events.on('chase', (e) => push({ type: 'chase', group: e.group, ticks: e.ticks, chased: ids(e.chased), skipped: ids(e.skipped) }));
   return sub;

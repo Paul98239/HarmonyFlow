@@ -86,14 +86,14 @@ export class VoiceLedger {
   holdOf(note, cursor) { return holdOf(note, this._driverTicks, cursor, this._holdCapTicks, this._secOf); }
 
   // 讓一顆音發聲：noteOn，記進正在響的佇列（同音高先進先出）。dueMs＝預定發聲的時鐘時刻（你的音就是按下的那一刻），只有 tick() 裡的
-  // 電腦音（lookahead）才會帶時間戳；onTime 記下那顆 noteOn 的 AudioContext 時間（沒帶時間戳＝undefined）。
+  // 電腦音（lookahead）與被併入組裡的你的音（timed）才會帶時間戳；onTime 記下那顆 noteOn 的 AudioContext 時間（沒帶時間戳＝undefined）。
   // cursor＝driver 游標（hold 判定用）、rate＝目前速度、fromTick＝由 tick() 放出（記在 noteOn 事件裡：遲到統計只算這種，
-  // 見 performanceEvents.js）、clockMs＝排程器時鐘。
-  sound(staff, note, offMs, dueMs, { cursor, rate, fromTick, clockMs }) {
-    this._capOverlaps(staff, note, dueMs, rate, clockMs);
+  // 見 performanceEvents.js）、clockMs＝排程器時鐘、timed＝你的合成器也照 lookahead 帶時間戳（近距起音分組被併入的音，見 scheduler.js）。
+  sound(staff, note, offMs, dueMs, { cursor, rate, fromTick, clockMs, timed = false }) {
+    const opts = timed ? this._router.stampTime(dueMs) : this._router.stamp(staff, dueMs);
+    this._capOverlaps(staff, note, dueMs, rate, clockMs, opts?.time);
     let queue = staff.sounding.get(note.midiNote);
     if (!queue) staff.sounding.set(note.midiNote, (queue = []));
-    const opts = this._router.stamp(staff, dueMs);
     // hold：結尾接著、或橫跨某個還沒放行的 driver 起音的音（你的與電腦的一樣），先不排收音（Infinity），等你按到那個起音才收
     // （releaseHeld）；tailSec 是檔案裡那個起音到這顆音結尾的樂譜秒數。被同譜表的新音截短過的不再 hold（見 _capOverlaps，capped）
     const hold = this.holdOf(note, cursor);
@@ -109,8 +109,8 @@ export class VoiceLedger {
   // 「onsetMs ＋ 檔案裡這兩顆音的重疊量依目前速度 rate 換算」（檔案裡舊音結尾在新音起音之前＝重疊 0，就在新音發聲時收）。
   // 為什麼：舊音的結尾是依發聲當時估到的速度排好的，速度之後變快、或舊音還在 hold（結尾是無限大）時，舊音就會比檔案裡的重疊多響一截
   // （糊在一起）；照檔案的 tick 位置收尾，重疊量就跟檔案一樣，也不會丟音、不會擠。只會把收音提早，不會延長（所以你按得晚時不撐）。
-  // 同譜表內起音 tick 相同的音（和弦）不算「下一個音」，不互相截。
-  _capOverlaps(staff, note, onsetMs, rate, clockMs) {
+  // 同譜表內起音 tick 相同的音（和弦）不算「下一個音」，不互相截。onTime＝新音 noteOn 的時間戳（有帶的話）。
+  _capOverlaps(staff, note, onsetMs, rate, clockMs, onTime) {
     const startSec = this._secOf(note.startTick);
     for (const queue of staff.sounding.values()) {
       for (const entry of queue) {
@@ -126,10 +126,15 @@ export class VoiceLedger {
         else if (entry.note.midiNote === note.midiNote) { entry.capped = true; entry.holdIdx = null; }
       }
     }
-    // 同音高的舊音若因此到期，要在新音 noteOn 之前先收（先收再放：不然同音高的 noteOff 會連新音一起關掉）
+    // 同音高的舊音若因此到期，要在新音 noteOn 之前先收（先收再放：不然同音高的 noteOff 會連新音一起關掉）。你的合成器的收音平常不帶
+    // 時間戳，但新音提早帶時間戳送出時（被併入組裡的音），舊音要收在新音的時間戳（同一個時間戳依送出順序，先收再放）：立刻收會把
+    // 舊音切短，等時鐘到了才收又會晚於新音、把新音一起關掉。
     const same = staff.sounding.get(note.midiNote);
     for (let i; same && (i = dueIndex(same, onsetMs)) !== -1; ) {
-      this._off(staff, note.midiNote, same[i], this._router.offOpts(staff, same[i], same[i].offMs), clockMs);
+      const opts = staff.kind === 'human' && onTime !== undefined
+        ? { time: Math.max(onTime, (same[i].onTime ?? -Infinity) + 0.001) }
+        : this._router.offOpts(staff, same[i], same[i].offMs);
+      this._off(staff, note.midiNote, same[i], opts, clockMs);
       same.splice(i, 1);
     }
     if (same && !same.length) staff.sounding.delete(note.midiNote);
@@ -165,14 +170,15 @@ export class VoiceLedger {
     }
   }
 
-  // 下一次按鍵時，driver 的音 endTick ≤ 新錨點 tick 的先收掉（你的下一個起音發聲時，之前該結束的音已經結束，不管估到的
-  // 速度怎樣）。只收 driver：follower 的音照自己的時刻（MIDI 音符長度）放完，不被你的按鍵切斷。
+  // 下一次按鍵時（或組裡的起音自動放行時），driver 的音 endTick ≤ 新錨點 tick 的先收掉（你的下一個起音發聲時，之前該結束的音已經
+  // 結束，不管估到的速度怎樣）。只收 driver：follower 的音照自己的時刻（MIDI 音符長度）放完，不被你的按鍵切斷。立刻處理；但組裡被併入、
+  // 提早帶時間戳送出還沒響的音，收音要排在它的 noteOn 之後（offOpts），不然先到的 noteOff 收不到它、它響了就卡住。
   closeByTick(ticks, clockMs) {
     for (const staff of this._staves.values()) {
       if (staff.kind !== 'human') continue;
       for (const [pitch, queue] of staff.sounding) {
         while (queue.length && queue[0].endTick <= ticks) {
-          this._offNow(staff, pitch, queue[0], clockMs);
+          this._off(staff, pitch, queue[0], this._router.offOpts(staff, queue[0]), clockMs);
           queue.shift();
         }
         if (!queue.length) staff.sounding.delete(pitch);
@@ -204,12 +210,6 @@ export class VoiceLedger {
   _off(staff, pitch, entry, opts, clockMs) {
     this._router.noteOff(staff, pitch, opts);
     this._queueNoteOff(staff, entry, opts !== undefined, clockMs);
-  }
-
-  // 不帶時間戳、立刻處理的收音（你的下一次按鍵時先收掉 endTick ≤ 新起音的音）。
-  _offNow(staff, pitch, entry, clockMs) {
-    this._router.noteOffNow(staff, pitch);
-    this._queueNoteOff(staff, entry, false, clockMs);
   }
 
   _queueNoteOff(staff, entry, timed, clockMs) {
