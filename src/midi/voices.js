@@ -365,10 +365,10 @@ export function holdCapTicksFor(score) {
   return Number.isFinite(cap) ? Math.max(HOLD_GAP_TICKS, Math.round(cap)) : HOLD_GAP_TICKS;
 }
 
-// 同音高佇列裡「下一個該收的音」的位置：先進先出只排沒有 hold 的音——hold 著的音要等你按到它的起音才收，不能擋住排在它後面、
-// 已經到期的音（延遲放出的舊 tick 的電腦音可能比新 tick 的音晚發聲）。第一個沒有 hold 的音到期（offMs ≤ limit）就回傳它的位置，否則 -1。
+// 同音高佇列裡「下一個該收的音」的位置：先進先出只排沒有 hold、也沒有在等鍵（waitKey，keyup 模式）的音——hold 著的音要等你按到它的起音才收、等鍵的音要等它的鍵放開，
+// 都不能擋住排在它後面、已經到期的音（延遲放出的舊 tick 的電腦音可能比新 tick 的音晚發聲）。第一個這樣的音到期（offMs ≤ limit）就回傳它的位置，否則 -1。
 export function dueIndex(queue, limit) {
-  const i = queue.findIndex((e) => e.holdIdx === null);
+  const i = queue.findIndex((e) => e.holdIdx === null && e.waitKey == null);
   return i !== -1 && queue[i].offMs <= limit + EPS_MS ? i : -1;
 }
 
@@ -417,15 +417,17 @@ export class VoiceLedger {
   // 讓一顆音發聲：noteOn，記進正在響的佇列（同音高先進先出）。dueMs＝預定發聲的時鐘時刻（你的音就是按下的那一刻），只有 tick() 裡的電腦音（lookahead）與被併入組裡的你的音（timed）才帶時間戳；
   // onTime 記下那顆 noteOn 的 AudioContext 時間（沒帶＝undefined）。cursor＝driver 游標（hold 判定）、rate＝目前速度、fromTick＝由 tick() 放出（遲到統計只算這種，見 scheduler.js）、
   // clockMs＝排程器時鐘、timed＝你的合成器也照 lookahead 帶時間戳（近距起音分組被併入的音）。
-  sound(staff, note, offMs, dueMs, { cursor, rate, fromTick, clockMs, timed = false }) {
+  // keyup 模式（mode 不是 null，見 scheduler.js 的 keyupOf()）：你的音不做 hold；mode.key 有值的音（組頭）不排收音（Infinity），等這個鍵放開（releaseKey），mode.key 是 null 的照 offMs 收。
+  sound(staff, note, offMs, dueMs, { cursor, rate, fromTick, clockMs, timed = false, mode = null }) {
     const opts = timed ? this._router.stampTime(dueMs) : this._router.stamp(staff, dueMs);
     this._capOverlaps(staff, note, dueMs, rate, clockMs, opts?.time);
     let queue = staff.sounding.get(note.midiNote);
     if (!queue) staff.sounding.set(note.midiNote, (queue = []));
     // hold：結尾接著、或橫跨某個還沒放行的 driver 起音的音（你的與電腦的一樣），先不排收音（Infinity），等你按到那個起音才收（releaseHeld）；
     // tailSec＝檔案裡那個起音到結尾的樂譜秒數。被同譜表新音截短過的不再 hold（見 _capOverlaps）
-    const hold = this.holdOf(note, cursor);
-    queue.push({ endTick: note.endTick, offMs: hold ? Infinity : offMs, holdIdx: hold ? hold.idx : null, tailSec: hold ? hold.tailSec : 0, note, onTime: opts?.time, capped: false }); // 先登記再 noteOn：合成器收到 noteOn 時，佇列最後一項就是這顆音
+    const hold = mode ? null : this.holdOf(note, cursor);
+    const waitKey = mode?.key ?? null;
+    queue.push({ endTick: note.endTick, offMs: hold || waitKey !== null ? Infinity : offMs, holdIdx: hold ? hold.idx : null, tailSec: hold ? hold.tailSec : 0, waitKey, note, onTime: opts?.time, capped: false }); // 先登記再 noteOn：合成器收到 noteOn 時，佇列最後一項就是這顆音
     this._router.noteOn(staff, note.midiNote, note.velocity, opts);
     this._events.queue('noteOn', {
       note, noteId: note.id ?? null, staffId: staff.id, kind: staff.kind, dueMs, clockMs,
@@ -444,13 +446,13 @@ export class VoiceLedger {
         if (entry.note.startTick >= note.startTick) continue;
         // 例外：檔案裡這兩顆音真的重疊、音高不同（同一行譜的多聲部，長音底下另有音在動），舊音又還在 hold：保留 loop 到它的結尾起音、不修剪——
         // 修剪只擋「檔案沒寫的」多疊（你早按造成的），檔案寫了的重疊是樂譜本意；同音高不適用（同一個 key 不能同時有兩個音）
-        if (entry.holdIdx !== null && entry.note.midiNote !== note.midiNote && entry.endTick > note.startTick) continue;
+        if ((entry.holdIdx !== null || entry.waitKey != null) && entry.note.midiNote !== note.midiNote && entry.endTick > note.startTick) continue;
         const capMs = onsetMs + scaledMs(Math.max(0, this._secOf(entry.endTick) - startSec), rate);
         // 只有「真的截短」才標成 capped、不再 hold（EPS：capMs 與 offMs 從同一個錨點算出來，相等時只差浮點誤差，不算截短）；
         // 單音旋律的譜表因此不會糊到你下一次按鍵，hold 著的音（offMs＝Infinity）遇到同譜表新音也在這裡被截成有限值
-        if (capMs < entry.offMs - EPS_MS) { entry.offMs = capMs; entry.capped = true; entry.holdIdx = null; }
+        if (capMs < entry.offMs - EPS_MS) { entry.offMs = capMs; entry.capped = true; entry.holdIdx = null; entry.waitKey = null; }
         // 同音高：新音的收音在先進先出佇列裡排在舊音後面，舊音若還 hold 著，新音的收音會被拖住，所以也不再 hold
-        else if (entry.note.midiNote === note.midiNote) { entry.capped = true; entry.holdIdx = null; }
+        else if (entry.note.midiNote === note.midiNote) { entry.capped = true; entry.holdIdx = null; entry.waitKey = null; }
       }
     }
     // 同音高的舊音若因此到期，要在新音 noteOn 之前先收（先收再放，不然同音高的 noteOff 會連新音一起關掉）。你的合成器收音平常不帶時間戳，但新音提早帶時間戳送出時
@@ -493,6 +495,22 @@ export class VoiceLedger {
         }
       }
     }
+  }
+
+  // keyup 模式：鍵 key 放開時，收掉登記這個鍵的音（收在 clock；呼叫端接著 closeDue()）。只收 waitKey === key 的音：A 的 keyup 晚於 B 的 keydown 時不會收掉 B 的音。回傳收了幾顆。
+  releaseKey(key, clock) {
+    let n = 0;
+    for (const staff of this._staves.values()) {
+      for (const queue of staff.sounding.values()) {
+        for (const entry of queue) {
+          if (entry.waitKey !== key) continue;
+          entry.offMs = clock;
+          entry.waitKey = null;
+          n++;
+        }
+      }
+    }
+    return n;
   }
 
   // 下一次按鍵時（或組裡的起音自動放行時），driver 的音 endTick ≤ 新錨點 tick 的先收掉（你的下一個起音發聲時，之前該結束的音已結束，不管估到的速度怎樣）。

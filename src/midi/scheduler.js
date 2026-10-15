@@ -1,7 +1,8 @@
 // scheduler.js — 排程器（純邏輯，無 DOM／CDN）。單位是 MIDI tick；你按一下放行你的聲部（driver）的下一個起音，電腦聲部（follower）依你的速度排好時刻跟著走。
 // 規格與假設見 docs/design-spec.md 的 N1～N12：按鍵啟動一段與垂直切片 N2、尾巴收尾 N3、停格與時鐘 N5、估速 N6、去抖 N7、前奏鎖 N8、lookahead N9、hold N10、近距起音分組 N11、控制器重播 N12。
 // ⚠ 你的音一律在 trigger() 呼叫內立即 noteOn，不經 tick、不帶時間戳（唯一例外：前奏預按，N8）。
-// ⚠ 排程器時鐘（_clockMs）只在 tick()／trigger() 前進，暫停時不走。
+// ⚠ 排程器時鐘（_clockMs）只在 tick()／trigger()／lift() 前進，暫停時不走。
+// keyup 模式：輸入事件帶 key（鍵盤的 event.code）時，你的音按下 noteOn、放開（lift()）noteOff，不做 hold；不帶 key 的（手勢、槽位觸發）行為完全不變（N10）。
 // 沒有任何 driver（沒有指派，或指派的聲部都沒有音符）＝整首自動播放：只有第 0 段，從開頭照原速放完（同一條程式路徑）。
 // 聲部單位（part／staff）與 driver 群組見 performancePlan.js；每個群組在這裡有一份執行期狀態（makeGroupState()）。現在永遠一個群組，播放頭、hold 判定、對外的 playbackRate 看第一個群組。
 // 預報入口 setForecaster()：每個 tick 問預報器「你會在什麼時刻按下一個起音」，收到有效預報就段中換錨、重排還沒送出的電腦音（_applyForecast）；預設沒有預報器，行為完全不變（N2）。
@@ -95,11 +96,19 @@ export function chaseStatsSubscriber(events) {
   return sub;
 }
 
-/** 標準訂閱者：每次按鍵嘗試的記錄（見 scheduler.js 的 pressLog()）。 */
+/** 標準訂閱者：每次按鍵嘗試與每次放開的記錄（見 scheduler.js 的 pressLog()、liftLog()）。 */
 export function pressLogSubscriber(events) {
-  const sub = { entries: [], log() { return this.entries.map((p) => ({ ...p })); }, reset() { this.entries = []; } };
+  const sub = {
+    entries: [], lifts: [],
+    log() { return this.entries.map((p) => ({ ...p })); },
+    liftLog() { return this.lifts.map((p) => ({ ...p })); },
+    reset() { this.entries = []; this.lifts = []; },
+  };
   events.on('press', (e) => {
-    pushCapped(sub.entries, { slot: e.slot, clockMs: e.clockMs, released: e.result === 'released', source: e.source, eventTimeMs: e.eventTimeMs, receivedMs: e.receivedMs }, PRESS_LOG_MAX);
+    pushCapped(sub.entries, { slot: e.slot, clockMs: e.clockMs, released: e.result === 'released', source: e.source, key: e.key, eventTimeMs: e.eventTimeMs, receivedMs: e.receivedMs }, PRESS_LOG_MAX);
+  });
+  events.on('lift', (e) => {
+    pushCapped(sub.lifts, { slot: e.slot, key: e.key, clockMs: e.clockMs, closed: e.closed, eventTimeMs: e.eventTimeMs, receivedMs: e.receivedMs }, PRESS_LOG_MAX);
   });
   return sub;
 }
@@ -147,6 +156,10 @@ function mergeByDue(a, b) {
 // 單一來源：midiPlayer.js 列在指派下拉的「PC 鍵盤手」、main.js 交給 keyboard.js 的觸發槽位都用它。
 export const KEYBOARD_SLOT = 'kb';
 
+// keyup 模式的發聲方式（傳給 _sound／發聲帳本的 mode）：{ key } ＝等這個鍵放開才收；LIFTED ＝ keyup 模式但不等鍵（前奏預按在入場前已放開、組裡被併入的音），照 scaledMs(檔案音長, 速度) 收、不 hold。null ＝ 非 keyup 模式（有 hold）。
+const LIFTED = Object.freeze({ key: null });
+const keyupOf = (key) => (key != null ? { key } : null);
+
 // ── 應用層常數（不是規格）──
 // 每個 tick 的時間步長上限：分頁被瀏覽器節流（背景分頁的計時器可能隔好幾秒才醒來）後恢復時，時鐘最多只前進這麼多，
 // 不會一次把空窗期的音全部放出來或收掉。
@@ -187,6 +200,8 @@ function makeGroupState(index, plan, tempo = new TempoFollower()) {
     ownSent: [],           // 被併入組裡、已經提早帶時間戳送出的你的音的預定時刻（你提早按下一組時統計取消不了的有幾顆）
     preludeCredit: false,  // 前奏鎖期間有人預按過（布林）：播放頭到入場點時自動放行第一個起音
     preludeSource: null,   // 預按那一下的輸入來源（自動放行時判斷分組用）
+    preludeKey: null,      // 預按那一下帶的鍵（keyup 模式；沒帶 key 就是 null）
+    preludeLifted: false,  // 預按的鍵在前奏結束前已經放開（入場音就照檔案長度收，不等鍵）
     stalled: false,        // 播放頭停在你的下一個起音（stall 事件只在狀態改變時發）
   };
 }
@@ -341,7 +356,7 @@ export class Scheduler {
   pause() {
     this._playing = false;
     this._lastTickMs = null;
-    for (const g of this._groups) g.preludeCredit = false; // 預按作廢：續播後要重新按
+    for (const g of this._groups) { g.preludeCredit = false; g.preludeKey = null; g.preludeLifted = false; } // 預按作廢：續播後要重新按
     for (const staff of this._plan.staves.values()) this._router.releaseForPause(staff);
     this.silence();
   }
@@ -380,6 +395,8 @@ export class Scheduler {
       g.ownSent = [];
       g.preludeCredit = false;
       g.preludeSource = null;
+      g.preludeKey = null;
+      g.preludeLifted = false;
       g.stalled = false;
       g.tempo.reset();
     }
@@ -446,7 +463,7 @@ export class Scheduler {
         init: s.init && { ...s.init }, percussionKit: s.percussionKit, baseVolume: s.baseVolume, notes: [...s.notes],
         // 正在響的音攤平成一筆一顆（同音高重疊時依先進先出的順序）
         sounding: [...s.sounding].flatMap(([pitch, queue]) => queue.map((e) => ({
-          pitch, endTick: e.endTick, offMs: e.offMs, holdIdx: e.holdIdx, tailSec: e.tailSec, capped: e.capped, onTime: e.onTime, note: e.note,
+          pitch, endTick: e.endTick, offMs: e.offMs, holdIdx: e.holdIdx, waitKey: e.waitKey ?? null, tailSec: e.tailSec, capped: e.capped, onTime: e.onTime, note: e.note,
         }))),
       })),
     };
@@ -514,7 +531,7 @@ export class Scheduler {
   // fromTick：熱切換指派從中間接續時，這一段裡 startTick 在它之前的音（與控制器）已經過了（控制器的狀態已用 chase 送），不排進佇列，不然會一次補放。
   // 近距起音分組（lastSlice > slice）：組頭 j 啟動第 j＋1 段到第 lastSlice 段（組裡每個起音之間的段，到下一個組頭為止），用同一個錨點；組裡被併入的起音的音像電腦音一樣排時刻（own：走你的合成器、帶 lookahead 時間戳，同 tick 排在電腦音前面），
   // 另外每個起音排一個自動放行（_autoRelease），跟送你的合成器的控制器依時刻排在一起。
-  _anchorSlice(g, slice, clockMs, scoreSec, rate, fromTick = -Infinity, lastSlice = slice) {
+  _anchorSlice(g, slice, clockMs, scoreSec, rate, fromTick = -Infinity, lastSlice = slice, ownMode = null) {
     g.anchor = { slice, clockMs, scoreSec, rate };
     this.events.queue('anchor', { group: g.index, slice, clockMs, scoreSec, rate });
     g.anchoredSlice = lastSlice;
@@ -544,7 +561,7 @@ export class Scheduler {
       if (note.startTick < fromTick) continue;
       const startSec = this._secOf(note.startTick);
       const dueMs = clockMs + ((startSec - scoreSec) * 1000) / rate;
-      fresh.push({ dueMs, offMs: dueMs + scaledMs(this._secOf(note.endTick) - startSec, rate), staff, note, own: isOwn });   // 起音與音長都依你的速度等比例縮放（整份譜用你的 BPM 演奏）
+      fresh.push({ dueMs, offMs: dueMs + scaledMs(this._secOf(note.endTick) - startSec, rate), staff, note, own: isOwn, mode: isOwn ? ownMode : null });   // 起音與音長都依你的速度等比例縮放（整份譜用你的 BPM 演奏）
     }
     while (k < cTo) takeControl();
     // 啟動新的一段時佇列一定是空的（上一段的電腦音與控制器在你按下時已經放完、追音或跳過）；依樂譜順序，dueMs 單調不減
@@ -582,6 +599,8 @@ export class Scheduler {
       this._pressEvent(g, ev, clock, 'prelude');
       g.preludeCredit = true;
       g.preludeSource = ev.source ?? null;
+      g.preludeKey = ev.key ?? null;
+      g.preludeLifted = false;
       return false;
     }
 
@@ -596,13 +615,41 @@ export class Scheduler {
     this._lastTickMs = ev.receivedMs;
     const inFlight = this._takeInFlight(g, clock);
     this._flushAutoReleases(g, clock);   // 提早按下一組：這一組還沒到的自動放行先依序做完（hold 與收音的狀態才一致）
-    this._release(g, clock, ev.source ?? null, inFlight);
+    this._release(g, clock, ev.source ?? null, inFlight, keyupOf(ev.key));
     return true;
+  }
+
+  /**
+   * 放開一個鍵（keyup 模式，鍵盤 keyup／視窗失焦補送）：登記這個鍵的你的音收在放開的時鐘時刻；組內被併入的音不受影響（照檔案走）。
+   * 前奏預按的鍵在入場前放開，入場音就不等鍵。沒帶 key、沒有資格的槽位、這個鍵沒有登記的音（被去抖擋掉、已被下一次按下收掉、暫停收掉）都不做事。
+   * @param {{ slot: number|string, key: string, source?: string|null, eventTimeMs?: number|null, receivedMs: number }} input  keyboard.js 的放開事件
+   * @returns {boolean} 有沒有收到音
+   */
+  lift(input) {
+    try { return this._lift(input); }
+    finally { this.events.flush(); }
+  }
+
+  _lift(ev) {
+    const g = this._groups.find((x) => x.plan.slots.has(ev.slot));
+    if (ev.key == null || !g) return false;
+    if (g.preludeCredit && g.preludeKey === ev.key) g.preludeLifted = true;
+    let clock = this._clockMs;
+    if (this._playing) {   // 暫停中時鐘不走（暫停已經收掉所有音，這裡也沒有東西可收）
+      clock = this._clockAt(ev.receivedMs);
+      this._clockMs = clock;
+      this._lastTickMs = ev.receivedMs;
+    }
+    const closed = this._ledger.releaseKey(ev.key, clock);
+    this._ledger.closeDue(clock);
+    this.events.queue('lift', { group: g.index, slot: ev.slot, key: ev.key, clockMs: clock, closed, eventTimeMs: ev.eventTimeMs ?? null, receivedMs: ev.receivedMs ?? null });
+    return closed > 0;
   }
 
   // 放行群組 g 的下一個 driver segment（按鍵 trigger() 與前奏結束時的預按放行共用），時刻 clock（排程器時鐘）；它是一組的組頭。
   // source＝這一下的輸入來源（分組的門檻，見 _groupEnd）；inFlight＝上一組已經提早送出、取消不了的你的音（統計用，見 _chaseOrSkip）。
-  _release(g, clock, source = null, inFlight = 0) {
+  // keyup＝keyup 模式的發聲方式（keyupOf()／LIFTED，null＝非 keyup 模式）：組頭等鍵放開，組裡被併入的音照檔案長度，都不 hold。
+  _release(g, clock, source = null, inFlight = 0, keyup = null) {
     const j = g.cursor, seg = g.plan.driverSegs[j];
     const scoreSec = this._secOf(seg.ticks);
     if (g.stalled) { g.stalled = false; this.events.queue('stall', { group: g.index, state: 'end', clockMs: clock }); }
@@ -627,9 +674,9 @@ export class Scheduler {
     this._emitHumanPending(g, this._clockMs);
     // 早按：上一段還沒輪到的電腦音落在你這個起音的「垂直 tick」之前，不能再照原時刻放（會跟你不同步、甚至倒序）。改跳到 T_k 的垂直狀態：還該響著的追音、整顆在身後的跳過，控制器改送 T_k 之前的狀態（_chaseOrSkip）。錨點因此永遠是按下的時刻。
     this._chaseOrSkip(g, seg.ticks, scoreSec, clock, inFlight);
-    this._anchorSlice(g, j + 1, clock, scoreSec, rate, -Infinity, end);   // 這一段（含組裡起音之間的段）的錨點、電腦音、組裡的音與控制器（佇列此時是空的）
+    this._anchorSlice(g, j + 1, clock, scoreSec, rate, -Infinity, end, keyup && LIFTED);   // 這一段（含組裡起音之間的段）的錨點、電腦音、組裡的音與控制器（佇列此時是空的）
     this._emitHumanPending(g, clock);                               // 你起音那個 tick 上、送你的合成器的控制器（program change 等）在你的音之前
-    for (const { staff, note } of seg.items) this._sound(g, staff, note, clock + scaledMs(this._secOf(note.endTick) - scoreSec, rate), clock);
+    for (const { staff, note } of seg.items) this._sound(g, staff, note, clock + scaledMs(this._secOf(note.endTick) - scoreSec, rate), clock, false, false, keyup);
     this._emitPending(g);                                           // 同 tick 的 follower 音與控制器（dueMs ＝ 這一刻）跟你的音同刻
     this._emitHumanPending(g, this._clockMs);
     this._ledger.closeDue(this._clockMs);                           // 零長度的音
@@ -699,7 +746,7 @@ export class Scheduler {
     for (const p of notes) {
       if (p.note.endTick > ticks) {
         chased.push(p.note);
-        this._sound(g, p.staff, p.note, clock + scaledMs(this._secOf(p.note.endTick) - scoreSec, g.tempo.playbackRate), clock);
+        this._sound(g, p.staff, p.note, clock + scaledMs(this._secOf(p.note.endTick) - scoreSec, g.tempo.playbackRate), clock, false, false, p.mode);
       } else {
         skipped.push(p.note);
         this._skipped.add(p.note);
@@ -722,9 +769,10 @@ export class Scheduler {
 
   // 讓一顆音發聲：記進 _sounded（每顆音恰好一次），交給發聲帳本 noteOn 並登記（hold、尾巴收尾、先進先出見 voices.js 的 sound()；hold 看群組 g 的游標、音長看 g 的速度）。
   // dueMs＝預定發聲的時鐘時刻（你的音就是按下的那一刻）；fromTick＝由 tick() 放出（遲到統計只算這種）；timed＝你的合成器也照 lookahead 帶時間戳（組裡被併入的音）。
-  _sound(g, staff, note, offMs, dueMs, fromTick = false, timed = false) {
+  // mode＝keyup 模式的發聲方式（keyupOf()／LIFTED，undefined／null＝非 keyup 模式）。
+  _sound(g, staff, note, offMs, dueMs, fromTick = false, timed = false, mode = null) {
     this._sounded.add(note);
-    this._ledger.sound(staff, note, offMs, dueMs, { cursor: g.cursor, rate: g.tempo.playbackRate, fromTick, clockMs: this._clockMs, timed });
+    this._ledger.sound(staff, note, offMs, dueMs, { cursor: g.cursor, rate: g.tempo.playbackRate, fromTick, clockMs: this._clockMs, timed, mode: mode ?? null });
   }
 
   // 群組 g 排好時刻已到的 follower 音、組裡你的音與送電腦合成器的控制器依序送出（佇列已依 dueMs 排序）。fromTick＝由 tick() 呼叫
@@ -734,7 +782,7 @@ export class Scheduler {
     while (n < g.pending.length && g.pending[n].dueMs <= limitMs + EPS_MS) {
       const p = g.pending[n++];
       if (p.note) {
-        this._sound(g, p.staff, p.note, p.offMs, p.dueMs, fromTick, p.own);
+        this._sound(g, p.staff, p.note, p.offMs, p.dueMs, fromTick, p.own, p.mode);
         if (p.own && p.dueMs > this._clockMs + EPS_MS) g.ownSent.push(p.dueMs);
       } else if (p.sysex) this._router.sendSysex(p.ev.data, this._router.stampTime(p.dueMs));
       else this._sendControl(p);
@@ -780,7 +828,7 @@ export class Scheduler {
   // 按鍵嘗試的事件（按鍵記錄 pressLog() 是它的訂閱者）。result：'released' 放行、'blocked' 被去抖擋掉、'prelude' 前奏中的預按。
   // ev 是輸入事件（見 trigger()）：來源與事件發生的時刻原樣記下（用槽位觸發時是 null）。
   _pressEvent(g, ev, clockMs, result) {
-    this.events.queue('press', { group: g.index, slot: ev.slot, source: ev.source ?? null, result, clockMs, eventTimeMs: ev.eventTimeMs ?? null, receivedMs: ev.receivedMs ?? null });
+    this.events.queue('press', { group: g.index, slot: ev.slot, source: ev.source ?? null, key: ev.key ?? null, result, clockMs, eventTimeMs: ev.eventTimeMs ?? null, receivedMs: ev.receivedMs ?? null });
   }
 
   /**
@@ -788,6 +836,9 @@ export class Scheduler {
    * 可以直接拿去重放。重設（stop／restart／換歌）時清空。
    */
   pressLog() { return this._pressLog.log(); }
+
+  /** 量測：這一輪每次放開的記錄（keyup 模式；複本）：槽位、鍵、排程器時鐘、收了幾顆音與兩個時刻。重設時清空。 */
+  liftLog() { return this._pressLog.liftLog(); }
 
   /** 開啟錄音用的事件記錄（錨點、換錨、放行、每顆音實際發聲的時刻、早按處理；見 scheduler.js 的 eventLogSubscriber）。 */
   enableEventLog() {
@@ -896,7 +947,12 @@ export class Scheduler {
     for (const g of this._groups) {
       if (!g.preludeCredit || g.cursor !== 0) continue;
       const reach = this._reachClockMs(g);
-      if (reach !== null && this._clockMs >= reach - EPS_MS) { g.preludeCredit = false; this._release(g, reach, g.preludeSource); }
+      if (reach !== null && this._clockMs >= reach - EPS_MS) {
+        // keyup 模式的預按：入場時鍵還按著就等 keyup，入場前已放開就照檔案長度收
+        const keyup = g.preludeKey != null ? (g.preludeLifted ? LIFTED : keyupOf(g.preludeKey)) : null;
+        g.preludeCredit = false; g.preludeKey = null; g.preludeLifted = false;
+        this._release(g, reach, g.preludeSource, 0, keyup);
+      }
     }
   }
 }

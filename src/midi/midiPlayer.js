@@ -1,7 +1,7 @@
 // midiPlayer.js — MIDI 播放器：狀態 store ＋ 動作 ＋ 三個區塊的畫面（頂端 pill／選歌面板／曲庫）
 // 上半部是狀態與動作（無 DOM）：playerStore 是唯一的真相，動作函式改它；合成器在 synth.js。下半部是畫面：每個區塊各自的 DOM 參照、handler（經 ui.js 的委派表）
 // 與 render(snapshot)，render 只在值不同時寫 DOM；檔尾把三段合成一個區塊模組 { actions, fields, inputs, mount, render } 給 ui.js。
-// 對外：main.js 用 startPlayer()、warmUpMidiEngine()、triggerInput()、triggerSlot()、setPlayerCount()、KEYBOARD_SLOT；ui.js 用 playerStore 與檔尾的區塊模組。
+// 對外：main.js 用 startPlayer()、warmUpMidiEngine()、triggerInput()、liftInput()、triggerSlot()、setPlayerCount()、KEYBOARD_SLOT；ui.js 用 playerStore 與檔尾的區塊模組。
 //
 // 選歌＝載入，播放鍵才是播放：選了本地檔或雲端曲目只解析並更新狀態（歌名／分譜清單），不啟動音源引擎。
 // 分譜的互動是「指派演奏者」：每個指派單位一個下拉（無／PC 鍵盤手／演奏者 1~N），選了＝那個聲部交給那個人，其餘沒指派的聲部由電腦輔助播放。
@@ -135,6 +135,11 @@ export function triggerInput(input) {
   synth.scheduler.trigger(input);
 }
 
+// 放開一個鍵（main.js 把鍵盤的 keyup 接到這裡）：輸入事件帶 key（keyboard.js 的 { slot, source, key, eventTimeMs, receivedMs }），收掉登記這個鍵的你的音（keyup 模式，見 scheduler.js 的 lift()）。
+export function liftInput(input) {
+  synth.scheduler.lift(input);
+}
+
 // 用槽位觸發一次（日後手勢接回時的入口：觸發序號變動時呼叫）。沒有來源與事件發生的時刻，時刻取現在。
 export function triggerSlot(slot) {
   synth.scheduler.trigger(slot, performance.now());
@@ -165,15 +170,16 @@ export function audioLatency() {
   return synth.audioLatencyInfo();
 }
 
-// 量測（同上）：錄音 v2，給 main.js 的 __pressLog 匯出做離線分析：歌、指派（Map 展開成 [partId, 槽位][] 才能轉 JSON）、每次按鍵嘗試（事件發生與程式收到的時刻、排程器時鐘、有沒有放行）、
+// 量測（同上）：錄音 v3，給 main.js 的 __pressLog 匯出做離線分析：歌、指派（Map 展開成 [partId, 槽位][] 才能轉 JSON）、每次按鍵嘗試（鍵、事件發生與程式收到的時刻、排程器時鐘、有沒有放行）、每次放開（lifts：鍵、時鐘、收了幾顆音）、
 // 事件串流（錨點、速度、每顆音實際發聲的時刻…）與匯出時刻。commit 不在這裡（app 不知道），登記到 corpus 時由 test/tools/recording-register.mjs 補上。
 export function pressLog() {
   const { source, songTitle, assignments } = playerStore.state;
   return {
-    version: 2,
+    version: 3,
     song: { title: songTitle, source: source && { kind: source.kind, name: source.name, id: source.id ?? null } },
     assignments: [...assignments],
     presses: synth.scheduler.pressLog(),
+    lifts: synth.scheduler.liftLog(),
     events: synth.scheduler.eventLog(),
     recordedAt: new Date().toISOString(),
   };
@@ -473,7 +479,7 @@ function schedulerTick() {
 
 // main.js 呼叫一次；不靠 import 副作用啟動。
 export function startPlayer() {
-  synth.scheduler.enableEventLog();   // 錄音 v2 的事件串流（pressLog()）：app 一律記，彈完隨時可以匯出
+  synth.scheduler.enableEventLog();   // 錄音 v3 的事件串流（pressLog()）：app 一律記，彈完隨時可以匯出
   setInterval(uiTick, UI_TICK_MS);
   setInterval(schedulerTick, SCHEDULER_TICK_MS);
 }

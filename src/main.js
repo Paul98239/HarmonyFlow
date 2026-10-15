@@ -24,7 +24,7 @@ window.__stats = () => {
   };
 };
 
-// 開發用：copy(__pressLog()) 匯出錄音 v2（欄位見規格文件「開發／執行」）。
+// 開發用：copy(__pressLog()) 匯出錄音 v3（欄位見規格文件「開發／執行」）。
 window.__pressLog = midiPlayer.pressLog;
 
 async function bootSystem() {
@@ -40,7 +40,7 @@ async function bootSystem() {
   ]);
 
   // 觸發來源目前是鍵盤，揮手暫時關閉；手勢接回時用 midiPlayer.triggerSlot(槽位)（見規格文件）
-  startKeyboardTrigger(midiPlayer.triggerInput, midiPlayer.KEYBOARD_SLOT);
+  startKeyboardTrigger(midiPlayer.triggerInput, midiPlayer.KEYBOARD_SLOT, midiPlayer.liftInput);
 
   // 視覺初始化失敗時錯誤畫面已經顯示，載入畫面不收、inert 也維持
   if (!visionOk) return;
