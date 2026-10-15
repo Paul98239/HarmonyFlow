@@ -24,19 +24,13 @@
   <link rel="modulepreload" href="./src/midi/synth.js">
   <link rel="modulepreload" href="./src/midi/midiPlayer.js">
   <link rel="modulepreload" href="./src/midi/midiParser.js">
-  <link rel="modulepreload" href="./src/midi/smf.js">
+  <link rel="modulepreload" href="./src/midi/midiFile.js">
   <link rel="modulepreload" href="./src/midi/timeline.js">
-  <link rel="modulepreload" href="./src/midi/gmNames.js">
-  <link rel="modulepreload" href="./src/midi/instruments.js">
-  <link rel="modulepreload" href="./src/midi/scoreQueries.js">
+  <link rel="modulepreload" href="./src/midi/parts.js">
   <link rel="modulepreload" href="./src/midi/scheduler.js">
-  <link rel="modulepreload" href="./src/midi/outputRouter.js">
-  <link rel="modulepreload" href="./src/midi/performanceEvents.js">
-  <link rel="modulepreload" href="./src/midi/tempoFollower.js">
-  <link rel="modulepreload" href="./src/midi/voiceLedger.js">
+  <link rel="modulepreload" href="./src/midi/voices.js">
+  <link rel="modulepreload" href="./src/midi/tempo.js">
   <link rel="modulepreload" href="./src/midi/performancePlan.js">
-  <link rel="modulepreload" href="./src/midi/pressTiming.js">
-  <link rel="modulepreload" href="./src/midi/previewPlayer.js">
   <link rel="modulepreload" href="./src/midi/midiApi.js">
   <link rel="modulepreload" href="./src/vision/vision.js">
   <link rel="modulepreload" href="./src/vision/tracking.js">
@@ -46,36 +40,22 @@
   <video id="webcam" playsinline></video>
 
   <!-- 版面骨架（HTML-first：所有靜態 UI 都寫在這裡，JS 只綁行為與填動態清單）：
-       #app-shell 佔滿視窗，flex 置中一個 #camera-frame（視窗裝得下的最大 16:9 方框，見 src/styles.css），
-       攝影機畫面永久蓋著黑幕（#stage-blackout，見 src/styles.css）；頂端置中疊
-       一欄 #top-center-stack（position:fixed，不受 #camera-frame 的 overflow:hidden 裁切）：
-       播放 pill（#toolbar-playback）在上，系統控制／選歌控制列（#control-row）在下，兩者垂直
-       分層、水平都置中，結構上就不會互相遮蔽。
-       panel-system 是常駐系統控制 bar，panel-song 是觸發鈕＋彈出面板
-       （面板釘在整排控制列正下方置中，見 src/styles.css 的 .tl-popup）。
-       鎖定 16:9 而非滿版：F11 進出全螢幕時方框只是等比例縮放，裁切一致就穩定。
-       攝影機容器不能用 JS 在執行期搬動（vision.js 在模組頂層就抓 #webcam／#gl-canvas／#overlay-canvas／
-       #stage-hint）。#stage-hint 是舞台中央的提示，absolute 定位、不佔 #stage 的 grid 格。
+       #app-shell 佔滿視窗，flex 置中一個鎖 16:9 的 #camera-frame（F11 進出全螢幕時只是等比例縮放，裁切一致就穩定；見 src/styles.css），攝影機畫面永久蓋著黑幕（#stage-blackout）。
+       頂端置中疊一欄 #top-center-stack（position:fixed，不受 #camera-frame 的 overflow:hidden 裁切）：播放 pill（#toolbar-playback）在上，系統控制／選歌控制列（#control-row）在下，垂直分層、水平都置中，結構上不會互相遮蔽。
+       panel-system 是常駐系統控制 bar，panel-song 是觸發鈕＋彈出面板（釘在整排控制列正下方置中，見 src/styles.css 的 .tl-popup）。
+       攝影機容器不能用 JS 在執行期搬動（vision.js 在模組頂層就抓 #webcam／#gl-canvas／#overlay-canvas／#stage-hint）；#stage-hint 是舞台中央的提示，absolute 定位、不佔 #stage 的 grid 格。
        唯一會重複的結構「分譜列」放在 <template id="tpl-part-row">，由 JS clone 後填聲部名。
        #app-shell 的 inert：開機期間整個 app 惰性（點不到、Tab 不到），src/ui.js 收起載入畫面時解除。
        控制項的行為經 data-action（click）／data-field（change／input）委派到 #top-center-stack（src/ui.js）。
-       #topProgressBar 是獨立於 #top-center-stack 之外的第三個 #app-shell 直接子元素：唯讀播放
-       進度，跨滿 #camera-frame 寬度、貼齊視窗頂邊，不可互動、不顯示任何時間文字，見下方元素
-       本身的註解與 src/midi/scheduler.js 的 getPositionSeconds()。 -->
+       #topProgressBar 是獨立於 #top-center-stack 之外的 #app-shell 直接子元素，見下方元素本身的註解。 -->
   <div id="app-shell" inert>
-    <!-- 頂端進度條：純視覺、跨滿攝影機外框寬度、不可互動、不顯示任何時間文字。進度是播放頭在
-         原譜的第幾秒換算成比例（scheduler.getPositionSeconds() / score.durationSeconds）
-         ——輔助聲部停格等你時靜止、你放行新的起音組時會跟著跳，這是事件驅動的誠實呈現，不做補間動畫。用
-         <progress> 而不是可互動控制項：天生唯讀、不接點擊／拖曳、不會被 Tab 聚焦。要回到開頭用
-         播放列的重播鈕；拖曳跳到任意時間點目前不做（要連動各槽位的游標與輔助聲部的時鐘，工程量偏大）。 -->
+    <!-- 頂端進度條：純視覺、跨滿攝影機外框寬度、不可互動、不顯示時間文字。進度是播放頭（scheduler.getPositionTicks()）換算成原譜秒數後佔總長的比例——輔助聲部停格等你時靜止、你放行新的起音組時跳一下，事件驅動，不做補間動畫。
+         用 <progress>：天生唯讀、不接點擊／拖曳、不會被 Tab 聚焦。要回到開頭用播放列的重播鈕；不做拖曳 seek（要連動各槽位的游標與輔助聲部的時鐘，工程量偏大）。 -->
     <progress id="topProgressBar" class="top-progress-bar" max="1" value="0" aria-label="播放進度" hidden></progress>
     <div id="top-center-stack">
-      <!-- 播放 pill：四顆獨立按鈕（▶ 播放／❚❚ 暫停／↻ 重播／♪ 試聽，互相防呆：哪顆能按由 midiPlayer.js 的
-           transportButtonState() 依播放狀態決定，不能按的就 disabled）＋歌名（完整顯示、不用省略號
-           截斷）。♪ 是進出試聽（官方 Sequencer）的開關，試聽中黃底；試聽中 ▶ ❚❚ ↻ 作用在試聽。
-           is-empty＝還沒有能播放的歌（idle／載入中），控制列的淡化條件靠它。
-           按鈕的 icon 是 inline SVG、不是字型字元：圖畫在 24×24 的座標裡、重心對齊 (12,12)，viewBox
-           把它放在按鈕正中央，置中由向量座標保證，不受字型與像素取整影響（細節見 styles.css 的 .tb-icon）。 -->
+      <!-- 播放 pill：四顆獨立按鈕（▶ 播放／❚❚ 暫停／↻ 重播／♪ 試聽，互相防呆：哪顆能按由 midiPlayer.js 的 transportButtonState() 決定，不能按的 disabled）＋歌名（完整顯示、不用省略號截斷）。
+           ♪ 是進出試聽（官方 Sequencer）的開關，試聽中黃底；試聽中 ▶ ❚❚ ↻ 作用在試聽。is-empty＝還沒有能播放的歌（idle／載入中），控制列的淡化條件靠它。
+           按鈕 icon 是 inline SVG、不是字型字元：圖畫在 24×24 座標裡、重心對齊 (12,12)，viewBox 把它放在按鈕正中央，置中由向量座標保證，不受字型與像素取整影響（見 styles.css 的 .tb-icon）。 -->
       <div id="toolbar-playback" class="toolbar-playback is-empty">
         <div id="transport-group" class="tb-transport" role="group" aria-label="播放控制">
           <button id="btnPlay" class="btn tb-btn tb-play" type="button" data-action="play" disabled aria-label="播放">

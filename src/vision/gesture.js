@@ -1,48 +1,27 @@
-// ============================================================
-//  gesture.js — 手勢偵測（純邏輯，無 DOM／CDN 依賴）
-//
-//  只有一種偵測器：`ArcDetector`，拋物線手勢（手同時有橫向位移＋垂直方向先下沉再回升），
-//  回升那一刻（確認反轉）觸發 `triggerSeq` +1，當作「前進一步」的觸發訊號（純觸發，不輸出音量；
-//  目前觸發來源是鍵盤，手勢沒有接進播放器，接回時由 main.js 在 triggerSeq 變動時呼叫 midiPlayer.triggerSlot()）。不依賴肩膀高度，手在胸口、腰間動都可以觸發；開口大小、
-//  左右方向都不限，只看「有沒有這個下沉再回升的相對形狀」。
-//
-//  `triggerSeq` 只是離散的「有沒有新觸發」訊號：
-//  這個模組完全不管速度，只負責偵測「有沒有一次有效的拋物線」。
-//
-//  vision.js 每幀從鎖定骨架取出左右手腕／肘／肩座標，每個槽位左右手各一個 ArcDetector；
-//  triggerSeq 是離散事件，「哪隻手最近觸發」需要跨幀記憶，由 vision.js 自己逐幀比對兩手的
-//  triggerSeq 變化來合成（見 vision.js 的 combineArcTriggers()）。
-//  所有門檻以「肩寬」為距離單位、「毫秒」為時間單位，同一動作站遠站近、30fps 或 60fps 結果一致。
-// ============================================================
+// gesture.js — 手勢偵測（純邏輯，無 DOM／CDN）：ArcDetector 偵測拋物線手勢（橫向位移＋垂直先下沉再回升），回升確認那一刻 triggerSeq +1。
+// 純離散觸發訊號，不輸出音量、不管速度；目前觸發來源是鍵盤，手勢沒有接進播放器（接回方式見規格文件）。
+// 「哪隻手最近觸發」要跨幀記憶，由 vision.js 逐幀比對兩手的 triggerSeq 合成（combineArcTriggers()）。
+// 所有門檻以肩寬為距離單位、毫秒為時間單位，站遠站近、30fps 或 60fps 結果一致。
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 export { clamp01 };
 
-/* ═══════════════════════════════════════════
-   🎯 ArcDetector — 拋物線手勢（前進一步的觸發）
-   ═══════════════════════════════════════════ */
+// ── ArcDetector：拋物線手勢（前進一步的觸發）──
 export const DEFAULT_ARC_CONFIG = Object.freeze({
   minShoulderWidth: 0.04,   // 肩寬的下限，避免遠處偵測到的極小肩寬把比值放大到離譜
   staleMs: 320,             // 距上一次餵值超過這麼久 → 視為剛回到鏡頭，這一段動作作廢重來
   reversalNoiseFloor: 0.05, // Y 方向死區（肩寬單位）：從谷底回升要超過這個幅度才算「確認回升」
-  // 這兩個門檻比較嚴格（原本 0.08／0.10）：每一次判定成立都會立刻前進一步、播出下一個音，沒有緩衝空間，
-  // 門檻調嚴一點降低誤觸發。
+  // 這兩個門檻比較嚴：每次判定成立都立刻前進一步、沒有緩衝空間，調嚴降低誤觸發
   minDepthRatio: 0.15,      // 這段下沉至少要多深（肩寬單位）才算一次有效拋物線
   minXSpanRatio: 0.18,      // 下沉期間至少要有這麼多橫向位移（肩寬單位），用來跟「純上下抖」區分開
 });
 
 /**
- * 拋物線手勢：手同時有橫向位移＋垂直方向先下沉（image y 變大）再回升。
- * 不看肩膀高度、不限開口大小、不限左右方向，只認這個相對形狀，純粹當一個離散的「觸發」訊號
- * （不輸出音量／深度——手勢的音量／表情這輪先不做）。
- *
- * 判斷邏輯（單一狀態機，逐幀更新最高點／最低點）：
- *  - 追蹤目前這一段動作的「起點高度」（peak，Y 最小值）與「目前已知的最低點」（trough，Y 最大值）。
- *  - Y 持續變大（往下）：延伸 trough，同時累積這段下沉期間的橫向位移範圍。
- *  - Y 從 trough 回升超過死區（確認反轉）：這一段下沉結束，深度與橫向位移都達標就讓
- *    triggerSeq +1（供呼叫端偵測「有新事件」）；不管達不達標，都以目前位置當新的起點，
- *    重新開始找下一段。
- *  - 手不在畫面：中斷目前這段動作的追蹤，等手回來重新認一次。
+ * 拋物線手勢：手同時有橫向位移＋垂直先下沉（image y 變大）再回升；不看肩膀高度、不限開口大小與左右方向，只認這個相對形狀。
+ * 單一狀態機逐幀更新起點 peak（Y 最小值）與最低點 trough（Y 最大值）：
+ *  - Y 持續變大：延伸 trough，累積下沉期間的橫向位移範圍。
+ *  - Y 從 trough 回升超過死區（確認反轉）：下沉結束，深度與橫向位移都達標就 triggerSeq +1；不論達不達標都以目前位置當新起點。
+ *  - 手不在畫面：中斷追蹤，等手回來重新認一次。
  */
 export class ArcDetector {
   constructor(config = {}) {
@@ -68,7 +47,6 @@ export class ArcDetector {
   update(frame, nowMs) {
     const { point } = frame || {};
     if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
-      // 手不在畫面：這一段動作的追蹤中斷，等手回來重新認一次新的下沉。
       this.peakY = this.troughY = null;
       this._lastMs = null;
       return { triggerSeq: this.triggerSeq };
@@ -81,29 +59,25 @@ export class ArcDetector {
     const { x, y } = point;
 
     if (this.peakY === null) {
-      // 剛開始追蹤：這個位置當這一段動作暫定的起點。
       this.peakY = y; this.troughY = y;
       this._minX = x; this._maxX = x;
       return { triggerSeq: this.triggerSeq };
     }
 
     if (y >= this.troughY) {
-      // 還在往下（或持平）：延伸目前已知的最低點，累積橫向位移範圍。
       this.troughY = y;
       if (x < this._minX) this._minX = x;
       if (x > this._maxX) this._maxX = x;
     } else if (y < this.troughY - this.cfg.reversalNoiseFloor * sw) {
-      // 已經比最低點回升超過死區——這段下沉結束，判斷是否是一次有效拋物線。
       const depth = this.troughY - this.peakY;
       const xSpan = this._maxX - this._minX;
       if (depth >= this.cfg.minDepthRatio * sw && xSpan >= this.cfg.minXSpanRatio * sw) {
         this.triggerSeq++;
       }
-      // 不論這次算不算數，都以現在的位置當新起點，重新開始找下一段下沉。
       this.peakY = y; this.troughY = y;
       this._minX = x; this._maxX = x;
     } else {
-      // 還沒明顯下沉、或還在回升死區內：讓起點跟著目前更高的位置走，避免小雜訊被算進之後的深度。
+      // 起點跟著更高的位置走，避免小雜訊被算進之後的深度
       if (y < this.peakY) this.peakY = y;
     }
 

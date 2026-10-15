@@ -1,79 +1,129 @@
-// ============================================================
-//  scheduler.js — 排程器（純邏輯，無 DOM／CDN）
-//
-//  時間單位：整份總譜只有一條時間軸，單位是 MIDI tick（SMF 規格唯一的時間單位；秒只是用速度表換算出來的衍生值）。
-//  電腦聲部的音符對應到「你的聲部」的 tick，不是第二條時鐘。
-//
-//  兩種聲部（模仿同事 SmartEnsemble 的「主控／伴奏」，但以這個專案的做法為主）：
-//    · driver（kind: 'human'，走 humanSynth）＝被指派的聲部。每個起音要你按一次：parser 的 segment（同一個 startTick 的所有音）
-//      裡屬於 driver 的音，一次按鍵（`trigger(輸入事件)` 或 `trigger(slot, nowMs)`，鍵盤或日後的手勢）放行一個 segment，在這次呼叫內立刻 noteOn（0ms）。
-//    · follower（kind: 'assist'，走 assistSynth）＝沒被指派的電腦輔助聲部。不用按：它的音依 tick 分屬 driver 起音之間的「段」，
-//      按鍵啟動它負責的那一段。
-//  沒有任何 driver（沒有指派，或指派的聲部都沒有音符）＝整首自動播放：只有第 0 段，從開頭照原速放完（同一條程式路徑）。
-//
-//  按鍵啟動它負責的那一段：第 k 次按鍵放行 driver 起音 T_k，同時記下錨點 { T_k, 按下的時刻, 速度 }，並把落在 [T_k, T_{k+1})
-//  的 follower 音各自排好發聲時刻：`按下時刻 + (樂譜秒(startTick) − 樂譜秒(T_k)) ÷ playbackRate`（startTick == T_k 的在這次呼叫內
-//  同刻發聲）。第 0 段（第一個 driver 起音之前的前奏）在 play() 後用 1× 起算，所以前奏照原速播、停在你的入場點。前奏還沒播完
-//  時按鍵不放行（前奏鎖：不然第 1 段重新對時，前奏剩下的音就被跳過），只記預按，播到入場點由 tick() 自動放行第一個起音。
-//    · 你按得比預估早（垂直切片）：按下 T_k 的那一刻，樂譜上「T_k 這個垂直 tick 響著什麼」＝ T_k 的 segment ＋ 從更早延續過來、
-//      endTick > T_k 的音。上一段還沒輪到的 follower 音因此分兩種：還該響著的追音（現在發聲，長度是 T_k 到它結尾的剩餘長度 ÷ 速度），
-//      整顆在你身後的跳過（不發聲）。這一段的錨點就是按下的時刻，同 tick 的電腦音永遠與你同刻（見 _chaseOrSkip 與 chaseStats）。
-//      文獻：Antescofo 的 @tight＋@local（位置優先、丟棄已過去的動作）、DAW 的 Chase Events（補發還在響的音）、Dannenberg 1984 §8。
-//    · 你按得比預估晚：這一段放完就靜止等你，不會越過你的下一個起音；已經開始的音照音長收完（loop 的音等你按）。
-//  playbackRate（命名同官方 Sequencer：樂譜秒 ÷ 真實秒）＝最近 8 個按鍵的頭尾比值（tempoFollower.js＋pressTiming.js，模擬評估選出來的）。
-//  去抖（tempoFollower.js）：兩次按鍵太近就忽略第二次（擋手抖、手勢重複觸發）。
-//
-//  收音：音長與起音一樣依你的速度等比例縮放（檔案音長 ÷ playbackRate，整份譜用你的 BPM 演奏）。driver 的音到期或下一次按鍵時 endTick ≤
-//  新錨點的先收掉（先收再放），follower 的音從它發聲的時刻起算同一個長度。
-//  hold（loop 等你按下一個起音）：音的結尾對齊、或橫跨某個還沒放行的 driver 起音（你的與電腦的一樣，見 voiceLedger.js 的 holdOf()），原長走完也不收，
-//  等你按到「結尾之前（含）最後一個起音」才收，收在「該軌的時刻 ＋ 檔案裡那個起音到結尾的長度 ÷ 速度」（見 voiceLedger.js 的 releaseHeld()；你的音的時刻是
-//  你按下的那一刻，電腦音的時刻是電腦走到這個起音的那一刻）。以你的聲部為準：結尾對齊起音（含匯出器統一縮短一點點的相連音）時剩餘長度是 0＝
-//  起音那一刻就收，就算原長還沒走完（你比預估快）也收；橫跨起音的音在這個起音之後再響完剩餘長度。
-//  是否 hold 看每顆音自己的結尾，不看它屬於哪個 segment：同 tick 你的音短、電腦音長時，短音照自己的長度收、長音等它的那個起音。
-//  尾巴收尾：同一個譜表的新音發聲時，還在響的舊音（起音 tick 比新音早）的收音時刻上限＝新音發聲時刻 ＋ 檔案裡這兩顆音的重疊量
-//  （結尾 tick − 新音起音 tick，最少 0）÷ 速度——舊音不會比檔案裡的重疊多響一截（糊在一起），也不丟音；hold 著的舊音在檔案沒有重疊時
-//  在這裡被截成有限值。例外：檔案裡真的重疊、音高不同、舊音還在 hold（同一行譜的多聲部，重疊是樂譜本意）不修剪，長音繼續 loop。
-//  同音高重疊的音依發聲順序先進先出收音（hold 著的不算），每個 noteOn 都送出一個 noteOff。以上（正在響的音）由發聲帳本 voiceLedger.js 保管。
-//
-//  lookahead：tick(nowMs, audioNow) 有給 AudioContext 時間時，電腦輔助聲部 LOOKAHEAD_MS 以內要發聲／收音的事件提早帶時間戳（eventOptions.time）
-//  送進合成器，由 worklet 依取樣時鐘準時放，不受主執行緒卡頓影響；你的聲部永遠立即發聲、不帶時間戳。worklet 沒有取消已排程事件的
-//  辦法，所以暫停時「已送出、還沒響」的音要另外送帶時間戳的 noteOff（見 outputRouter.js 的 offOpts()）。所有合成器呼叫都經過
-//  outputRouter.js（輸出 channel 分配、初始音色、時間戳）。
-//
-//  排程器自己的時鐘（`_clockMs`）只在 tick() 前進、暫停時不走，所以暫停的時間不會被當成按鍵間隔，恢復後排好的時刻照剩下的時間放。
-//  velocity 一律用樂譜原值。
-//
-//  控制器重播（子專案 E）：檔案裡的控制器、program change、pitch bend、aftertouch（parser 的控制器軌，一個輸入 channel 一條）扇出到
-//  每個來源是那個 channel 的譜表的輸出 channel（見 performancePlan.js）。載入、重播、改指派時每個輸出 channel 先重設（CC121 等）、
-//  送初始音色（bank／program 與 CC7／10／91／93），再送這首歌在那個位置之前的狀態（chase，只送跟輸出路由的 shadow 不同的值）——
-//  一定在任何 noteOn 之前。播放中途的控制器跟電腦音一樣依段排時刻：送電腦合成器的跟電腦音放在同一個佇列（同一個時刻照檔案順序，
-//  也帶 lookahead 時間戳），送你的合成器的另一個佇列、時鐘到了才送；你起音那個 tick 上的控制器在你的音之前送。早按時上一段還沒送出
-//  的控制器不逐一重播，改送那個起音之前的狀態（_chaseLane）。暫停時放開延音踏板、彎音歸中央（再 All Notes Off），續播恢復。
-//
-//  近距起音分組（子專案 E）：放行一個起音時往後看，相鄰起音的樂譜間隔 ÷ 目前速度比這個輸入來源的最短間隔還短（按不及；鍵盤 0.06 秒，
-//  pressTiming.js 的 minPressIntervalSec）就併成一組、一下放行（_groupEnd）。組頭在按下的那一次呼叫內發聲；被併入的起音的音照 tick 差 ÷
-//  速度排時刻、帶 lookahead 時間戳但走你的合成器，到點自動放行（_autoRelease：收掉 endTick ≤ 它的你的音、放行 hold 著等它的音），不動
-//  估速與去抖——它們看你實際按的組頭。提早按下一組時先做完還沒到的自動放行，組裡還沒送出的音照垂直切片（追音／跳過）。
-//
-//  預報入口（段中換錨）：每個 driver 群組可以掛一個預報器（setForecaster()，預設沒有＝行為完全不變）。排程器每個 tick 問它「你會在
-//  什麼時刻按下一個起音」，收到有效的預報就以（現在、此刻的樂譜位置、新速度）換錨，重排這一段還沒送出的電腦音（見 _applyForecast）。
-//  預報只是暫時的：真正按下時照原本的流程（早按走垂直切片、晚按停格等你），下一段的速度照舊來自速度追蹤。
-//
-//  聲部單位（part／staff）與 driver 群組見 performancePlan.js（演奏計畫，載入、改指派時建好，之後不變）。每個 driver 群組在這裡
-//  各有一份執行期狀態：游標、錨點、電腦音佇列、前奏預按、停格旗標、速度追蹤（makeGroupState()）。現在永遠只有一個群組
-//  （所有被指派的槽位共用同一條 driver 序列、擁有全部的 follower）；播放頭、hold 判定、對外的 playbackRate 看第一個群組。
-// ============================================================
+// scheduler.js — 排程器（純邏輯，無 DOM／CDN）。單位是 MIDI tick；你按一下放行你的聲部（driver）的下一個起音，電腦聲部（follower）依你的速度排好時刻跟著走。
+// 規格與假設見 docs/design-spec.md 的 N1～N12：按鍵啟動一段與垂直切片 N2、尾巴收尾 N3、停格與時鐘 N5、估速 N6、去抖 N7、前奏鎖 N8、lookahead N9、hold N10、近距起音分組 N11、控制器重播 N12。
+// ⚠ 你的音一律在 trigger() 呼叫內立即 noteOn，不經 tick、不帶時間戳（唯一例外：前奏預按，N8）。
+// ⚠ 排程器時鐘（_clockMs）只在 tick()／trigger() 前進，暫停時不走。
+// 沒有任何 driver（沒有指派，或指派的聲部都沒有音符）＝整首自動播放：只有第 0 段，從開頭照原速放完（同一條程式路徑）。
+// 聲部單位（part／staff）與 driver 群組見 performancePlan.js；每個群組在這裡有一份執行期狀態（makeGroupState()）。現在永遠一個群組，播放頭、hold 判定、對外的 playbackRate 看第一個群組。
+// 預報入口 setForecaster()：每個 tick 問預報器「你會在什麼時刻按下一個起音」，收到有效預報就段中換錨、重排還沒送出的電腦音（_applyForecast）；預設沒有預報器，行為完全不變（N2）。
+// 所有合成器呼叫都經過 voices.js（輸出 channel 分配、初始音色、時間戳）。
 
-import { TempoFollower } from './tempoFollower.js';
-import { OutputRouter, portsFor } from './outputRouter.js';
-import { PerformanceEvents, lateStatsSubscriber, chaseStatsSubscriber, pressLogSubscriber, eventLogSubscriber } from './performanceEvents.js';
-import { VoiceLedger, scaledMs, EPS_MS } from './voiceLedger.js';
+import { summarizeMs, TempoFollower, minPressIntervalSec } from './tempo.js';
+import { OutputRouter, portsFor, VoiceLedger, scaledMs, EPS_MS } from './voices.js';
 import { buildPlan, staffPools, sliceOfTick, switchesKit, stateEvents } from './performancePlan.js';
 import { ChannelStateTracker, chaseEventsAt } from './midiParser.js';
-import { minPressIntervalSec } from './pressTiming.js';
 
-// channel 的單一來源在 outputRouter.js；synth.js 從這裡 import（對外的匯出不變）。
-export { CHANNELS_PER_PORT, DEFAULT_PORTS } from './outputRouter.js';
+// ── PerformanceEvents：演奏的對外事件 ──
+// 排程器在 trigger()／tick()／暫停等呼叫裡先把事件排隊，呼叫結束、合成器的呼叫都送出之後才發給訂閱者（flush），訂閱者的工作不會擋在你的音前面；訂閱者丟的例外被隔離，不影響演奏。
+// 統計（遲到、早按處理、按鍵記錄）是標準訂閱者。事件種類與 payload 見 docs/design-spec.md「程式內部細節」。
+
+// 量測／記錄各留最近一批（超過丟最舊的），避免長時間播放無限成長；事件記錄每顆音一筆，一首最密的歌整首約一萬多筆
+const LATE_SAMPLES_MAX = 5000;
+const PRESS_LOG_MAX = 20000;
+const EVENT_LOG_MAX = 100000;
+// 滿了一次丟最舊的八分之一而不是每筆 shift()：大陣列的 shift() 是 O(n)（10 萬筆實測每筆約 0.3ms），攤銷後每筆 O(1)。
+function pushCapped(arr, item, max) {
+  arr.push(item);
+  if (arr.length > max) arr.splice(0, arr.length - (max - (max >> 3)));
+}
+
+// 每次按鍵都會走過排隊與派送（trigger() 的執行時間直接加在按下到出聲上），所以這裡刻意寫得省：沒有人訂閱的種類不排隊、
+// 佇列裡種類與 payload 交錯放（不另建 [種類, payload] 小陣列）、派送用索引迴圈（不建迭代器）。
+export class PerformanceEvents {
+  constructor() {
+    this._subscribers = new Map();   // 事件種類 → 回呼陣列（訂閱、取消時換成新的陣列：正在派送的那一輪照舊陣列跑完，新的訂閱下一個事件才生效）
+    this._queue = [];                // 排隊中、還沒發的事件：種類, payload, 種類, payload…
+  }
+
+  /** 訂閱一種事件，回傳取消訂閱的函式。同一個回呼重複訂閱只算一次。 */
+  on(type, fn) {
+    const subs = this._subscribers.get(type) || [];
+    if (!subs.includes(fn)) this._subscribers.set(type, [...subs, fn]);
+    return () => this._subscribers.set(type, (this._subscribers.get(type) || []).filter((f) => f !== fn));
+  }
+
+  /** 這種事件現在有沒有人訂閱：內容要另外組、又很頻繁的種類（control）先問，沒有人訂閱就連內容都不組。 */
+  has(type) {
+    const subs = this._subscribers.get(type);
+    return subs !== undefined && subs.length > 0;
+  }
+
+  // 排一個事件。排隊當下沒有人訂閱的種類直接略過（演奏時只有統計訂閱 noteOn／press／chase，其餘的不排隊也不派送）。
+  queue(type, payload) {
+    const subs = this._subscribers.get(type);
+    if (subs !== undefined && subs.length > 0) this._queue.push(type, payload);
+  }
+
+  // 把排隊的事件依序發出。先把佇列換掉再發：訂閱者裡如果又呼叫了排程器（又排了事件），那些事件下一次 flush 才發，不會亂序。
+  flush() {
+    if (!this._queue.length) return;
+    const pending = this._queue;
+    this._queue = [];
+    for (let i = 0; i < pending.length; i += 2) {
+      const type = pending[i], payload = pending[i + 1], subs = this._subscribers.get(type);
+      for (let k = 0; k < subs.length; k++) {
+        try { subs[k](payload); } catch (err) { console.error(`演奏事件「${type}」的訂閱者出錯（已略過，不影響演奏）：`, err); }
+      }
+    }
+  }
+}
+
+// 三個標準訂閱者的狀態都放在回傳物件自己的欄位（不藏在閉包裡）：排程器的重設測試通用地走整個物件圖，看得到才抓得到「忘了重設」。
+
+/** 標準訂閱者：tick() 放出的電腦音比排好的時刻晚了多少（見 scheduler.js 的 lateStats()）。 */
+export function lateStatsSubscriber(events) {
+  const sub = { samples: [], stats() { return summarizeMs(this.samples); }, reset() { this.samples = []; } };
+  events.on('noteOn', (e) => {
+    // 只記 tick() 放出的電腦音：按鍵呼叫內同刻放出的音（時鐘就是按下的那一刻）沒有「等 tick」這回事，記進去只會把統計稀釋成 0；
+    // 組裡到點放出的你的音不是電腦音。
+    if (e.fromTick && e.kind === 'assist') {
+      pushCapped(sub.samples, e.lateMs, LATE_SAMPLES_MAX);
+    }
+  });
+  return sub;
+}
+
+/** 標準訂閱者：你早按時的追音、跳過與取消不了的組內音（見 scheduler.js 的 chaseStats()）。 */
+export function chaseStatsSubscriber(events) {
+  const zero = () => ({ presses: 0, chased: 0, skipped: 0, inFlight: 0 });
+  const sub = { counts: zero(), stats() { return { ...this.counts }; }, reset() { this.counts = zero(); } };
+  events.on('chase', (e) => {
+    sub.counts.presses++;
+    sub.counts.chased += e.chased.length;
+    sub.counts.skipped += e.skipped.length;
+    sub.counts.inFlight += e.inFlight;
+  });
+  return sub;
+}
+
+/** 標準訂閱者：每次按鍵嘗試的記錄（見 scheduler.js 的 pressLog()）。 */
+export function pressLogSubscriber(events) {
+  const sub = { entries: [], log() { return this.entries.map((p) => ({ ...p })); }, reset() { this.entries = []; } };
+  events.on('press', (e) => {
+    pushCapped(sub.entries, { slot: e.slot, clockMs: e.clockMs, released: e.result === 'released', source: e.source, eventTimeMs: e.eventTimeMs, receivedMs: e.receivedMs }, PRESS_LOG_MAX);
+  });
+  return sub;
+}
+
+/**
+ * 錄音用的事件記錄（enableEventLog() 才掛）：錨點與換錨（速度）、放行、每顆音實際發聲的時刻、早按處理，存成可轉 JSON 的小物件，音符用 id（「軌序號:軌內序號」，同一版 parser 解析同一個檔一定相同）。
+ * 實際發聲時刻（排程器時鐘）：帶時間戳的電腦音在時間戳發聲（時間戳已經過去就在送出的當下），其餘在送出的當下。
+ */
+export function eventLogSubscriber(events) {
+  const sub = { entries: [], log() { return this.entries.map((e) => ({ ...e })); }, reset() { this.entries = []; } };
+  const push = (entry) => pushCapped(sub.entries, entry, EVENT_LOG_MAX);
+  const ids = (notes) => notes.map((n) => n.id ?? null);
+  events.on('anchor', (e) => push({ type: 'anchor', group: e.group, slice: e.slice, clockMs: e.clockMs, scoreSec: e.scoreSec, rate: e.rate }));
+  events.on('reanchor', (e) => push({ type: 'reanchor', group: e.group, slice: e.slice, clockMs: e.clockMs, scoreSec: e.scoreSec, rate: e.rate }));
+  events.on('release', (e) => push({ type: 'release', group: e.group, index: e.index, ticks: e.ticks, clockMs: e.clockMs }));
+  events.on('group', (e) => push({ type: 'group', group: e.group, index: e.index, merged: e.merged.map((m) => m.index), clockMs: e.clockMs }));
+  events.on('autoRelease', (e) => push({ type: 'autoRelease', group: e.group, index: e.index, ticks: e.ticks, dueMs: e.dueMs, clockMs: e.clockMs }));
+  events.on('noteOn', (e) => push({ type: 'noteOn', noteId: e.noteId, staffId: e.staffId, kind: e.kind, atMs: e.timed ? Math.max(e.dueMs, e.clockMs) : e.clockMs }));
+  events.on('chase', (e) => push({ type: 'chase', group: e.group, ticks: e.ticks, chased: ids(e.chased), skipped: ids(e.skipped) }));
+  return sub;
+}
+
+// channel 的單一來源在 voices.js；synth.js 從這裡 import（對外的匯出不變）。
+export { CHANNELS_PER_PORT, DEFAULT_PORTS } from './voices.js';
 
 export const DEFAULT_SCHEDULER_CONFIG = Object.freeze({
   drumChannel: 9, // MIDI 規格：第 10 個 channel（索引 9）是打擊
@@ -81,8 +131,7 @@ export const DEFAULT_SCHEDULER_CONFIG = Object.freeze({
   forecastMinChangeMs: 10,
 });
 
-// 控制器事件 ev 在檔案裡是不是比這顆音（它的 note on）早：先比 tick，同一個 tick 再比軌序、軌內序（parser 的事件排序鍵 byFileOrder，
-// 官方 timeline 的順序）。合併佇列用它決定同一個 tick 的控制器插在哪裡。
+// 控制器事件 ev 在檔案裡是不是比這顆音的 note on 早：先比 tick，同一個 tick 再比軌序、軌內序（parser 的 byFileOrder，官方 timeline 的順序）；合併佇列用它決定同一個 tick 的控制器插在哪裡。
 const fileBefore = (ev, note) => ev.ticks < note.startTick
   || (ev.ticks === note.startTick && (ev.trackIndex < note.trackIndex || (ev.trackIndex === note.trackIndex && ev.eventIndex < note.eventIndex)));
 
@@ -98,21 +147,15 @@ function mergeByDue(a, b) {
 // 單一來源：midiPlayer.js 列在指派下拉的「PC 鍵盤手」、main.js 交給 keyboard.js 的觸發槽位都用它。
 export const KEYBOARD_SLOT = 'kb';
 
-/* ═══════════════════════════════════════════
-   應用層常數——不是規格
-   ═══════════════════════════════════════════ */
+// ── 應用層常數（不是規格）──
 // 每個 tick 的時間步長上限：分頁被瀏覽器節流（背景分頁的計時器可能隔好幾秒才醒來）後恢復時，時鐘最多只前進這麼多，
 // 不會一次把空窗期的音全部放出來或收掉。
 const MAX_TICK_DT_MS = 100;
-// lookahead：tick() 把「這麼久以內就要發聲／收音」的電腦音提早帶時間戳（eventOptions.time，AudioContext 時間）送進合成器，
-// 由 worklet 依取樣時鐘準時放，主執行緒被影像算繪卡住幾十毫秒也不會晚。取捨：送出去的事件 worklet 沒有取消的辦法
-// （spessasynth_core 的 eventQueue 只有 push／shift），所以這段時間內的音「一定會響」。50ms 是蓋過實機量到的主執行緒
-// 停頓（攝影機開著，最大約 40ms）的最小值；只用在電腦輔助聲部，你的音永遠立即發聲、不帶時間戳。
+// lookahead：tick() 把「這麼久以內就要發聲／收音」的電腦音提早帶時間戳（eventOptions.time，AudioContext 時間）送進合成器，由 worklet 依取樣時鐘準時放，主執行緒被影像算繪卡住幾十毫秒也不會晚。
+// 取捨：worklet 沒有取消已送出事件的辦法（spessasynth_core 的 eventQueue 只有 push／shift），所以這段內的音「一定會響」。50ms 是蓋過實機量到的主執行緒停頓（攝影機開著，最大約 40ms）的最小值；只用在電腦輔助聲部（N9）。
 const LOOKAHEAD_MS = 50;
 
-// 這首歌至少需要幾個 port 的 channel（不低於 DEFAULT_PORTS）：旋律 staff 每個 port 有 15 個、打擊 staff 每種鼓組 program 佔一個
-// port 的打擊槽，指派與未指派兩個池子（兩個合成器）各自算，取較大的（見 outputRouter.js 的 portsFor()）。assignments 同 load()：
-// Map 或 [partId, 槽位][]。
+// 這首歌至少需要幾個 port 的 channel（不低於 DEFAULT_PORTS）：旋律 staff 每個 port 15 個、打擊 staff 每種鼓組 program 佔一個 port 的打擊槽，指派與未指派兩個池子（兩個合成器）各自算、取較大的（voices.js 的 portsFor()）。assignments 同 load()。
 export function portsNeeded(score, assignments) {
   const { assigned, assist } = staffPools(score, assignments);
   return portsFor([assigned, assist].map((specs) => ({
@@ -121,9 +164,7 @@ export function portsNeeded(score, assignments) {
   })));
 }
 
-/* ═══════════════════════════════════════════
-   driver 群組的執行期狀態
-   ═══════════════════════════════════════════ */
+// ── driver 群組的執行期狀態 ──
 // 每個群組一份：計畫（plan：performancePlan.js 的群組，載入後不變）、速度追蹤 tempo，以及播放狀態（_resetPlayback() 要全部重設）。
 // tempo：改指派時沿用舊的（速度估計保留，見 reassign()），沒給就新建（1×）；速度區間一律換成這個群組的計畫算的。
 function makeGroupState(index, plan, tempo = new TempoFollower()) {
@@ -131,7 +172,7 @@ function makeGroupState(index, plan, tempo = new TempoFollower()) {
   return {
     index,                 // 群組編號（對外事件的 group）
     plan,
-    tempo,                 // 速度估計 playbackRate、停手／變速判斷、去抖（見 tempoFollower.js）
+    tempo,                 // 速度估計 playbackRate、停手／變速判斷、去抖（見 tempo.js）
     cursor: 0,             // 下一個還沒放行的 driver segment（按下的組頭、或組裡等著自動放行的起音）
     groupEnd: 0,           // 下一個要你按的 driver segment：還在進行的一組之後的那個（沒有組在進行時＝cursor）
     lastHead: null,        // 你上一次實際按下的起音（組頭）：估速與去抖的「上一下」
@@ -150,15 +191,13 @@ function makeGroupState(index, plan, tempo = new TempoFollower()) {
   };
 }
 
-/* ═══════════════════════════════════════════
-   Scheduler
-   ═══════════════════════════════════════════ */
+// ── Scheduler ──
 export class Scheduler {
   constructor(config = {}) {
     this.cfg = { ...DEFAULT_SCHEDULER_CONFIG, ...config };
     this._router = new OutputRouter(this.cfg.drumChannel);   // 兩個合成器、輸出 channel、初始音色、lookahead 時間戳：所有合成器呼叫都經過它
     this.events = new PerformanceEvents();   // 對外事件（統計、視覺化、測試工具訂閱）：trigger()／tick()／暫停等呼叫結束、合成器的呼叫都送出之後才發
-    this._ledger = new VoiceLedger(this._router, this.events);   // 發聲帳本：正在響的音、hold、尾巴收尾、先進先出收音（見 voiceLedger.js）
+    this._ledger = new VoiceLedger(this._router, this.events);   // 發聲帳本：正在響的音、hold、尾巴收尾、先進先出收音（見 voices.js）
     this._score = null;
     this._plan = buildPlan(null);   // 載入後不變的計畫（staff、driver 群組、總音數、hold 容差上限；見 performancePlan.js）
     this._groups = this._plan.groups.map((p, i) => makeGroupState(i, p));   // 每個 driver 群組的執行期狀態（現在永遠一個）
@@ -219,9 +258,8 @@ export class Scheduler {
     this._bindLedger();
   }
 
-  // 合成器退回這首歌在界線 boundary（tick）之前的狀態：界線之前的整體參數 SysEx（依序，每個都是狀態）→ 每個輸出 channel 重設控制器
-  // （CC121 與中途改過的送回預設，見 outputRouter.js 的 resetChannel()）→ 初始音色 → 每條控制器軌在界線之前的狀態（chase，只送跟
-  // shadow 不同的）。載入與重播是 tick 0 的狀態（界線 1：tick 0 的事件都在之前），改指派是播放頭的位置。都在任何 noteOn 之前。
+  // 合成器退回這首歌在界線 boundary（tick）之前的狀態：界線之前的整體參數 SysEx → 每個輸出 channel 重設控制器（CC121 與中途改過的送回預設，voices.js 的 resetChannel()）→ 初始音色 →
+  // 每條控制器軌在界線之前的狀態（chase，只送跟 shadow 不同的）。載入與重播是 tick 0 的狀態（界線 1），改指派是播放頭的位置。都在任何 noteOn 之前。
   _sendInitialState(boundary = 1) {
     for (const ev of this._plan.globalSysex) if (ev.ticks < boundary) this._router.sendSysex(ev.data);
     const staves = [...this._plan.staves.values()];
@@ -230,31 +268,26 @@ export class Scheduler {
     for (const lane of this._plan.lanes.values()) this._sendLaneState(lane, chaseEventsAt(lane.events, boundary));
   }
 
-  // 把一條控制器軌的狀態（chase 序列）送到它的每個輸出 channel：只送跟 shadow 不同的值（outputRouter.js 的 sendStateDiff）；tick 0 的
+  // 把一條控制器軌的狀態（chase 序列）送到它的每個輸出 channel：只送跟 shadow 不同的值（voices.js 的 sendStateDiff）；tick 0 的
   // bank／program 不送（初始音色的事）、會讓打擊與旋律互換的 bank select 不送（見 performancePlan.js）。
   _sendLaneState(lane, chase) {
     const events = stateEvents(chase);
     for (const staff of lane.targets) this._router.sendStateDiff(staff, events.filter((ev) => !switchesKit(staff, ev)));
   }
 
-  // 發聲帳本綁定這一輪的譜表與計畫（載入、改指派之後）。hold 看第一個群組的 driver 起音（現在只有一個群組；多個群組時每顆音
-  // 跟哪個群組的起音 hold，是多人分工規則的一部分）。
+  // 發聲帳本綁定這一輪的譜表與計畫。hold 看第一個群組的 driver 起音（現在只有一個群組；多群組時每顆音跟哪個群組 hold 是多人分工規則的一部分）
   _bindLedger() {
     this._ledger.bind({ staves: this._plan.staves, driverTicks: this._groups[0].plan.driverTicks, holdCapTicks: this._plan.holdCapTicks, secOf: (tick) => this._secOf(tick) });
   }
 
   /**
    * 播放到一半改指派（或整首自動播放 ↔ 有人演奏）：從目前的播放位置接續，不從頭。
-   * 做法：量舊計畫的播放頭，算出「界線 boundary」→ 收掉還在響的音 → 依新的指派重建 staff 與計畫（同 load()）→ 起音在界線之前的音算已經過了
-   * （不重播、不補放，isFinished 才算得對）→ driver 游標指到第一個 >= 界線的起音 → 以現在的時鐘為界線重新錨定這一段（速度沿用）。
-   * 界線：舊計畫停格在你的下一個起音上（播放頭已走到它，還沒按）→ 那個起音的 tick（它的音還沒響）；否則是播放頭所在的 tick（含）
-   * ——剛按下一個起音、播放頭還在它上面時，那個 tick 的音已經響過，不能再放一次。
-   * 控制器：舊的輸出 channel 先重設（踏板放開、彎音歸中央，在收音之前；channel 可能換給別的譜表用），新的輸出 channel 送初始音色與
-   * 界線之前的狀態（_sendInitialState）；暫停中再依新的狀態放開踏板與彎音，續播恢復。
-   * 去抖與估速歷史清掉（舊的間隔對不上新的 driver 序列），速度估計保留；前奏鎖依新計畫重算（界線若還在新 driver 的第一個起音之前，
-   * 前奏鎖照常生效）。播放／暫停狀態不變。切換的瞬間還在響的音會被收掉、不重播；lookahead 已經提早送出、還沒響的電腦音取消不了，
-   * 若它的起音在界線之後，新計畫會再放一次（最多 LOOKAHEAD_MS 內的短暫重複）。
-   * 群組：現在只有一個，播放頭與速度看它；多個群組時新舊群組怎麼對應是多人分工規則的一部分。
+   * 做法：量舊計畫的播放頭算出「界線 boundary」→ 收掉還在響的音 → 依新指派重建 staff 與計畫（同 load()）→ 起音在界線之前的音算已經過了（不重播、不補放，isFinished 才算得對）
+   * → driver 游標指到第一個 >= 界線的起音 → 以現在的時鐘為界線重新錨定這一段（速度沿用）。
+   * 界線：舊計畫停格在你的下一個起音上（播放頭已走到它、還沒按）→ 那個起音的 tick（它的音還沒響）；否則是播放頭所在的 tick（含）——剛按下一個起音、播放頭還在它上面時，那個 tick 的音已經響過，不能再放一次。
+   * 控制器：舊的輸出 channel 先重設（踏板放開、彎音歸中央，在收音之前；channel 可能換給別的譜表用），新的輸出 channel 送初始音色與界線之前的狀態（_sendInitialState）；暫停中再依新狀態放開踏板與彎音，續播恢復。
+   * 去抖與估速歷史清掉（舊間隔對不上新的 driver 序列），速度估計保留；前奏鎖依新計畫重算。播放／暫停狀態不變。切換瞬間還在響的音會被收掉、不重播；
+   * lookahead 已提早送出、還沒響的電腦音取消不了，起音在界線之後的話新計畫會再放一次（最多 LOOKAHEAD_MS 內的短暫重複）。多個群組時新舊群組怎麼對應是多人分工規則的一部分。
    * @param {Map<string,number|string>|[string,number|string][]} assignments  同 load()
    */
   reassign(assignments) {
@@ -304,8 +337,7 @@ export class Scheduler {
     for (const staff of this._plan.staves.values()) this._router.restoreAfterPause(staff);   // 暫停時放開的踏板、彎音恢復原狀
   }
 
-  // 暫停：收掉還在響的音，時鐘、錨點與排好的 follower 音與控制器都保留（下次播放從原處繼續）。收音之前先放開踩著的延音踏板、
-  // 彎音歸中央（MIDI 1.0：踏板踩著時 Note Off 與 All Notes Off 要等踏板放開才生效；sequencer 停止時控制器應該歸位），續播再恢復。
+  // 暫停：收掉還在響的音，時鐘、錨點與排好的 follower 音與控制器都保留（下次從原處繼續）。收音之前先放開踩著的延音踏板、彎音歸中央（MIDI 1.0：踏板踩著時 Note Off 與 All Notes Off 要等踏板放開才生效），續播再恢復。
   pause() {
     this._playing = false;
     this._lastTickMs = null;
@@ -335,9 +367,7 @@ export class Scheduler {
     this.play();
   }
 
-  // 把播放狀態整個退回「剛 load() 完」的樣子：stop() 與 restart() 共用這一個函式。之後任何新增的
-  // 狀態欄位都要在這裡重設（test/unit/scheduler.test.mjs 有一個整體快照比對，忘了重設會
-  // 直接失敗）。呼叫端負責先收音（pause()）與決定要不要接著播放。
+  // 把播放狀態整個退回「剛 load() 完」的樣子（stop() 與 restart() 共用）。新增狀態欄位都要在這裡重設（test/unit/scheduler.test.mjs 有整體快照比對，忘了會失敗）。呼叫端負責先收音（pause()）與決定要不要接著播放。
   _resetPlayback() {
     for (const g of this._groups) {
       g.cursor = 0;
@@ -369,9 +399,8 @@ export class Scheduler {
   isPlaying() { return this._playing; }
 
   /**
-   * 唯讀快照（複本）：測試、工具與之後的視覺化用，取代直接讀私有欄位。陣列與物件都是新的；note 是樂譜裡的同一個物件
-   * （唯讀，不複製）。groups 現在永遠一個：所有被指派的槽位共用同一條 driver 序列（多人分工等手勢接回再定）；最上層的
-   * playbackRate／rateBounds／followers／sliceFirst 是第一個群組的。
+   * 唯讀快照（複本）：測試、工具與之後的視覺化用，取代直接讀私有欄位。陣列與物件都是新的；note 是樂譜裡的同一個物件（唯讀，不複製）。
+   * groups 現在永遠一個；最上層的 playbackRate／rateBounds／followers／sliceFirst 是第一個群組的。
    */
   inspect() {
     const withStaffId = ({ staff, note }) => ({ staffId: staff.id, note });
@@ -423,11 +452,10 @@ export class Scheduler {
     };
   }
 
-  /** 這個 tick 屬於第幾段（第一個 driver 起音之前＝第 0 段；第一個群組的）。唯讀查詢。方法裡呼叫的 sliceOfTick(...) 是
-   *  performancePlan.js 匯出的同名函式，不是這個方法自己（類別的方法名稱不會變成可以直接呼叫的變數名稱）。 */
+  /** 這個 tick 屬於第幾段（第一個 driver 起音之前＝第 0 段；第一個群組的）。唯讀查詢。呼叫的 sliceOfTick(...) 是 performancePlan.js 匯出的同名函式，類別方法名稱不會變成可直接呼叫的變數名。 */
   sliceOfTick(tick) { return sliceOfTick(this._groups[0].plan.driverTicks, tick); }
 
-  /** 以目前的 driver 游標判斷這顆音要不要 hold（見 voiceLedger.js 的 holdOf()）。唯讀查詢，library-scan 的音符分類用。 */
+  /** 以目前的 driver 游標判斷這顆音要不要 hold（見 voices.js 的 holdOf()）。唯讀查詢，library-scan 的音符分類用。 */
   holdOf(note) { return this._ledger.holdOf(note, this._groups[0].cursor); }
 
   // 播完：所有音（你的與電腦的）都發過聲而且沒有還在響的音。有指派聲部但還沒按到，driver 的音沒發過，不算播完。
@@ -481,15 +509,11 @@ export class Scheduler {
     if (g.anchoredSlice < 0) this._anchorSlice(g, 0, this._clockMs, 0, 1);
   }
 
-  // 啟動群組 g 的第 slice 段：記下錨點，把這一段的 follower 音各自排好發聲時刻（錨點時刻 ＋ 樂譜秒差 ÷ 速度）與收音時刻（發聲時刻 ＋
-  // 音符時值 ÷ 速度；結尾對齊或橫跨你某個起音的音在發聲時另外標 hold，見 _sound），成為排程佇列（依 dueMs 排序）。上一段沒放完的 follower 音在你按下時已經追音或跳過（見 _chaseOrSkip）。
-  // 這一段的控制器用同一條換算排時刻：送電腦合成器的插進同一個佇列——同一個 tick 插在檔案裡比它晚的第一個音之前（踏板換踩、program
-  // change 在音之前；音符之間的順序不變），送你的合成器的進 humanPending。
-  // fromTick：熱切換指派（reassign）從中間接續時，這一段裡 startTick 在它之前的音已經過了，不排進佇列（不然會一次補放）；
-  // 控制器同理（界線之前的狀態已經用 chase 送了）。
-  // 近距起音分組（lastSlice > slice）：組頭 j 啟動第 j＋1 段到第 lastSlice 段（組裡每個起音之間的段，到下一個組頭為止），用同一個錨點；
-  // 組裡被併入的起音（第 slice … lastSlice−1 個 driver segment）的音像電腦音一樣排時刻（own：走你的合成器、帶 lookahead 時間戳，
-  // 同一個 tick 排在電腦音前面，跟組頭一樣你的音先），另外每個起音排一個自動放行（_autoRelease），跟送你的合成器的控制器依時刻排在一起。
+  // 啟動群組 g 的第 slice 段：記下錨點，把這一段的 follower 音各自排好發聲時刻（錨點時刻 ＋ 樂譜秒差 ÷ 速度）與收音時刻（發聲時刻 ＋ 音符時值 ÷ 速度；結尾對齊或橫跨你某個起音的音在發聲時另外標 hold，見 _sound），成為依 dueMs 排序的佇列。
+  // 上一段沒放完的 follower 音在你按下時已追音或跳過（_chaseOrSkip）。這一段的控制器用同一條換算排時刻：送電腦合成器的插進同一個佇列——同一個 tick 插在檔案裡比它晚的第一個音之前（踏板換踩、program change 在音之前；音符之間的順序不變），送你的合成器的進 humanPending。
+  // fromTick：熱切換指派從中間接續時，這一段裡 startTick 在它之前的音（與控制器）已經過了（控制器的狀態已用 chase 送），不排進佇列，不然會一次補放。
+  // 近距起音分組（lastSlice > slice）：組頭 j 啟動第 j＋1 段到第 lastSlice 段（組裡每個起音之間的段，到下一個組頭為止），用同一個錨點；組裡被併入的起音的音像電腦音一樣排時刻（own：走你的合成器、帶 lookahead 時間戳，同 tick 排在電腦音前面），
+  // 另外每個起音排一個自動放行（_autoRelease），跟送你的合成器的控制器依時刻排在一起。
   _anchorSlice(g, slice, clockMs, scoreSec, rate, fromTick = -Infinity, lastSlice = slice) {
     g.anchor = { slice, clockMs, scoreSec, rate };
     this.events.queue('anchor', { group: g.index, slice, clockMs, scoreSec, rate });
@@ -529,9 +553,8 @@ export class Scheduler {
   }
 
   /**
-   * 觸發一次：放行這個槽位所屬群組的下一個 driver segment，裡面的音在這次呼叫內立刻 noteOn；同時啟動它負責的那一段 follower。
-   * 兩種呼叫法走同一條路徑：trigger(輸入事件)（鍵盤，見 keyboard.js）或 trigger(槽位, 時刻)（日後的手勢、測試）。發聲與錨點用
-   * 程式收到的時刻；事件發生的時刻（eventTimeMs）只記在按鍵事件與按鍵記錄裡。
+   * 觸發一次：放行這個槽位所屬群組的下一個 driver segment，裡面的音在這次呼叫內立刻 noteOn，同時啟動它負責的那一段 follower。
+   * trigger(輸入事件)（鍵盤，keyboard.js）與 trigger(槽位, 時刻)（日後的手勢、測試）走同一條路徑；發聲與錨點用程式收到的時刻，事件發生的時刻（eventTimeMs）只記在按鍵事件與按鍵記錄裡。
    * @param {number|string|{ slot: number|string, source: string|null, eventTimeMs: number|null, receivedMs: number }} input
    *   演奏者槽位（要有指派聲部才有資格），或輸入事件：source＝來源（'keyboard'…）、eventTimeMs＝事件發生的時刻（鍵盤的
    *   event.timeStamp，跟 performance.now() 同一個時間原點）、receivedMs＝程式收到的時刻（performance.now()）
@@ -553,9 +576,8 @@ export class Scheduler {
     const j = g.groupEnd, seg = g.plan.driverSegs[j];   // 這一下要放行的起音：還在進行的一組之後的那個
     const scoreSec = this._secOf(seg.ticks);
 
-    // 前奏鎖：別的聲部在你的第一個起音之前有音（例如卡農：大提琴先進、你控制後進的小提琴），前奏還沒播到你的入場點時，
-    // 按鍵不放行——放行會讓第 1 段用「現在」重新對時，前奏剩下的音就被跳過。這一下只記成「預按」（布林，按幾下都一樣），
-    // 播放頭走到入場點的那一刻由 tick() 自動放行第一個起音。不動估速、去抖與錨點。
+    // 前奏鎖：別的聲部在你的第一個起音之前有音（卡農：大提琴先進、你控制後進的小提琴），前奏還沒播到入場點時按鍵不放行——放行會讓第 1 段用「現在」重新對時，前奏剩下的音就被跳過。
+    // 這一下只記成「預按」（布林，按幾下都一樣），播放頭走到入場點的那一刻由 tick() 自動放行第一個起音；不動估速、去抖與錨點。
     if (j === 0 && g.plan.hasPrelude && clock < this._reachClockMs(g) - EPS_MS) {
       this._pressEvent(g, ev, clock, 'prelude');
       g.preludeCredit = true;
@@ -563,8 +585,7 @@ export class Scheduler {
       return false;
     }
 
-    // 去抖（見 tempoFollower.js 的 attempt()）：這一步依目前速度預估的真實長度，從你上一次按下的起音（組頭）算起（第一下沒有上一個，
-    // 去抖也不會用到）
+    // 去抖（tempo.js 的 attempt()）：這一步依目前速度預估的真實長度，從你上一次按下的起音（組頭）算起（第一下沒有上一個，去抖不會用到）
     const head = g.lastHead === null ? null : this._secOf(g.plan.driverSegs[g.lastHead].ticks);
     const blocked = g.tempo.attempt(clock, head === null ? 0 : ((scoreSec - head) * 1000) / g.tempo.playbackRate);
     this._pressEvent(g, ev, clock, blocked ? 'blocked' : 'released');   // 放行必定接著 _release()
@@ -585,10 +606,12 @@ export class Scheduler {
     const j = g.cursor, seg = g.plan.driverSegs[j];
     const scoreSec = this._secOf(seg.ticks);
     if (g.stalled) { g.stalled = false; this.events.queue('stall', { group: g.index, state: 'end', clockMs: clock }); }
-    // 估速（停手與變速的判斷見 tempoFollower.js）：間隔從你上一次按下的起音（組頭）算起
+    // 估速（停手與變速的判斷見 tempo.js）：間隔從你上一次按下的起音（組頭）算起
     g.tempo.accept(j, scoreSec, g.lastHead === null ? null : this._secOf(g.plan.driverSegs[g.lastHead].ticks), clock);
     const rate = g.tempo.playbackRate;                              // 這一下估完的速度
     const end = this._groupEnd(g, j, rate, source);                 // 按不及的近距起音併進這一組：[j＋1, end) 到點自動放行
+    // 已經到期、tick 還沒來得及放的電腦音（與控制器）要在游標前進之前放：結尾對齊這個起音的才會 hold，下面的 releaseHeld 才收得到它；也要在追音之前，同譜表的新音才截得到它們
+    this._emitPending(g);
     g.lastHead = j;
     g.cursor = j + 1;
     g.groupEnd = end;
@@ -601,10 +624,8 @@ export class Scheduler {
     this._ledger.closeByTick(seg.ticks, this._clockMs);             // driver 的音 endTick ≤ 這個起音的，先收
     this._ledger.releaseHeld(j, clock, rate);                       // 結尾對齊這個起音（或更早的起音）而 hold 著的音：你的音與電腦音都在你按下的這一刻收（錨點就是按下的時刻）
     this._ledger.closeDue(this._clockMs);
-    this._emitPending(g);                                           // 已經到期的電腦音與控制器（tick 還沒來得及放的）照常放，要在追音之前：同譜表的新音才截得到它們
     this._emitHumanPending(g, this._clockMs);
-    // 早按：上一段還沒輪到的電腦音落在你這個起音的「垂直 tick」之前，不能再照原本的時刻放（會跟你不同步、甚至倒序）。
-    // 改成跳到 T_k 的垂直狀態：還該響著的追音、整顆在身後的跳過，控制器改送 T_k 之前的狀態（見 _chaseOrSkip）。錨點因此永遠是按下的時刻，同 tick 的電腦音 0ms 同刻。
+    // 早按：上一段還沒輪到的電腦音落在你這個起音的「垂直 tick」之前，不能再照原時刻放（會跟你不同步、甚至倒序）。改跳到 T_k 的垂直狀態：還該響著的追音、整顆在身後的跳過，控制器改送 T_k 之前的狀態（_chaseOrSkip）。錨點因此永遠是按下的時刻。
     this._chaseOrSkip(g, seg.ticks, scoreSec, clock, inFlight);
     this._anchorSlice(g, j + 1, clock, scoreSec, rate, -Infinity, end);   // 這一段（含組裡起音之間的段）的錨點、電腦音、組裡的音與控制器（佇列此時是空的）
     this._emitHumanPending(g, clock);                               // 你起音那個 tick 上、送你的合成器的控制器（program change 等）在你的音之前
@@ -614,9 +635,8 @@ export class Scheduler {
     this._ledger.closeDue(this._clockMs);                           // 零長度的音
   }
 
-  // 近距起音分組：從組頭 j 往後串，相鄰兩個起音的樂譜間隔依目前速度換成真實時間，比這個輸入來源的最短間隔還短（按不及，鍵盤
-  // 0.06 秒，見 pressTiming.js 的 minPressIntervalSec）就併進來，一直串到不按不及為止（沒有長度上限）。彈得慢間隔被拉開、併的就少，
-  // 彈得快併的就多。回傳這一組的結束（不含）。
+  // 近距起音分組：從組頭 j 往後串，相鄰兩個起音的樂譜間隔依目前速度換成真實時間，比這個輸入來源的最短間隔還短（按不及；鍵盤 0.06 秒，tempo.js 的 minPressIntervalSec）就併進來，一直串到不按不及為止（沒有長度上限）。
+  // 彈得慢間隔被拉開、併的就少，彈得快併的就多。回傳這一組的結束（不含）。
   _groupEnd(g, j, rate, source) {
     const segs = g.plan.driverSegs, minSec = minPressIntervalSec(source);
     let m = j + 1;
@@ -653,15 +673,12 @@ export class Scheduler {
     return n;
   }
 
-  // 早按時的垂直切片（Antescofo 的 @tight＋@local、DAW 的 Chase Events）：你按下 driver 起音 T_k 的這一刻，樂譜上「T_k 這個垂直
-  // tick 響著什麼」＝ T_k 的 segment ＋ 從更早的 segment 延續過來、endTick > T_k 的音。群組 g 的佇列裡還沒輪到（dueMs 在按下之後）、
-  // 起音在 T_k 之前的電腦音，因此分兩種：
+  // 早按時的垂直切片（Antescofo 的 @tight＋@local、DAW 的 Chase Events）：你按下 driver 起音 T_k 的這一刻，樂譜上「T_k 這個垂直 tick 響著什麼」＝ T_k 的 segment ＋ 從更早的 segment 延續過來、endTick > T_k 的音。
+  // 群組 g 的佇列裡還沒輪到（dueMs 在按下之後）、起音在 T_k 之前的電腦音因此分兩種：
   //  · endTick > T_k：追音——現在發聲，長度是檔案裡 T_k 到它結尾的剩餘長度 ÷ 速度（hold 規則照舊，見 _sound）。它在 T_k 本來就是和聲的一部分。
   //  · endTick ≤ T_k：整顆在你身後，跳過（記進 _skipped，isFinished 才算得對）。
-  // 為什麼不照原時刻放完或加速追趕：前者樂譜前面的音會比同 tick 的音晚響（倒序）、後者讓同 tick 的電腦音晚到（你的音與電腦音不同步）。
-  // 佇列依 dueMs 排序，同一個 tick 的音 dueMs 相同、排在一起，所以追音的順序就是樂譜順序。
-  // 還沒送出的控制器（兩個佇列都算）不逐一重播：改把它們的控制器軌帶到 T_k 之前的狀態（_chaseLane），而且在追音之前——追音發聲時
-  // 彎音、踏板、表情就已經是 T_k 的值。還沒送出的整體參數 SysEx 依序馬上送（每個都是狀態，最後一個為準）。
+  // 為什麼不照原時刻放完或加速追趕：前者樂譜前面的音會比同 tick 的音晚響（倒序），後者讓同 tick 的電腦音晚到（你的音與電腦音不同步）。佇列依 dueMs 排序，同 tick 的音 dueMs 相同、排在一起，所以追音順序就是樂譜順序。
+  // 還沒送出的控制器（兩個佇列都算）不逐一重播：改把控制器軌帶到 T_k 之前的狀態（_chaseLane），而且在追音之前——追音發聲時彎音、踏板、表情就已是 T_k 的值。還沒送出的整體參數 SysEx 依序馬上送（每個都是狀態，最後一個為準）。
   // 組裡被併入、還沒送出的你的音（own）也一樣追音或跳過；已經提早送出的取消不了（inFlight，記在 chase 事件裡）。
   _chaseOrSkip(g, ticks, scoreSec, clock, inFlight = 0) {
     const left = g.pending, leftHuman = g.humanPending;
@@ -703,9 +720,8 @@ export class Scheduler {
     this._sendLaneState(lane, t.tracker.chase());
   }
 
-  // 讓一顆音發聲：記進 _sounded（每顆音恰好一次），交給發聲帳本 noteOn 並登記（hold、尾巴收尾、先進先出見 voiceLedger.js 的 sound()；
-  // hold 看群組 g 的游標、音長看 g 的速度）。dueMs＝預定發聲的時鐘時刻（你的音就是按下的那一刻）；fromTick＝由 tick() 放出
-  // （遲到統計只算這種，見 performanceEvents.js）；timed＝你的合成器也照 lookahead 帶時間戳（組裡被併入的音）。
+  // 讓一顆音發聲：記進 _sounded（每顆音恰好一次），交給發聲帳本 noteOn 並登記（hold、尾巴收尾、先進先出見 voices.js 的 sound()；hold 看群組 g 的游標、音長看 g 的速度）。
+  // dueMs＝預定發聲的時鐘時刻（你的音就是按下的那一刻）；fromTick＝由 tick() 放出（遲到統計只算這種）；timed＝你的合成器也照 lookahead 帶時間戳（組裡被併入的音）。
   _sound(g, staff, note, offMs, dueMs, fromTick = false, timed = false) {
     this._sounded.add(note);
     this._ledger.sound(staff, note, offMs, dueMs, { cursor: g.cursor, rate: g.tempo.playbackRate, fromTick, clockMs: this._clockMs, timed });
@@ -747,9 +763,7 @@ export class Scheduler {
   }
 
   /**
-   * 量測：tick() 放出的電腦音比排好的時刻晚了多少（排程器時鐘 − dueMs，毫秒）的統計。這是 tick 間隔（12ms 計時器被主執行緒
-   * 的影像算繪／姿勢推論延後）造成的遲到；不含 AudioWorklet 的一個 render quantum（約 2.7ms）與瀏覽器輸出延遲。
-   * 重設（stop／restart／換歌）時清空。
+   * 量測：tick() 放出的電腦音比排好的時刻晚了多少（排程器時鐘 − dueMs，毫秒）的統計：tick 間隔（12ms 計時器被主執行緒的影像算繪／姿勢推論延後）造成的遲到，不含 AudioWorklet 的一個 render quantum（約 2.7ms）與瀏覽器輸出延遲。重設（stop／restart／換歌）時清空。
    */
   lateStats() { return this._lateStats.stats(); }
 
@@ -775,7 +789,7 @@ export class Scheduler {
    */
   pressLog() { return this._pressLog.log(); }
 
-  /** 開啟錄音用的事件記錄（錨點、換錨、放行、每顆音實際發聲的時刻、早按處理；見 performanceEvents.js 的 eventLogSubscriber）。 */
+  /** 開啟錄音用的事件記錄（錨點、換錨、放行、每顆音實際發聲的時刻、早按處理；見 scheduler.js 的 eventLogSubscriber）。 */
   enableEventLog() {
     if (!this._eventLog) this._eventLog = eventLogSubscriber(this.events);
   }
@@ -845,13 +859,9 @@ export class Scheduler {
     };
   }
 
-  // 段中換錨：預報說你會在 f.atMs 按下一個起音。只在這一段是按鍵啟動的（游標 ≥ 1；前奏照 1× 播到入場點）、還有下一個起音、
-  // 播放頭還沒走到它（還沒停格）、預報在現在之後、而且跟目前預計的到達時刻差到門檻（forecastMinChangeMs）以上時才換。
-  // 新錨點＝（現在, 此刻的樂譜位置 p, r′）：r′＝（下一個起音的樂譜秒 − p）÷（atMs − 現在），夾在這個群組的速度區間（N6）。
-  // 佇列裡（還沒送出）、樂譜位置在 p 之後的電腦音與控制器照 r′ 重排時刻（電腦音連收音時刻，音長上限照 scaledMs）：不會排到現在之前、
-  // 保持樂譜順序、間隔等比例。碰不到的有：跟你同 tick 的音（按下時已經發聲）、lookahead 已經送出的音（已經離開佇列，取消不了）、
-  // 已經在響的音（收音時刻與 hold 照發聲當時的換算），以及已經過期、只是還沒放出的音（p 之前，照原時刻放）。
-  // 近距起音分組進行中時，「下一個起音」是下一個要你按的組頭（組裡的起音到點自動放行，一起依新的速度重排）。
+  // 段中換錨：預報說你會在 f.atMs 按下一個起音。只在這一段是按鍵啟動的（游標 ≥ 1；前奏照 1× 播到入場點）、還有下一個起音、播放頭還沒走到它（還沒停格）、預報在現在之後、跟目前預計的到達時刻差到門檻（forecastMinChangeMs）以上時才換。
+  // 新錨點＝（現在, 此刻的樂譜位置 p, r′）：r′＝（下一個起音的樂譜秒 − p）÷（atMs − 現在），夾在這個群組的速度區間（N6）。佇列裡（還沒送出）、樂譜位置在 p 之後的電腦音與控制器照 r′ 重排時刻（電腦音連收音時刻）：不會排到現在之前、保持樂譜順序、間隔等比例。
+  // 碰不到的有：跟你同 tick 的音（按下時已發聲）、lookahead 已送出的音（取消不了）、已經在響的音（收音時刻與 hold 照發聲當時的換算）、已過期只是還沒放出的音（p 之前，照原時刻放）。近距起音分組進行中時，「下一個起音」是下一個要你按的組頭（組裡的起音到點自動放行，一起依新速度重排）。
   _applyForecast(g, f) {
     if (!f) return;
     const now = this._clockMs, j = g.groupEnd, next = g.plan.driverSegs[j], a = g.anchor;
@@ -882,8 +892,7 @@ export class Scheduler {
     for (const g of this._groups) this._emitPending(g, horizonMs, true);
     for (const g of this._groups) this._emitHumanPending(g, this._clockMs);    // 送你的合成器的控制器、組裡起音的自動放行：不提早
     this._ledger.closeDue(this._clockMs, horizonMs);     // 剛發聲就到期的短音
-    // 前奏鎖期間有人預按過：播放頭到了入場點就放行第一個起音。放行時刻取「剛好到達」的那一刻（不是這個 tick 的時鐘），
-    // 第 1 段的錨點因此接在前奏的 1× 時間軸上；落在這一刻到現在之間的電腦音由 _release() 裡的 _emitPending() 補放。
+    // 前奏鎖期間有人預按過：播放頭到了入場點就放行第一個起音。放行時刻取「剛好到達」的那一刻（不是這個 tick 的時鐘），第 1 段的錨點因此接在前奏的 1× 時間軸上；落在這一刻到現在之間的電腦音由 _release() 裡的 _emitPending() 補放。
     for (const g of this._groups) {
       if (!g.preludeCredit || g.cursor !== 0) continue;
       const reach = this._reachClockMs(g);

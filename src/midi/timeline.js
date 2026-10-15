@@ -1,17 +1,9 @@
-// ============================================================
-//  timeline.js — 時間層：速度表、tick ↔ 秒（midiTicksToSeconds／secondsToMIDITicks，名稱照官方 BasicMIDI）、拍號與調號表、
-//  port 偏移（絕對 channel，對照官方的 portChannelOffsetMap）、小節與拍格線。純邏輯，無 DOM／CDN 依賴。
-//
-//  ── 規格保證什麼、應用層假設什麼 ──
-//  SMF 規格真正寫進檔案的是「格線」：時間解析度（division）、速度（FF 51）、拍號（FF 58）。
-//  這三樣加起來足以把任何一個 tick 精確還原成「第幾拍、第幾秒」，`buildTempoMap()`／
-//  `makeMidiTicksToSeconds()`／`buildMeasureGrid()`／`buildBeatGrid()` 這條鏈是確定性計算，不是
-//  推導。規格沒有寫進檔案的是格線上的「音樂意義」：小節線本身、弱起、強弱、swing、複拍子
-//  的實際律動——這些只能由應用層推導，而推導必然帶假設，本模組只在明確標示假設（CLAUDE.md「拍子從哪裡來」的假設表，
-//  A 開頭的項目，散在各函式的 JSDoc／註解裡）的地方才做這類啟發式推導，其餘一律照規格算出來的數字為準。
-// ============================================================
+// timeline.js — 時間層（純邏輯，無 DOM／CDN）：速度表、tick ↔ 秒（midiTicksToSeconds／secondsToMIDITicks，名稱照官方 BasicMIDI）、
+// 拍號與調號表、port 偏移（絕對 channel）、小節與拍格線。
+// 規格寫進檔案的是格線：division、速度（FF 51）、拍號（FF 58），加起來足以把任何 tick 精確還原成第幾拍、第幾秒，這條鏈是確定性計算。
+// 規格沒寫的是格線上的音樂意義（小節線、弱起、強弱、swing、複拍子律動），只能推導，推導必帶假設：只在明確標示假設的地方做（規格文件假設表的 A 項目）。
 
-import { META, makeWarn } from './smf.js';
+import { META, makeWarn } from './midiFile.js';
 
 /** @typedef {import('./midiParser.js').MidiDivision} MidiDivision */
 /** @typedef {import('./midiParser.js').MidiTrack} MidiTrack */
@@ -20,9 +12,7 @@ import { META, makeWarn } from './smf.js';
 
 const DEFAULT_TEMPO_US = 500000; // 規格：沒有 FF51 時視為 120 BPM
 
-/* ═══════════════════════════════════════════
-   解析：時間軸（速度表／拍號／調號）
-   ═══════════════════════════════════════════ */
+// ── 解析：時間軸（速度表／拍號／調號）──
 
 function collectMeta(tracks, type) {
   const list = [];
@@ -31,7 +21,7 @@ function collectMeta(tracks, type) {
       if (ev.kind === 'meta' && ev.type === type) list.push({ ev, trackIndex: track.index });
     }
   }
-  // Array.prototype.sort 自 ES2019 起保證穩定，同 tick 時維持「軌序 → 事件序」。
+  // 穩定排序（ES2019 起保證）：同 tick 維持軌序 → 事件序
   list.sort((a, b) => a.ev.ticks - b.ev.ticks);
   return list;
 }
@@ -92,9 +82,8 @@ export function makeMidiTicksToSeconds(tempoMap, division) {
   };
 }
 
-// midiTicksToSeconds 的反函數（名稱照官方 BasicMIDI.secondsToMIDITicks）。數學上：tick → 秒在每個速度區段內是斜率固定的
-// 線性函數、區段之間接得起來，整條是嚴格遞增的分段線性函數，所以反函數也是分段線性——先用 seg.seconds（每段的起始秒數，
-// 嚴格遞增）二分搜尋找到所屬區段，再在區段內反解線性式。回傳值可以是小數（秒不一定剛好落在整數 tick 上）。
+// midiTicksToSeconds 的反函數（名稱照官方 BasicMIDI.secondsToMIDITicks）：tick → 秒是嚴格遞增的分段線性函數，反函數也是分段線性，
+// 先用每段起始秒數（seg.seconds，嚴格遞增）二分搜尋所屬區段，再在區段內反解。回傳值可以是小數。
 export function makeSecondsToMIDITicks(tempoMap, division) {
   if (division.type === 'smpte') {
     return (seconds) => seconds * division.ticksPerSecond;
@@ -151,13 +140,10 @@ export function buildKeySignatures(tracks) {
   );
 }
 
-/* ═══════════════════════════════════════════
-   port 偏移（絕對 channel）
-   ═══════════════════════════════════════════ */
+// ── port 偏移（絕對 channel）──
 
-// 每條 track 的 channel 偏移（絕對 channel＝軌內 channel＋偏移），跟官方 SpessaSynth 一致：沒有指定 port（FF21）的 track
-// 用「最小的已指定 port」（都沒有就 0）；依軌序（只看有 channel 事件的軌）第一次出現的 port 配偏移 0、16、32…，
-// 用的是出現順序，不是 port 的數值。
+// 每條 track 的 channel 偏移（絕對 channel＝軌內 channel＋偏移），跟官方 SpessaSynth 一致：沒指定 port（FF21）的 track 用最小的已指定 port（都沒有就 0）；
+// 依軌序（只看有 channel 事件的軌）第一次出現的 port 配偏移 0、16、32…，用的是出現順序而非 port 數值。
 export function buildPortOffsets(tracks) {
   const withChannels = tracks.filter((t) => t.channels.length);
   const given = withChannels.filter((t) => t.port !== null).map((t) => t.port);
@@ -172,9 +158,7 @@ export function buildPortOffsets(tracks) {
   return offsets;
 }
 
-/* ═══════════════════════════════════════════
-   小節格線：不塞進 parseMidi() 的回傳值（排程器目前不用它，逐音放行只看 startTick）。
-   ═══════════════════════════════════════════ */
+// ── 小節格線（不塞進 parseMidi() 的回傳值：排程器目前不用它，逐音放行只看 startTick）──
 
 /**
  * @typedef {{index:number, startTick:number, endTick:number, startSeconds:number,
@@ -183,38 +167,18 @@ export function buildPortOffsets(tracks) {
  */
 
 /**
- * 依拍號（timeSignatures）與 timeDivision 推算全曲的小節線。拍號中途變更處強制斷一條
- * 小節線，該段落最後一小節可能因此不是完整長度；樂曲真正結尾的最後一小節不截短，保留完整
- * 名目長度（讓演奏者仍有整小節的揮手窗口）。SMPTE division 沒有「四分音符」這個概念，
- * timeDivision 為 null，回傳空陣列——呼叫端退回沒有格線的路徑（A5，應用層限制，不是
- * 規格的一部分）。弱起拍（anacrusis）目前不處理，格線一律從 tick 0 起算，檔案若有弱起，
- * 所有小節線與拍位會整體平移（A1）。
+ * 依拍號與 timeDivision 推算全曲小節線。拍號中途變更處強制斷一條小節線（該段最後一小節可能不完整）；樂曲真正結尾的最後一小節不截短，
+ * 保留完整名目長度（演奏者仍有整小節的揮手窗口）。SMPTE division 沒有四分音符概念，timeDivision 為 null，回傳空陣列，呼叫端退回沒有格線的路徑（A5）。
+ * 弱起拍不處理，格線一律從 tick 0 起算，有弱起的檔案所有小節線與拍位會整體平移（A1）。
  *
- * FF58 的四個位元組（`nn dd cc bb`）分別餵給兩種不同的「拍長」，都是規格欄位算出來的，
- * 不是猜的：
- *
- * - `notatedBeatTicks`（記譜拍長，算小節長度用）＝一個 `dd`（分母）音符值有幾個 tick。
- *   `bb`（RP-001 p.10：一個 MIDI 認知的四分音符／24 clocks 等於幾個記譜三十二分音符）
- *   多數檔案是規格最常見的值 8，這時退化成 `tpq*4/denominator`；非 8 代表這份檔案把
- *   「MIDI 四分音符」重新記譜成別的音符值（RP-001 原文：「已有多個程式允許使用者指定
- *   MIDI 認知的四分音符要被記譜成、或對應到別的東西」），公式仍然照規格算：
- *   `32*tpq/(bb*denominator)`。
- * - `beatTicks`（律動拍長，演奏者實際要揮的單位）優先採用 `cc`（節拍器每響一次隔幾個
- *   MIDI clock，24 clocks＝一個四分音符＝`tpq` ticks）換算出的 `pulseTicks = tpq*cc/24`。
- *   RP-001 自己的 6/8 範例（`FF 58 04 06 03 24 08`）就是 `cc=36`＝附點四分音符＝每小節
- *   揮 2 下，不是切成 6 個八分音符。
- *
- * 採用 `cc` 有三個保險條件，任一不成立就退回 `beatTicks = notatedBeatTicks`（也就是舊版
- * 「一拍＝拍號分母那個音符」的算法）：`cc !== 24`（24 是 MIDI 的內建預設值，多數編曲軟體
- * 不論拍號一律照抄，視為「檔案沒有表態」）、`pulseTicks` 是 `notatedBeatTicks` 的正整數倍
- * （否則不構成一個合理的記譜單位）、`measureTicks % pulseTicks === 0`（否則一小節切不出
- * 整數次揮手）。這是應用層唯一還留著的假設（取代舊版的 A2／A10）：`cc = 24` 的複拍子檔案
- * 仍然會切成分母音符單位（例如 6/8 若 `cc` 剛好也是 24，會切成 6 下而不是 2 下），代價是
- * 保守但不會對音樂上沒有意義的值信以為真。
- *
- * 拍號本身無效（`numerator<=0` 或算出的 `measureTicks<=0`，例如 `denominator` 透過
- * `2**d[1]` 算出離譜的大值）時，會送一則警告並把這段拍號當 4/4 處理再繼續，不會讓迴圈
- * 卡在原地出不來（曾經是真的會凍結分頁的無限迴圈）。
+ * FF58 的四個位元組（nn dd cc bb）餵給兩種拍長，都是規格欄位算出來的：
+ * - notatedBeatTicks（記譜拍長，算小節長度用）＝一個 dd 音符值有幾個 tick。bb（RP-001 p.10：一個 MIDI 四分音符／24 clocks 等於幾個記譜三十二分音符）
+ *   多為 8，此時退化成 tpq*4/denominator；非 8 代表檔案把 MIDI 四分音符重新記譜成別的音符值，公式仍照規格：32*tpq/(bb*denominator)。
+ * - beatTicks（律動拍長，演奏者實際要揮的單位）優先採用 cc（節拍器每響一次隔幾個 MIDI clock，24 clocks＝一個四分音符＝tpq ticks）換算的 pulseTicks = tpq*cc/24。
+ *   RP-001 的 6/8 範例（FF 58 04 06 03 24 08）cc=36＝附點四分音符＝每小節揮 2 下。
+ *   任一保險條件不成立就退回 beatTicks = notatedBeatTicks：cc === 24（內建預設值，多數編曲軟體不論拍號照抄，視為檔案沒表態）、
+ *   pulseTicks 不是 notatedBeatTicks 的正整數倍、measureTicks % pulseTicks !== 0。
+ *   這是應用層唯一留著的假設：cc = 24 的複拍子檔案仍切成分母音符單位（6/8 會切成 6 下而不是 2 下），保守但不會對沒意義的值信以為真。
  * @param {ParsedMidi} parsed  parseMidi() 的結果（可能被追加警告，見上）
  * @returns {Measure[]}
  */
@@ -239,9 +203,8 @@ export function buildMeasureGrid(parsed) {
     let notatedBeatTicks = Math.round((32 * tpq) / (bb * denominator));
     let measureTicks = numerator * notatedBeatTicks;
     if (!(measureTicks > 0)) {
-      // 拍號無效（分子 <=0，或分母透過 2**d[1] 算出超大值把 notatedBeatTicks 除到趨近 0）：
-      // 這裡的 tick 永遠不會前進，下面的 while 迴圈會原地卡死。警告後退回 4/4；連 4/4
-      // 都算不出正數（denominator 本身也異常）就整段退回「一拍＝一個四分音符」。
+      // 拍號無效（分子 <=0，或分母經 2**d[1] 算出超大值把 notatedBeatTicks 除到趨近 0）：tick 不會前進，下面的 while 會原地卡死。
+      // 警告後退回 4/4；連 4/4 都算不出正數就整段退回「一拍＝一個四分音符」。
       warn(`拍號 ${sig.numerator}/${sig.denominator}（tick ${sig.ticks}）無效，已當作 4/4 處理`);
       numerator = 4;
       denominator = 4;
@@ -289,11 +252,8 @@ export function buildMeasureGrid(parsed) {
  */
 
 /**
- * 把小節格線（`buildMeasureGrid()`）切成拍格線：每拍長度是 `m.beatTicks`（律動拍長，見
- * `buildMeasureGrid()` 的說明），不是固定切成 `numerator` 份——採用 `cc` 時一小節的拍數會
- * 少於 `numerator`（例如 6/8 的 2 拍）。拍號中途變更造成的截短小節，最後一拍夾到
- * `measure.endTick`；長度為 0 就不收。SMPTE division（`buildMeasureGrid()` 回空陣列）
- * 這裡也回空陣列。
+ * 把小節格線切成拍格線：每拍長度是 m.beatTicks（律動拍長，見 buildMeasureGrid()），不是固定切成 numerator 份（採用 cc 時一小節的拍數少於 numerator，如 6/8 的 2 拍）。
+ * 拍號中途變更造成的截短小節，最後一拍夾到 measure.endTick，長度為 0 就不收。SMPTE（格線回空陣列）也回空陣列。
  * @param {ParsedMidi} parsed  parseMidi() 的結果
  * @returns {Beat[]}
  */

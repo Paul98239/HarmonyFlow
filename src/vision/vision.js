@@ -1,11 +1,7 @@
-// ============================================================
-//  vision.js — MediaPipe 骨架偵測模組
-//  WebGL 視訊渲染 + 多人 ID 鎖定追蹤 + 自適應平滑濾波（最多 4 人）
-// ============================================================
+// vision.js — MediaPipe 骨架偵測模組：WebGL 視訊渲染 + 多人 ID 鎖定追蹤 + 自適應平滑濾波（最多 4 人），並產出手勢觸發序號（目前沒有接收者，見規格文件）
 
-// 直接從 CDN 匯入（不經 import map），版本固定為 1.1.0：bundle、loader JS、.wasm 三個檔案必須同一版。
-// 不用 @latest：jsDelivr 邊緣節點曾同時回傳不同版本的 loader JS 與 .wasm（2026-10-07 實測），
-// 載入時 assignWasmExports 讀到 undefined 而失敗。升級時下面兩個網址（import 與 forVisionTasks）一起改。
+// 直接從 CDN 匯入（不經 import map），版本固定 1.1.0：bundle、loader JS、.wasm 三個檔必須同一版。不用 @latest：jsDelivr 邊緣節點曾同時回傳不同版本的 loader JS 與 .wasm
+// （2026-10-07 實測），載入時 assignWasmExports 讀到 undefined 而失敗。升級時下面兩個網址（import 與 forVisionTasks）一起改。
 import {
   PoseLandmarker,
   FilesetResolver,
@@ -13,59 +9,44 @@ import {
 import { PersonTracker, buildDetection } from "./tracking.js";
 import { ArcDetector } from "./gesture.js";
 
-/* ═══════════════════════════════════════════
-   ⚙️ 基礎設定
-   ═══════════════════════════════════════════ */
+// ── 基礎設定 ──
 const CONFIG = {
-  // 攝影機解析度與幀率的「上限」（getUserMedia 用 max 而非只給 ideal）：外接攝影機的原生模式
-  // 常是 1080p60，真的拿到會讓每幀多搬四倍像素、rVFC 一秒觸發 60 次推論，多數機器跟不上。
-  // 用 max 收成硬上限後瀏覽器會自行降採樣；實際協商到的規格會在啟動時印到 console。
+  // 攝影機解析度與幀率的「上限」（getUserMedia 用 max 而非只給 ideal）：外接攝影機的原生模式常是 1080p60，真的拿到會讓每幀多搬四倍像素、rVFC 一秒觸發 60 次推論，多數機器跟不上；
+  // 用 max 收成硬上限後瀏覽器會自行降採樣，實際協商到的規格若超出會在 console 警告。
   width: 854,
   height: 480,
   frameRate: 30,
   maxUsers: 4, // 最多鎖定並顯示的目標人數
 };
 
-// 只用 lite 模型（最快、抖動也最明顯，但足夠用）。CDN 為主、本地副本為備用：Google 官方 storage 的 /1/ 是釘死的版本（內容與
-// 本地副本逐位元相同），實測比 GitHub Pages 快得多（0.6 秒 vs 100 秒以上）；CDN 失敗（網路錯誤、HTTP 錯誤、下載到一半斷線、
-// 檔案壞了）才改載本地。不用逾時當備援條件——慢不等於壞，慢速連線下載本體本來就可能很久。
+// 只用 lite 模型（最快、抖動也最明顯，但足夠用）。CDN 為主、本地副本為備：Google 官方 storage 的 /1/ 是釘死的版本（內容與本地副本逐位元相同），實測比 GitHub Pages 快得多（0.6 秒 vs 100 秒以上）；
+// CDN 失敗（網路錯誤、HTTP 錯誤、下載到一半斷線、檔案壞了）才改載本地。不用逾時當備援條件——慢不等於壞。
 const POSE_MODEL_URLS = [
   "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
   "./src/assets/pose_landmarker_lite.task",
 ];
 let poseModelIndex = 0; // 目前採用的來源（POSE_MODEL_URLS 的索引）；CDN 失敗改用本地之後不再重試已經壞掉的那個
 
-// 暖機：載入畫面收起之後，用低優先序的 fetch 把姿勢模型（約 5.8MB）先抓進瀏覽器的 HTTP 快取（Google storage 的
-// Cache-Control: public, max-age=3600），使用者第一次選現場人數時 MediaPipe 對同一個 URL 的請求直接命中快取。
-// 不用 <link rel="preload">：模型要等選了人數才會用到，沒在幾秒內用掉 Chrome 會在 console 報黃色警告；呼叫端也刻意等開機完成
-// 才叫，不跟開頁時 8.4MB 的音色庫搶頻寬。失敗不處理：之後真的載入時會走備援並留下 warn。
+// 暖機：載入畫面收起之後，用低優先序的 fetch 把姿勢模型（約 5.8MB）先抓進 HTTP 快取（Google storage 的 Cache-Control: public, max-age=3600），使用者第一次選現場人數時 MediaPipe 對同一個 URL 的請求直接命中。
+// 不用 <link rel="preload">：模型要等選了人數才會用到，沒在幾秒內用掉 Chrome 會在 console 報黃色警告；呼叫端也刻意等開機完成才叫，不跟開頁時 8.4MB 的音色庫搶頻寬。失敗不處理：之後真的載入時會走備援並留下 warn。
 export function warmPoseModel() {
   if (poseModelIndex !== 0) return;   // 已改用本地副本，不必暖 CDN
   fetch(POSE_MODEL_URLS[0], { priority: "low" }).then((r) => r.arrayBuffer()).catch(() => {});
 }
 
-// MediaPipe 的 numPoses（同時追幾個人）。這個數字決定 MediaPipe 的工作模式：「追到的人數 ≥
-// numPoses」時偵測器跳過、每個人的 ROI 由上一幀的 landmark 延續——沒有幽靈骨架、節點最穩；
-// 「追到的人數 < numPoses」時偵測器每幀重跑，幽靈與抖動都是這個狀態的產物。
-// landmarker 是完全懶惰載入的：開頁不預建任何一份，還沒在系統控制 bar 選「現場人數」之前
-// 不推論（chosenPoseCount 為 0 時 processFrame 跳過 detectForVideo）。使用者選 N 才第一次
-// 建置 numPoses=N 的實例並武裝偵測，追蹤層的槽位數（＝ ID 上限）也設成 N（見 setPoseCount）。
-// 設小了多出來的人不會被偵測到，這是設定的字面意思。只維持一份使用中的實例（見
-// requestLandmarker()）：換人數／換模型變體時，新的建好才換手，等待期間畫面用舊的那份
-// 繼續正常推論，不會凍結，只是新設定生效前有 1~2 秒延遲（見 src/ui.js 的「調整人數中⋯」提示）。
+// MediaPipe 的 numPoses（同時追幾個人）決定它的工作模式：「追到的人數 ≥ numPoses」時偵測器跳過、每個人的 ROI 由上一幀的 landmark 延續——沒有幽靈骨架、節點最穩；
+// 「追到的人數 < numPoses」時偵測器每幀重跑，幽靈與抖動都是這個狀態的產物。設小了多出來的人不會被偵測到，這是設定的字面意思。
+// landmarker 完全懶惰載入：開頁不預建，還沒選「現場人數」之前不推論（chosenPoseCount 為 0 時 processFrame 跳過 detectForVideo）；使用者選 N 才第一次建置 numPoses=N 的實例，
+// 追蹤層的槽位數（＝ ID 上限）也設成 N（見 setPoseCount）。只維持一份使用中的實例（見 requestLandmarker()）：新的建好才換手，等待期間畫面用舊的繼續推論不凍結，只是新設定有 1~2 秒延遲。
 const POSE_COLORS = ["#00FFFF", "#FF6B6B", "#51CF66", "#FFD43B"]; // 4 人的代表色彩（依鎖定槽位對應）
 const BONE_WIDTH = 2;      // 骨架連線寬度（px）
 const JOINT_RADIUS = 2;    // 關節圓點半徑（px）
 const TAU = Math.PI * 2;
-// 嘴巴中點正下方的虛擬「下巴」節點偏移量：以肩寬為單位（跟 ArcDetector 門檻、ID 標籤字級
-// 同一套慣例），人離鏡頭遠近不同時偏移比例才會一致，不用固定 px。
+// 嘴巴中點正下方的虛擬「下巴」節點偏移量：以肩寬為單位（同 ArcDetector 門檻、ID 標籤字級的慣例），人離鏡頭遠近不同時比例才一致
 const CHIN_OFFSET_RATIO = 0.18;
-// 慣用手鎖定的兩道放開條件：HAND_LOCK_RELEASE_MS 是保險絲（排程器是觸發事件驅動、
-// 停頓幾秒——例如正在對著一顆長音不動——是完全正常的演奏節奏，門檻
-// 故意放寬，不再是主要機制）；真正負責「換手」體驗的是 HAND_STILL_RADIUS／HAND_STILL_MS：
-// 鎖定的手連續待在一個小範圍內夠久就視為靜止（藏起來的手通常也是靜止的），比「多久沒觸發」
-// 更直接對應「手被藏起來但還沒觸發過」這個情境——MediaPipe 對被遮擋的手常常會猜一個信心分數
-// 還過得去的位置，可見度旗標未必會掉到不可見，光調可見度的遲滯沒有用。
+// 慣用手鎖定的兩道放開條件：HAND_LOCK_RELEASE_MS 是保險絲（排程器是觸發事件驅動，停頓幾秒——例如對著一顆長音不動——是正常演奏節奏，所以門檻放寬）；
+// 真正負責「換手」體驗的是 HAND_STILL_RADIUS／HAND_STILL_MS：鎖定的手連續待在小範圍內夠久就視為靜止（藏起來的手通常也是靜止的），
+// 比「多久沒觸發」更直接對應「手被藏起來但還沒觸發過」——MediaPipe 對被遮擋的手常猜一個信心分數還過得去的位置，可見度旗標未必掉到不可見，光調可見度遲滯沒有用。
 const HAND_LOCK_RELEASE_MS = 8000;
 const HAND_STILL_RADIUS = 0.10;  // 肩寬單位，小於 ArcDetector 的 minDepthRatio(0.15)：真正的
                                   // 拋物線手勢一定會讓手離開這個半徑，不會誤放開正在使用的手
@@ -73,32 +54,25 @@ const HAND_STILL_MS = 700;       // 連續待在半徑內這麼久才放開鎖�
 
 const FRAME_ERROR_THRESHOLD = 90; // 連續幾幀處理失敗才判定為持續性錯誤並顯示錯誤畫面（約 1.5~3 秒）
 
-// 誰匹配誰、新面孔何時鎖定空位——純邏輯在 tracking.js。
-// let 而非 const：槽位數要跟系統控制 bar 的「現場人數」走（applyPoseCount 會用新的 maxUsers 重建）。
+// 誰匹配誰、新面孔何時鎖定空位的純邏輯在 tracking.js。let 而非 const：槽位數要跟「現場人數」走（applyPoseCount 會用新的 maxUsers 重建）。
 let tracker = new PersonTracker({ maxUsers: CONFIG.maxUsers });
 
-// 手勢：每個鎖定槽位左右手各一個 ArcDetector（拋物線手勢 → 換音符的觸發；不輸出音量）。
-// 每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號」＋「這一幀真的在場的槽位」，經 setPerformanceStateListener
-// 註冊的回呼送出去。目前沒有人註冊（觸發來源是鍵盤，見 keyboard.js）；接回時由 main.js 在觸發序號變動時
-// 呼叫 midiPlayer.triggerSlot()。這裡只送離散的觸發序號。
+// 手勢：每個鎖定槽位左右手各一個 ArcDetector（拋物線手勢 → 換音符的觸發；不輸出音量）。每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號」＋「這一幀真的在場的槽位」，
+// 經 setPerformanceStateListener 註冊的回呼送出。目前沒有人註冊（觸發來源是鍵盤）；接回方式見規格文件。
 const MP_LEFT_WRIST = 15, MP_RIGHT_WRIST = 16;
 const MP_LEFT_ELBOW = 13, MP_RIGHT_ELBOW = 14;
 const MP_LEFT_SHOULDER = 11, MP_RIGHT_SHOULDER = 12;
-// 手掌點（拇指／食指／小指）：跟手腕平均起來當「手掌＋手腕合併」的單一座標，供 ArcDetector
-// 追蹤與骨架繪製的合併大點共用（見 renderSkeletonOverlay()）。
+// 手掌點（拇指／食指／小指）：跟手腕平均起來當「手掌＋手腕合併」的單一座標，ArcDetector 追蹤與骨架繪製的合併大點共用（renderSkeletonOverlay()）。
 const MP_LEFT_HAND = [17, 19, 21], MP_RIGHT_HAND = [18, 20, 22];
 const arcDetectors = Array.from({ length: CONFIG.maxUsers },
   () => ({ left: new ArcDetector(), right: new ArcDetector() }));
-// 合成雙手 ArcDetector 時需要「上一幀各手的 triggerSeq」才能判斷有沒有新觸發（見
-// combineArcTriggers()）；ArcDetector 本身的 triggerSeq 是累加值，不是「這一幀有沒有觸發」的旗標。
+// 合成雙手結果時需要「上一幀各手的 triggerSeq」判斷有沒有新觸發（combineArcTriggers()）：ArcDetector 的 triggerSeq 是累加值，不是「這一幀有沒有觸發」的旗標。
 const arcLastSeqBySlot = Array.from({ length: CONFIG.maxUsers },
   () => ({
     left: 0, right: 0, combinedSeq: 0, lockedHand: null, lastTriggerMs: undefined,
     stillAnchor: null, stillSinceMs: undefined,
   }));
-// 注意：combinedSeq 刻意不在這裡歸零。接收端靠它「有沒有變」判斷有沒有新觸發，
-// 歸零會讓下一次比對誤判成一次新事件、平白多彈一個音（實測發現：走出鏡頭超過 SLOT_RELEASE_MS、
-// 按重置骨架 ID、改現場人數都會呼叫到這裡）。combinedSeq 單調遞增、永不重置。
+// 注意：combinedSeq 刻意不在這裡歸零。接收端靠它「有沒有變」判斷有沒有新觸發，歸零會讓下一次比對誤判成新事件、平白多彈一個音（實測：走出鏡頭超過 SLOT_RELEASE_MS、按重置骨架 ID、改現場人數都會呼叫到這裡）；它單調遞增、永不重置。
 const resetSlotDetectors = (arcSlot, lastSeq) => {
   arcSlot.left.reset(); arcSlot.right.reset();
   lastSeq.left = 0; lastSeq.right = 0;
@@ -112,9 +86,7 @@ const resetAllSlotDetectors = () => {
   }
 };
 const EMPTY_PERFORMANCE_STATE = { arcTriggerSeqBySlot: {}, presentSlots: [] };
-// 槽位這一幀沒有 active track 時的「不在場起算時刻」（0 ＝在場）。連續不在場超過
-// SLOT_RELEASE_MS 才把偵測器整個 reset；在那之前只餵 null 讓強度平滑衰減，
-// 避免追蹤閃斷一兩幀就讓那一路整段靜音。
+// 槽位這一幀沒有 active track 時的「不在場起算時刻」（0＝在場）。連續不在場超過 SLOT_RELEASE_MS 才把偵測器整個 reset；在那之前只餵 null 讓追蹤中斷，避免追蹤閃斷一兩幀就丟掉進行中的動作。
 const slotInactiveSinceMs = new Array(CONFIG.maxUsers).fill(0);
 const SLOT_RELEASE_MS = 1000;
 
@@ -130,17 +102,15 @@ function performanceStatesDiffer(a, b) {
   for (let i = 0; i < a.presentSlots.length; i++) {
     if (a.presentSlots[i] !== b.presentSlots[i]) return true;
   }
-  // triggerSeq 是離散事件的累加計數：任何變動都代表「有新的拋物線谷底」，一定要送，
-  // 不能只在超過門檻時才送。
+  // triggerSeq 是離散事件的累加計數：任何變動都代表「有新的拋物線谷底」，一定要送，不能只在超過門檻時才送。
   for (let id = 1; id <= CONFIG.maxUsers; id++) {
     if ((a.arcTriggerSeqBySlot[id] || 0) !== (b.arcTriggerSeqBySlot[id] || 0)) return true;
   }
   return false;
 }
 
-// 只在 arcTriggerSeqBySlot 有意義變化時才送，免得每幀都打一次——但再久也一定會送一次（心跳），
-// 因為「沒有變化」跟「沒有訊號」是兩件事。有了心跳，「還有沒有訊號」只由這裡決定，接收端的看門狗才是字面意思：
-// 真的沒有幀在跑（分頁切走、迴圈停掉）。
+// 只在 arcTriggerSeqBySlot 有意義變化時才送，免得每幀都打一次——但再久也一定會送一次（心跳），因為「沒有變化」跟「沒有訊號」是兩件事。
+// 有了心跳，接收端的斷訊看門狗才是字面意思：真的沒有幀在跑（分頁切走、迴圈停掉）。
 function emitGesturePerformanceState(state, nowMs) {
   const heartbeatDue = nowMs - lastEmitMs >= EMIT_HEARTBEAT_MS;
   if (!heartbeatDue && !performanceStatesDiffer(state, lastSentState)) return;
@@ -152,30 +122,23 @@ function emitGesturePerformanceState(state, nowMs) {
   }
 }
 
-/* ═══════════════════════════════════════════
-   🎞️ 播放環境能力偵測
-   ═══════════════════════════════════════════ */
+// ── 播放環境能力偵測 ──
 // requestVideoFrameCallback 能精準對齊視訊幀（新幀到達才觸發，比 rAF 輪詢更省電更準時）；
 // scheduleNextFrame() 依此決定排程 API：支援則用 rVFC，否則降級為 requestAnimationFrame。
 const useRVFC = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
 
-/* ═══════════════════════════════════════════
-   🖥️ DOM 參照
-   ═══════════════════════════════════════════ */
+// ── DOM 參照 ──
 const video = document.getElementById("webcam");
 const glCanvas = document.getElementById("gl-canvas");
 const overlayCanvas = document.getElementById("overlay-canvas");
 const ctx2d = overlayCanvas.getContext("2d");
 
-// 載入畫面的狀態文字與錯誤畫面都不在這裡畫：由 startVision({ onStatus, onError }) 的回呼交給
-// src/ui.js（遮罩的唯一擁有者）。
+// 載入畫面的狀態文字與錯誤畫面不在這裡畫：由 startVision({ onStatus, onError }) 的回呼交給 src/ui.js（遮罩的唯一擁有者）。
 let onStatus = null;
 let onError = null;
 const stageHint = document.getElementById("stage-hint"); // 舞台中央的提示（攝影機關閉／還沒選現場人數）
 
-/* ═══════════════════════════════════════════
-   🧠 狀態
-   ═══════════════════════════════════════════ */
+// ── 狀態 ──
 let poseLandmarker = null;
 let gl = null;      // WebGL context
 let glTexture = null;      // video texture
@@ -185,17 +148,12 @@ let lastProcessedVideoTime = -1; // 上一次真的送去推論的 video.current
 let visionFileset = null; // FilesetResolver 的結果，換人數重建 landmarker 時重用，不必重新載入 WASM
 let currentPoseCount = 0; // 目前使用中的 landmarker 的 numPoses；0 ＝ 還沒建過任何一份
 let chosenPoseCount = 0;  // 系統控制 bar 選的「現場人數」；0 ＝ 還沒選 ＝ 不推論
-// 唯一一個「在飛」的建置：{ numPoses, promise }。同一個 numPoses 重複要求共用同一顆
-// promise；換成別的 numPoses 時舊的直接作廢（MediaPipe 沒有取消 API，只能在它 resolve 時
-// close 掉，見 requestLandmarker()）。取代 landmarkerPool／poolGeneration／
-// latestRequestedPoseCount：只有一份在飛，用物件識別（pendingBuild !== build）就完全取代
-// 世代號。
+// 唯一一個「在飛」的建置：{ numPoses, promise }。同一個 numPoses 重複要求共用同一顆 promise；換成別的 numPoses 時舊的作廢（MediaPipe 沒有取消 API，只能在它 resolve 時 close 掉，見 requestLandmarker()）。
+// 只有一份在飛，用物件識別（pendingBuild !== build）判斷是否被取代。
 let pendingBuild = null;
 
 // ── 幀迴圈 ──
-// frameHandle：已排程的下一幀代號（rVFC 與 rAF 的 id 都 ≥ 1，0 ＝ 沒有排程中的回呼）。
-// isLoopStopped：迴圈停止中（攝影機關閉、致命錯誤）；已排隊的回呼另外真的取消掉（見 stopFrameLoop），
-// 旗標只是第二道防線。
+// frameHandle：已排程的下一幀代號（rVFC 與 rAF 的 id 都 ≥ 1，0＝沒有排程中的回呼）。isLoopStopped：迴圈停止中（攝影機關閉、致命錯誤）；已排隊的回呼另外真的取消掉（stopFrameLoop），旗標只是第二道防線。
 let frameHandle = 0;
 let isLoopStopped = true;
 
@@ -206,9 +164,7 @@ let cameraOffReason = "";         // 關閉時舞台提示的文字；"" ＝ 使
 let cameraOp = Promise.resolve(); // start／stop／ended 序列化用的 promise 鏈
 let cameraStateListener = null;
 
-/* ═══════════════════════════════════════════
-   🎨 WebGL 初始化
-   ═══════════════════════════════════════════ */
+// ── WebGL 初始化 ──
 const VERT_SRC = `
   attribute vec2 a_position;
   attribute vec2 a_texCoord;
@@ -300,8 +256,7 @@ function initWebGL() {
   gl.uniform1i(gl.getUniformLocation(glProgram, "u_sampler"), 0);
 }
 
-// GPU driver 重置／分頁長時間背景化可能造成 WebGL context 遺失。不 preventDefault() 瀏覽器就
-// 不會嘗試恢復；恢復後重新執行 initWebGL() 重建 shader／texture／buffer。
+// GPU driver 重置／分頁長時間背景化可能造成 WebGL context 遺失；不 preventDefault() 瀏覽器就不會嘗試恢復，恢復後重新 initWebGL() 重建 shader／texture／buffer。
 glCanvas.addEventListener("webglcontextlost", (e) => {
   e.preventDefault();
   console.warn("⚠️ WebGL context 遺失，等待瀏覽器恢復…");
@@ -310,8 +265,7 @@ glCanvas.addEventListener("webglcontextrestored", () => {
   try { initWebGL(); } catch (err) { showError("WebGL 恢復失敗", String(err)); }
 });
 
-// 畫布尺寸跟著實際視訊尺寸走；#canvas-container 滿版、子 canvas 是 object-fit:cover，
-// 裁切由 CSS 自動生效，不需要 JS 介入。
+// 畫布尺寸跟著實際視訊尺寸走；#canvas-container 滿版、子 canvas 是 object-fit:cover，裁切由 CSS 處理，不需要 JS 介入。
 function syncCanvasSize() {
   const vw = video.videoWidth || CONFIG.width;
   const vh = video.videoHeight || CONFIG.height;
@@ -334,8 +288,7 @@ function renderVideoGL() {
 
 function isFacePoint(i) { return i >= 0 && i <= 10; }
 
-// 手腕＋手掌（拇指／食指／小指）平均起來的合併座標——ArcDetector 追蹤與骨架繪製的合併大點
-// 共用同一個計算（見 renderSkeletonOverlay()）。手腕本身不可見就視為這隻手不在畫面。
+// 手腕＋手掌（拇指／食指／小指）平均起來的合併座標，ArcDetector 追蹤與骨架繪製的大點共用（renderSkeletonOverlay()）。手腕本身不可見就視為這隻手不在畫面。
 function mergedHandPoint(sm, wristIdx, handIdxs) {
   const wrist = sm[wristIdx];
   if (!wrist.visible) return null;
@@ -364,9 +317,7 @@ function virtualChinPoint(lm, shoulderWidth) {
   };
 }
 
-// 把一個在場槽位的骨架餵給它那對 ArcDetector（拋物線手勢 → 換音符觸發）。回傳的
-// leftVisible／rightVisible／leftPoint／rightPoint／shoulderWidth 供 combineArcTriggers()
-// 判斷鎖定的手是否該放開（可見度、靜止偵測都要用到實際座標）。
+// 把一個在場槽位的骨架餵給它那對 ArcDetector；回傳的可見度、座標與肩寬供 combineArcTriggers() 判斷鎖定的手是否該放開（可見度、靜止偵測都要用到實際座標）。
 function updateSlotArc(arcDet, track, nowMs) {
   const sm = track.smoothed;
   const ls = sm[MP_LEFT_SHOULDER], rs = sm[MP_RIGHT_SHOULDER];
@@ -382,12 +333,9 @@ function updateSlotArc(arcDet, track, nowMs) {
   };
 }
 
-// 合成雙手的 ArcDetector 結果，並套用「自動鎖定慣用手」：哪隻手先做出有效拋物線就鎖定它，
-// 之後只認那隻手的觸發——避免另一隻閒置手被模型猜出來後在畫面上飄移、湊出假拋物線造成誤觸發
-// （實測發現的問題）。鎖定的手連續不可見、連續 HAND_LOCK_RELEASE_MS 沒有新觸發（保險絲）、
-// 或連續 HAND_STILL_MS 幾乎沒在動（主要機制，見上方常數註解），才放開讓使用者換手。
-// combinedSeq 是槽位自己的累加計數，供接收端判斷「有沒有新事件」。state
-// 就是 arcLastSeqBySlot[slot]，逐幀被這個函式直接改動（歸位見 resetSlotDetectors）。
+// 合成雙手的 ArcDetector 結果，並套用「自動鎖定慣用手」：哪隻手先做出有效拋物線就鎖定它，之後只認那隻手的觸發——避免另一隻閒置手被模型猜出來後在畫面上飄移、湊出假拋物線造成誤觸發（實測發現）。
+// 鎖定的手連續不可見、連續 HAND_LOCK_RELEASE_MS 沒有新觸發（保險絲）、或連續 HAND_STILL_MS 幾乎沒在動（主要機制，見常數註解）才放開讓使用者換手。
+// combinedSeq 是槽位自己的累加計數，供接收端判斷「有沒有新事件」；state 就是 arcLastSeqBySlot[slot]，逐幀被這個函式直接改動（歸位見 resetSlotDetectors）。
 function combineArcTriggers(state, arc, nowMs) {
   const { left, right, leftVisible, rightVisible, leftPoint, rightPoint, shoulderWidth } = arc;
 
@@ -430,22 +378,17 @@ function combineArcTriggers(state, arc, nowMs) {
   return { triggerSeq: state.combinedSeq || 0 };
 }
 
-// 精簡骨架只畫手勢相關的手臂鏈（肩-肘-手掌大點）＋臉部簡化輪廓，不畫 PoseLandmarker.POSE_CONNECTIONS
-// 全身連線（髖／膝／踝／腳掌都不畫，這些點沒有被任何手勢或播放邏輯讀取）。
-// 只到肘為止：肘→手掌大點那一段要連到合併後的座標（見 renderSkeletonOverlay()），不是原始
-// 手腕點，兩者位置不同，用索引表連不出正確的線（會跟畫出來的大點之間留一截空隙）。
+// 精簡骨架只畫手勢相關的手臂鏈（肩-肘-手掌大點）＋臉部簡化輪廓，不畫全身連線（髖／膝／踝／腳掌沒有被任何手勢或播放邏輯讀取）。
+// 只到肘為止：肘→手掌大點那一段要連到合併後的座標，不是原始手腕點，兩者位置不同，用索引表連不出正確的線（會跟大點之間留一截空隙）。
 const ARM_CONNECTIONS = [
   { start: MP_LEFT_SHOULDER, end: MP_LEFT_ELBOW },
   { start: MP_RIGHT_SHOULDER, end: MP_RIGHT_ELBOW },
 ];
-// 臉部只標關鍵五官：雙眼（2/5）、鼻子（0）各畫一個獨立節點、不連線；嘴巴兩節點（9/10）
-// 加上下方的虛擬下巴節點（virtualChinPoint()）連成一個倒三角形。
+// 臉部只標關鍵五官：雙眼（2/5）、鼻子（0）各畫一個獨立節點、不連線；嘴巴兩節點（9/10）加上虛擬下巴節點（virtualChinPoint()）連成倒三角形。
 const MOUTH_PAIR = [9, 10];
 const HAND_DOT_RADIUS = JOINT_RADIUS * 2.2; // 手腕＋手掌合併後的大點，比一般關節明顯
 
-/* ═══════════════════════════════════════════
-   🖊️ 2D 覆蓋層繪製骨架（依鎖定槽位上色，同一人跨幀顏色不變）
-   ═══════════════════════════════════════════ */
+// ── 2D 覆蓋層繪製骨架（依鎖定槽位上色，同一人跨幀顏色不變）──
 function renderSkeletonOverlay(activeTracks) {
   const W = overlayCanvas.width;
   const H = overlayCanvas.height;
@@ -460,20 +403,16 @@ function renderSkeletonOverlay(activeTracks) {
   for (const track of activeTracks) {
     const color = POSE_COLORS[track.slot % POSE_COLORS.length];
 
-    // 低可見度（遮擋/猜測）的關節不繪製。visible 由 tracking.js 算好（可見度先 EMA 平滑、
-    // 再套遲滯門檻），這裡不自己比門檻，否則邊緣關節會逐幀閃爍。
-    // 骨架累積成 Path2D 後一次畫完，不用 DrawingUtils 逐條逐點畫。
+    // 低可見度（遮擋/猜測）的關節不繪製。visible 由 tracking.js 算好（可見度先 EMA 平滑、再套遲滯門檻），這裡不自己比門檻，否則邊緣關節會逐幀閃爍。骨架累積成 Path2D 後一次畫完，不用 DrawingUtils 逐條逐點畫。
     const lm = track.smoothed;
     const ls = lm[MP_LEFT_SHOULDER], rs = lm[MP_RIGHT_SHOULDER];
     const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
 
-    // 只畫目前鎖定的那隻手（未鎖定時兩隻都畫，讓使用者看得到還沒決定）：另一隻閒置手在畫面上
-    // 消失，使用者才看得出系統現在認哪隻手（見 combineArcTriggers() 的自動鎖定慣用手邏輯）。
+    // 只畫目前鎖定的那隻手（未鎖定時兩隻都畫）：另一隻閒置手消失，使用者才看得出系統現在認哪隻手（combineArcTriggers() 的自動鎖定慣用手）。
     const lockedHand = arcLastSeqBySlot[track.slot]?.lockedHand;
     const showLeftHand = lockedHand !== "right";
     const showRightHand = lockedHand !== "left";
-    // 手腕＋手掌合併點要先算出來：畫肘→手掌那一段連線、跟畫手掌大點都要用同一個座標，
-    // 兩處對不齊就會看起來中間有空隙。
+    // 手腕＋手掌合併點要先算出來：肘→手掌那段連線與手掌大點都要用同一個座標，兩處對不齊就會看起來中間有空隙。
     const leftHand = showLeftHand ? mergedHandPoint(lm, MP_LEFT_WRIST, MP_LEFT_HAND) : null;
     const rightHand = showRightHand ? mergedHandPoint(lm, MP_RIGHT_WRIST, MP_RIGHT_HAND) : null;
     const neck = virtualNeckPoint(lm);
@@ -512,9 +451,7 @@ function renderSkeletonOverlay(activeTracks) {
     ctx2d.lineWidth = BONE_WIDTH;
     ctx2d.stroke(bones);
 
-    // 關節點：肩／肘／脖子／下巴正常大小；雙眼與鼻子各畫一個獨立節點、不連線；手腕與手掌
-    // （拇指/食指/小指）合併畫成一個較大的點，跟 updateSlotArc() 的 mergedHandPoint() 用
-    // 同一套合併邏輯，畫面跟手勢追蹤的點位一致。
+    // 關節點：肩／肘／脖子／下巴正常大小；雙眼與鼻子各畫一個獨立節點、不連線；手腕與手掌合併畫成一個較大的點（與 updateSlotArc() 的 mergedHandPoint() 同一套合併邏輯，畫面跟手勢追蹤的點位一致）。
     const joints = new Path2D();
     const addJoint = (x, y, radius) => {
       // arc 從角度 0（圓的右端）起筆，先 moveTo 過去，否則會從上一個圓拉一條線過來
@@ -575,15 +512,12 @@ function renderSkeletonOverlay(activeTracks) {
   ctx2d.restore();
 }
 
-/* ═══════════════════════════════════════════
-   🎬 核心幀處理
-   ═══════════════════════════════════════════ */
+// ── 核心幀處理 ──
 function processFrame() {
   frameHandle = 0;           // 這一次回呼已經觸發，沒有排程中的了（startFrameLoop 據此決定要不要排新的）
   if (isLoopStopped) return; // 已停止：連已排隊的回呼也一併作廢（取消失敗時的第二道防線）
 
-  // rAF 降級路徑：rAF 跟著螢幕更新率跑（常見 60Hz），攝影機多半只有 30fps，不比對的話同一張
-  // 視訊幀會被送進 MediaPipe 推論兩次。rVFC 路徑只在新幀到達時才觸發，不需要這道檢查。
+  // rAF 降級路徑：rAF 跟著螢幕更新率（常見 60Hz）跑，攝影機多半只有 30fps，不比對的話同一張視訊幀會被送進 MediaPipe 兩次；rVFC 路徑只在新幀到達時觸發，不需要這道檢查。
   if (!useRVFC) {
     if (video.currentTime === lastProcessedVideoTime) {
       scheduleNextFrame();
@@ -592,34 +526,28 @@ function processFrame() {
     lastProcessedVideoTime = video.currentTime;
   }
 
-  // 單一幀處理過程中的任何例外都不該讓整條追蹤迴圈永久卡死：吞下例外、跳過這一幀，下一幀
-  // 繼續嘗試；只有連續失敗超過 FRAME_ERROR_THRESHOLD 幀才真的顯示錯誤畫面並停止。
+  // 單一幀的任何例外都不該讓整條追蹤迴圈永久卡死：吞下例外、跳過這一幀，下一幀繼續；連續失敗超過 FRAME_ERROR_THRESHOLD 幀才顯示錯誤畫面並停止。
   try {
     syncCanvasSize();
 
     const nowMs = performance.now();
 
-    // ▶ MediaPipe 偵測（上限 currentPoseCount）。還沒選「現場人數」（chosenPoseCount 0）就不推論；
-    //   模型切換中（poseLandmarker 為 null）也一樣。其餘管線照跑：tracker.update([]) 讓舊 track
-    //   自然過期、心跳照送 presentSlots: []、攝影機畫面照畫（畫面不會凍結）。
+    // ▶ MediaPipe 偵測（上限 currentPoseCount）。還沒選「現場人數」（chosenPoseCount 0）或模型切換中（poseLandmarker 為 null）就不推論；其餘管線照跑：
+    //   tracker.update([]) 讓舊 track 自然過期、心跳照送 presentSlots: []、攝影機畫面照畫（不凍結）。
     const rawPoses = (poseLandmarker && chosenPoseCount)
       ? (poseLandmarker.detectForVideo(video, nowMs)?.landmarks ?? [])
       : [];
 
-    // ▶ 依位置將偵測結果匹配到已鎖定的槽位（並平滑）——實際演算法見 tracking.js，純粹依螢幕
-    // 位置判斷、不使用服裝顏色。buildDetection 對座標異常／不像人的偵測回傳 null 先濾掉；
-    // 同一具身體的重複偵測由 tracker.update() 自己挑該留哪一筆。
+    // ▶ 依位置將偵測結果匹配到已鎖定的槽位（並平滑），演算法見 tracking.js。buildDetection 對座標異常／不像人的偵測回傳 null 先濾掉；同一具身體的重複偵測由 tracker.update() 自己挑該留哪一筆。
     const detections = rawPoses.map((lm) => buildDetection(lm)).filter(Boolean);
 
     tracker.update(detections, nowMs);
     const activeTracks = tracker.getActiveTracks();
 
-    // ▶ 手勢：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector（拋物線換音符觸發），
-    //   另外回報這一幀真的在場的槽位。
+    // ▶ 手勢：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector，另外回報這一幀真的在場的槽位。
     const arcTriggerSeqBySlot = {};
     const presentSlots = [];
-    // 先把 active track 攤成「槽位 → track」的查表。上限是追蹤器目前的槽位數（＝設定的現場人數）：
-    // 追蹤器只有 2 個槽位時，送出去的 map 不該還帶 3、4 這種永遠是空的 key。
+    // 先把 active track 攤成「槽位 → track」的查表；上限是追蹤器目前的槽位數（＝現場人數），追蹤器只有 2 個槽位時送出去的 map 不該還帶永遠是空的 3、4
     const slotCount = tracker.cfg.maxUsers;
     const trackBySlot = new Array(slotCount).fill(null);
     for (const t of activeTracks) trackBySlot[t.slot] = t;
@@ -633,8 +561,7 @@ function processFrame() {
         presentSlots.push(slot + 1);
         arc = updateSlotArc(arcDet, track, nowMs);
       } else {
-        // 不在場：釋放窗內兩隻手都餵「看不到」讓拋物線追蹤中斷；連續不在場超過
-        // SLOT_RELEASE_MS 才真的 reset（清掉狀態，下次鎖進來從乾淨開始）。
+        // 不在場：釋放窗內兩隻手都餵「看不到」讓拋物線追蹤中斷；連續不在場超過 SLOT_RELEASE_MS 才真的 reset（下次鎖進來從乾淨開始）。
         if (slotInactiveSinceMs[slot] === 0) slotInactiveSinceMs[slot] = nowMs;
         if (nowMs - slotInactiveSinceMs[slot] > SLOT_RELEASE_MS) {
           resetSlotDetectors(arcDet, arcLastSeqBySlot[slot]);
@@ -698,18 +625,13 @@ function startFrameLoop() {
   if (!frameHandle) scheduleNextFrame();
 }
 
-/* ═══════════════════════════════════════════
-   🧰 工具函式
-   ═══════════════════════════════════════════ */
+// ── 工具函式 ──
 function setStatus(msg) { onStatus?.(msg); }
 
 function showError(title, detail = "") { onError?.(title, detail); }
 
-/* ═══════════════════════════════════════════
-   📷 攝影機開啟／關閉（畫質／幀率封頂、可停可開）
-   ═══════════════════════════════════════════ */
-// getUserMedia 失敗時給使用者看的文字。開機失敗的錯誤畫面（initSystem）與執行期重開失敗的
-// 舞台提示／系統控制 bar 狀態列（startCamera）共用同一張表。
+// ── 攝影機開啟／關閉（畫質／幀率封頂、可停可開）──
+// getUserMedia 失敗時給使用者看的文字：開機失敗的錯誤畫面（initSystem）與執行期重開失敗的舞台提示／狀態列（startCamera）共用。
 const CAMERA_ERROR_MESSAGES = {
   NotAllowedError: ["鏡頭權限被拒絕", "請在瀏覽器設定中允許本頁面使用鏡頭。"],
   NotFoundError: ["找不到鏡頭", "請確認裝置已連接鏡頭。"],
@@ -722,8 +644,7 @@ function cameraErrorText(err, fallbackTitle = "鏡頭開啟失敗") {
   return CAMERA_ERROR_MESSAGES[err?.name] || [fallbackTitle, err?.message || String(err)];
 }
 
-// track.stop() 之後裝置在瀏覽器程序裡是非同步釋放的（Firefox／Windows 尤其明顯），緊接著重開
-// 會拿到 NotReadableError／AbortError；要等真實時間。只重試一次。
+// track.stop() 之後裝置在瀏覽器程序裡非同步釋放（Firefox／Windows 尤其明顯），緊接著重開會拿到 NotReadableError／AbortError，要等真實時間；只重試一次。
 const CAMERA_REOPEN_RETRY_MS = 400;
 async function openCamera() {
   try {
@@ -737,8 +658,7 @@ async function openCamera() {
 }
 
 async function requestCameraStream() {
-  // width／height／frameRate 三項都給「上限」（max）而非只給偏好：ideal 只是偏好，瀏覽器有權
-  // 直接給 1080p60。ideal 仍一併給，讓它在多個合法模式中優先挑最接近我們想要的那個。
+  // width／height／frameRate 都給「上限」（max）而非只給偏好：ideal 只是偏好，瀏覽器有權直接給 1080p60；ideal 仍一併給，讓它在多個合法模式中優先挑最接近的。
   const constraints = {
     width: { ideal: CONFIG.width, max: CONFIG.width },
     height: { ideal: CONFIG.height, max: CONFIG.height },
@@ -762,8 +682,7 @@ async function requestCameraStream() {
     });
   }
 
-  // 約束只是「請求」，不同瀏覽器／驅動的套用程度不一：實際協商到的規格若明顯超出設定上限
-  // （推論負擔會提高）才需要提醒，一切正常時不印。
+  // 約束只是「請求」，不同瀏覽器／驅動套用程度不一：實際協商到的規格明顯超出上限（推論負擔會提高）才提醒，一切正常時不印。
   const settings = stream.getVideoTracks()[0]?.getSettings() ?? {};
   if (settings.width > CONFIG.width || settings.height > CONFIG.height ||
       settings.frameRate > CONFIG.frameRate + 1) {
@@ -778,9 +697,7 @@ async function attachCamera() {
   cameraStream = stream;
   video.srcObject = stream;
 
-  // 執行期攝影機中斷（USB 被拔除、被其他應用程式搶走、驅動重置）會讓 track 觸發 ended，
-  // 視為「鏡頭已關閉」：舞台提示＋系統控制 bar 的按鈕變成「開啟鏡頭」，按一下就重連。
-  // 自己呼叫 track.stop() 依規格不會觸發 ended，但仍用串流身分擋掉舊串流遲來的事件。
+  // 執行期攝影機中斷（USB 被拔、被其他應用程式搶走、驅動重置）會讓 track 觸發 ended，視為「鏡頭已關閉」：舞台提示＋按鈕變「開啟鏡頭」，按一下即重連。自己呼叫 track.stop() 依規格不會觸發 ended，但仍用串流身分擋掉舊串流遲來的事件。
   stream.getVideoTracks()[0]?.addEventListener("ended", () => onCameraEnded(stream));
 
   await video.play();
@@ -791,16 +708,14 @@ async function attachCamera() {
   syncCanvasSize();
 }
 
-// 收掉攝影機（按鈕關閉、ended、開啟失敗的收尾共用）。reason 是舞台提示要顯示的文字
-// （"" ＝ 使用者主動關閉，顯示預設的「鏡頭已關閉」）。
+// 收掉攝影機（按鈕關閉、ended、開啟失敗的收尾共用）。reason 是舞台提示要顯示的文字（""＝使用者主動關閉，顯示預設的「鏡頭已關閉」）。
 // 不呼叫 tracker.hardReset()：既有槽位維持原狀，重開後空著的槽位才會被新偵測到的人取用。
 function detachCamera(reason) {
   stopFrameLoop();
   cameraStream?.getTracks().forEach((t) => t.stop());
   cameraStream = null;
   video.srcObject = null;
-  // srcObject 為 null 時 <video> 依規格「什麼都不呈現」；Firefox 有「最後一幀黏住」的回報，
-  // 多加一個 class 讓 CSS 把它藏起來當保險（visibility，不是 display:none——之後還要靠這個元素跑 rVFC）。
+  // srcObject 為 null 時 <video> 依規格什麼都不呈現；Firefox 有「最後一幀黏住」的回報，多加 class 讓 CSS 藏起來當保險（用 visibility 不是 display:none——之後還要靠這個元素跑 rVFC）
   video.classList.add("is-off");
   cameraOffReason = reason;
   try { gl?.clear(gl.COLOR_BUFFER_BIT); } catch (e) { /* context 可能正在遺失 */ }
@@ -811,8 +726,7 @@ function detachCamera(reason) {
   emitGesturePerformanceState(EMPTY_PERFORMANCE_STATE, performance.now());
 }
 
-// start／stop／ended 一律排進同一條 promise 鏈依序執行：<video> 的 srcObject 在 play() 尚未
-// resolve 時被換掉會讓 play() 以 AbortError reject；按鈕的 disabled 擋不住 ended 事件。
+// start／stop／ended 一律排進同一條 promise 鏈依序執行：<video> 的 srcObject 在 play() 尚未 resolve 時被換掉會讓 play() 以 AbortError reject；按鈕的 disabled 擋不住 ended 事件。
 function enqueueCameraOp(op) {
   const run = cameraOp.then(op, op);
   cameraOp = run.catch(() => {});
@@ -837,8 +751,7 @@ function onCameraEnded(stream) {
   });
 }
 
-// 舞台中央的提示（#stage-hint）唯一的擁有者：攝影機關閉（含中斷／開啟失敗）優先，其次是
-// 「還沒選現場人數」；兩者都不成立就藏起來。JS 只切 hidden 屬性＋寫 textContent（文字沒變就不寫）。
+// 舞台中央提示（#stage-hint）的唯一擁有者：攝影機關閉（含中斷／開啟失敗）優先，其次是「還沒選現場人數」，兩者都不成立就藏起來。JS 只切 hidden＋寫 textContent（文字沒變不寫）。
 const HINT_CAMERA_OFF = "鏡頭已關閉";
 const HINT_CHOOSE_COUNT = "請在上方選擇現場人數後開始偵測";
 function refreshStageHint() {
@@ -850,18 +763,14 @@ function refreshStageHint() {
   stageHint.hidden = !text;
 }
 
-/* ═══════════════════════════════════════════
-   🧠 Pose 模型載入（單一實例，懶惰載入）
-   ═══════════════════════════════════════════ */
+// ── Pose 模型載入（單一實例，懶惰載入）──
 // 純粹建置，不動任何模組層狀態。
 async function loadPoseModel(numPoses) {
   for (;;) {
     const idx = poseModelIndex;
     try {
       return await PoseLandmarker.createFromOptions(visionFileset, {
-        // 不設 baseOptions.canvas：GPU delegate 官方文件說「GPU 處理時要綁」，但那是指把畫面
-        // 交給 MediaPipe 用 GPU texture 處理的情境；我們只吃 landmark 座標，畫面渲染是自己另外
-        // 管理的 WebGL context（見檔案開頭），兩邊搶同一個 canvas 反而會衝突，所以刻意不設。
+        // 不設 baseOptions.canvas：GPU delegate 官方文件說處理 GPU 時要綁，但那是把畫面交給 MediaPipe 用 GPU texture 處理的情境；我們只吃 landmark 座標，畫面渲染是另外管理的 WebGL context，兩邊搶同一個 canvas 反而衝突。
         baseOptions: { modelAssetPath: POSE_MODEL_URLS[idx], delegate: "GPU" },
         runningMode: "VIDEO",
         numPoses,
@@ -881,15 +790,10 @@ async function loadPoseModel(numPoses) {
   }
 }
 
-// 唯一的建置入口。回傳：建好的 landmarker，或 null ＝「等待期間被更新的請求取代，這次不算
-// 數」（不是錯誤，呼叫端不該顯示錯誤訊息）。
-// 合併：同一個 numPoses 在飛時直接共用同一顆 promise，不會建第二份。
-// 取代：不同 numPoses 進來時，舊的那個建置沒有人「要」了——但 MediaPipe 沒有取消 API，
-// 底層的 loadPoseModel() 仍會實際跑完，只是結果一出來就發現自己已經被取代、直接 close 丟棄；
-// 這代表使用者連續改變心意時（例如 2→3 選了之後 debounce 才剛觸發建置，建置中途又選 4），
-// 短暫幾秒內可能有兩個 loadPoseModel() 的 WASM／GPU 建置真的同時在跑——不是嚴格意義上的
-// 「同時只有一個 in-flight」，只是同一時間只有一個結果會被採用，另一個一建好就丟棄。這個
-// 重疊窗口短暫且會自我修正，跟拿掉常駐 4 份實例池的目標（降低穩定狀態的記憶體用量）不衝突。
+// 唯一的建置入口。回傳建好的 landmarker，或 null＝「等待期間被更新的請求取代，這次不算數」（不是錯誤，呼叫端不該顯示錯誤訊息）。
+// 合併：同一個 numPoses 在飛時共用同一顆 promise，不會建第二份。取代：不同 numPoses 進來時舊的建置沒有人「要」了，但 MediaPipe 沒有取消 API，底層 loadPoseModel() 仍會跑完，
+// 結果一出來發現被取代就直接 close 丟棄。所以使用者連續改變心意時（如 2→3 之後建置中途又選 4），短暫幾秒內可能有兩個 WASM／GPU 建置同時在跑——只是同一時間只有一個結果會被採用；
+// 這個重疊窗口短暫且會自我修正，跟拿掉常駐 4 份實例池（降低穩定狀態記憶體）的目標不衝突。
 function requestLandmarker(numPoses) {
   if (pendingBuild && pendingBuild.numPoses === numPoses) {
     return pendingBuild.promise;
@@ -911,18 +815,14 @@ function requestLandmarker(numPoses) {
   return build.promise;
 }
 
-// 舊的在飛建置換人要了：清掉參照（它 resolve 時會自己走「已被取代」分支 close 掉），
-// 額外掛一個 catch 吞掉可能的 rejection 當防禦——目前設計下應該總有呼叫端在 await 它、
-// 不會真的變成 unhandled rejection，這裡純粹是多一層保險，不影響原呼叫端自己的錯誤處理。
+// 舊的在飛建置沒人要了：清掉參照（它 resolve 時會走「已被取代」分支 close 掉）。額外掛 catch 吞掉可能的 rejection 純粹是多一層保險：目前設計下總有呼叫端在 await 它，不影響原呼叫端的錯誤處理。
 function abandonPendingBuild() {
   const build = pendingBuild;
   pendingBuild = null;
   build?.promise.catch(() => {});
 }
 
-/* ═══════════════════════════════════════════
-   🚀 初始化流程
-   ═══════════════════════════════════════════ */
+// ── 初始化流程 ──
 async function initSystem() {
   try {
     setStatus("正在初始化 WebGL 渲染引擎⋯");
@@ -933,9 +833,7 @@ async function initSystem() {
       "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/wasm"
     );
 
-    // Pose landmarker 完全懶惰載入，開機不建：chosenPoseCount 這時候是 0，使用者選人數之前
-    // processFrame() 本來就不推論，開機搶建一份可以證明完全沒被用過，只會白白拖慢開機、
-    // 多養一份常駐記憶體。真正共用的固定成本（WASM runtime）已經在上一步載入完成。
+    // Pose landmarker 完全懶惰載入，開機不建：選人數之前 processFrame() 本來就不推論，開機搶建一份只會白白拖慢開機、多養一份常駐記憶體；真正共用的固定成本（WASM runtime）已在上一步載入完成。
 
     setStatus("正在啟動鏡頭⋯");
     // 開機走的就是系統控制 bar 「開啟鏡頭」同一條路，只是失敗時這裡仍視為致命（error overlay）。
@@ -952,9 +850,7 @@ async function initSystem() {
   }
 }
 
-/* ═══════════════════════════════════════════
-   🔌 外部 API 與快捷鍵
-   ═══════════════════════════════════════════ */
+// ── 外部 API ──
 // 重置骨架 ID：釋放所有已鎖定的槽位、候選名單與身分記憶，讓下一幀重新鎖定
 export function hardReset() {
   tracker.hardReset();
@@ -964,15 +860,12 @@ export function hardReset() {
   ctx2d.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 }
 
-// 註冊「手勢演奏狀態」的監聽者（main.js 把它接到播放器的 setGesturePerformanceState）。
-// 每次回呼收到 { arcTriggerSeqBySlot: {1..maxUsers → 拋物線觸發的累加計數，變動代表有新的
-// 一次有效拋物線}, presentSlots: [在場的 ID] }。
+// 註冊「手勢演奏狀態」的監聽者；每次回呼收到 { arcTriggerSeqBySlot: {1..maxUsers → 拋物線觸發的累加計數，變動代表有新的一次有效拋物線}, presentSlots: [在場的 ID] }。目前沒有人註冊，接回方式見規格文件。
 export function setPerformanceStateListener(fn) {
   performanceStateListener = typeof fn === "function" ? fn : null;
 }
 
-// 「現場人數」確定之後的監聽者（main.js 把它接到播放器的 setPlayerCount：分譜的「指派演奏者」
-// 下拉跟著列到 n）。跟 setCameraStateListener 同一種寫法。
+// 「現場人數」確定之後的監聽者（main.js 接到播放器的 setPlayerCount，分譜的「指派演奏者」下拉跟著列到 n）。寫法同 setCameraStateListener。
 let poseCountListener = null;
 export function setPoseCountListener(fn) {
   poseCountListener = typeof fn === "function" ? fn : null;
@@ -984,9 +877,7 @@ export function getPoseCount() {
   return chosenPoseCount;
 }
 
-// 系統控制 bar 「現場人數」：懶惰建置對應人數的 landmarker，建好才換手並武裝偵測——等待期間
-// （第一次選人數、或這個人數還沒建過時，約 1~2 秒）畫面用舊的那份（若有）繼續正常推論，
-// 不會凍結；成功不特別提示，失敗才由 src/ui.js 顯示在系統控制 bar 的錯誤訊息裡。
+// 系統控制 bar 「現場人數」：懶惰建置對應人數的 landmarker，建好才換手並武裝偵測——等待期間（第一次選人數或這個人數還沒建過時約 1~2 秒）畫面用舊的那份（若有）繼續推論不凍結；成功不特別提示，失敗才由 src/ui.js 顯示在系統控制 bar。
 export async function setPoseCount(count) {
   if (!Number.isInteger(count) || count < 1 || count > CONFIG.maxUsers) {
     throw new Error(`現場人數必須是 1~${CONFIG.maxUsers} 的整數：${count}`);
@@ -1007,8 +898,7 @@ export async function setPoseCount(count) {
   return true;
 }
 
-// 人數確定之後：武裝偵測、追蹤層的槽位數（＝ ID 上限）跟著人數走。換槽位數要重建
-// PersonTracker，效果等於「重置骨架 ID」。人數沒變就只是武裝偵測。
+// 人數確定之後：武裝偵測，追蹤層的槽位數（＝ ID 上限）跟著人數走。換槽位數要重建 PersonTracker，效果等於「重置骨架 ID」；人數沒變就只是武裝偵測。
 function applyPoseCount(count) {
   chosenPoseCount = count;
   if (tracker.cfg.maxUsers !== count) {
@@ -1025,11 +915,8 @@ function applyPoseCount(count) {
   }
 }
 
-/* ═══════════════════════════════════════════
-   📷 攝影機開關（系統控制 bar 的按鈕；開機也走同一條路）
-   ═══════════════════════════════════════════ */
-// 監聽者收到 { on, busy, message }：on ＝ 攝影機開著、busy ＝ 開啟／關閉進行中（按鈕該 disabled）、
-// message ＝ 關閉的原因或開啟失敗的文字（"" ＝ 使用者自己關的）。ui.js 用它畫按鈕與狀態列。
+// ── 攝影機開關（系統控制 bar 的按鈕；開機也走同一條路）──
+// getCameraState() 回傳 { on, busy, message }：on＝攝影機開著、busy＝開啟／關閉進行中（按鈕該 disabled）、message＝關閉的原因或開啟失敗的文字（""＝使用者自己關的）。ui.js 用它畫按鈕與狀態列。
 export function getCameraState() {
   return {
     on: cameraState === "on",
@@ -1042,8 +929,7 @@ export function setCameraStateListener(fn) {
   cameraStateListener = typeof fn === "function" ? fn : null;
 }
 
-// 開啟攝影機（已開著就直接返回）。失敗時把 srcObject 等收乾淨、把原因留在 message 再拋出——
-// attachCamera 可能已經把串流接上才失敗（play() 被拒），不能留半套狀態。
+// 開啟攝影機（已開著就直接返回）。失敗時把 srcObject 等收乾淨、把原因留在 message 再拋出：attachCamera 可能已把串流接上才失敗（play() 被拒），不能留半套狀態。
 export function startCamera() {
   return enqueueCameraOp(async () => {
     if (cameraState === "on") return;
@@ -1072,9 +958,7 @@ export function stopCamera() {
   });
 }
 
-/* ═══════════════════════════════════════════
-   🧹 資源清理
-   ═══════════════════════════════════════════ */
+// ── 資源清理 ──
 window.addEventListener("beforeunload", () => {
   stopFrameLoop();
   cameraStream?.getTracks().forEach((t) => t.stop());
@@ -1091,13 +975,9 @@ window.addEventListener("beforeunload", () => {
   }
 });
 
-/* ═══════════════════════════════════════════
-   ▶️ 啟動（必須由呼叫端明確呼叫）
-   ═══════════════════════════════════════════ */
-// 啟動攝影機與姿勢偵測。由 main.js 明確呼叫 startVision()，不靠模組頂層的 import 副作用啟動
-// （那樣「攝影機會不會開」會取決於有沒有人 import 到這個檔案，搬動 import 就默默黑畫面）。
-// 回傳 promise，resolve 值為是否初始化成功（失敗時已經經由 onError 回呼顯示錯誤畫面）。
-// 重複呼叫安全：一律回傳同一個 promise，不會啟動第二次。
+// ── 啟動（必須由呼叫端明確呼叫）──
+// 啟動攝影機與姿勢偵測。由 main.js 明確呼叫 startVision()，不靠模組頂層的 import 副作用（那樣「攝影機會不會開」會取決於有沒有人 import 到這個檔案，搬動 import 就默默黑畫面）。
+// 回傳 promise，resolve 值為是否初始化成功（失敗時已經經由 onError 回呼顯示錯誤畫面）。重複呼叫安全：一律回傳同一個 promise，不會啟動第二次。
 let startPromise = null;
 export function startVision({ onStatus: statusFn, onError: errorFn } = {}) {
   if (!startPromise) {

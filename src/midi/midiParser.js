@@ -1,45 +1,37 @@
-// ============================================================
-//  midiParser.js — Standard MIDI File 解析的對外入口（純邏輯，無 DOM／CDN 依賴）
-//
-//  典型用法：
-//    const parsed = parseMidi(await file.arrayBuffer());
-//    parsed.parts   // → 這份總譜有哪些聲部（MuseScore 的一個樂器＝一個 part，底下是 staff＝譜表 × channel）
-//    parsed.segments // → 全曲的垂直切片（同一個 startTick 的所有音）：scheduler.js 一次觸發放行一個 segment
-//    parsed.notes   // → scheduler.js 連同 parts 建立 staff（音符依 staffId 分給各 staff）
-//
-//  本模組不碰 Blob／DOM／AudioContext——包成 Blob 是呼叫端的事。
-//
-//  分層（每一層只依賴下面的層；呼叫端一律只 import 這個檔）：
-//    smf.js           讀檔層：位元組 → 檔頭與每軌原始事件；寫回（encodeMidi）
-//    timeline.js      時間層：速度表、tick ↔ 秒、拍號／調號、port 偏移、小節與拍格線
-//    gmNames.js       名稱表：GM 繁中音色名、鼓組名、音名
-//    instruments.js   樂器層：聲部切分（part／staff）、音符配對、控制器軌、系統軌、文字軌
-//    scoreQueries.js  衍生層：segments、控制器狀態查詢與 chase 序列
-//  本檔：parseMidi()（依序呼叫各層）、解析結果的型別說明（JSDoc typedef），並轉出各層對外的名稱。
-// ============================================================
+// midiParser.js — Standard MIDI File 解析的對外入口（純邏輯，無 DOM／CDN）；呼叫端一律只 import 這個檔。
+// 用法：const parsed = parseMidi(await file.arrayBuffer())。parsed.parts＝聲部（MuseScore 一個樂器＝一個 part，底下是 staff＝譜表 × channel）；
+// parsed.segments＝全曲垂直切片（scheduler.js 一次觸發放行一個）；parsed.notes＝連同 parts 建立 staff。包成 Blob 是呼叫端的事。
+// 分層（每層只依賴下面的層）：midiFile.js 讀檔層（位元組 → 檔頭與每軌原始事件）→ timeline.js 時間層（速度表、tick ↔ 秒、拍號／調號、port 偏移、小節與拍格線）
+// → parts.js（名稱表、聲部切分、音符配對、控制器軌／系統軌／文字軌、控制器狀態查詢與 chase 序列）。
+// 本檔：parseMidi() 依序呼叫各層、解析結果的 JSDoc typedef，並轉出各層對外的名稱。
 
-import { makeWarn, readSmf, findLastVoiceEventTick } from './smf.js';
+import { makeWarn, readSmf, findLastVoiceEventTick } from './midiFile.js';
 import { buildTempoMap, makeMidiTicksToSeconds, makeSecondsToMIDITicks, buildTimeSignatures, buildKeySignatures, buildPortOffsets } from './timeline.js';
-import { buildProgramResolver, collectPartsAndNotes, collectChannelLanes, collectSystemEvents, collectTextEvents } from './instruments.js';
-import { buildSegments } from './scoreQueries.js';
+import { buildProgramResolver, collectPartsAndNotes, collectChannelLanes, collectSystemEvents, collectTextEvents } from './parts.js';
 
-export { META, MidiParseError, encodeMidi } from './smf.js';
-export { gmProgramNameZh, midiNoteName } from './gmNames.js';
+export { META, MidiParseError } from './midiFile.js';
+export { gmProgramNameZh, midiNoteName, ChannelStateTracker, controllerStateAt, chaseEventsAt, byFileOrder } from './parts.js';
 export { buildMeasureGrid, buildBeatGrid } from './timeline.js';
-export { buildSegments, ChannelStateTracker, controllerStateAt, chaseEventsAt } from './scoreQueries.js';
-export { byFileOrder } from './instruments.js';
 
-/* ═══════════════════════════════════════════
-   資料模型的型別（JSDoc typedef）
-   ─────────────────────────────────────────
-   手寫一份而不用 ReturnType<typeof parseMidi>：TypeScript 把 .js 檔裡的物件字面量當「開放的」，
-   推導型別讀到不存在的屬性不會報錯；要抓錯字就得有一份「封閉」的宣告。改了 smf.js 的 parseTrack、
-   instruments.js 的 makeNote／collectPartsAndNotes 的欄位時同步改這裡。其他模組用 import('./midiParser.js').ParsedMidi 取得。
-   ═══════════════════════════════════════════ */
+// 全曲的垂直切片（名稱借自 MuseScore 的 Segment）：notes 已依 startTick 排序，相同 startTick 的音一定相鄰，線性掃描 O(n) 即可。
+// 排程器一次放行一個 segment，全曲所有聲部在同一次呼叫內一起起音，上下對齊由結構保證，不靠時間比對。
+export function buildSegments(notes) {
+  const segments = [];
+  for (const note of notes) {
+    const last = segments[segments.length - 1];
+    if (last && last.ticks === note.startTick) last.notes.push(note);
+    else segments.push({ ticks: note.startTick, notes: [note] });
+  }
+  return segments;
+}
+
+// ── 資料模型的型別（JSDoc typedef）──
+// 手寫一份而不用 ReturnType<typeof parseMidi>：TypeScript 把 .js 的物件字面量當「開放的」，讀到不存在的屬性不會報錯，要抓錯字就得有「封閉」的宣告。
+// 改了 midiFile.js 的 parseTrack、parts.js 的 makeNote／collectPartsAndNotes 的欄位時同步改這裡。其他模組用 import('./midiParser.js').ParsedMidi 取得。
 
 /**
  * channel voice message（note-on／off、CC、program change、pitch bend…）。
- * data1／data2 的意義依 type 而定，見檔頭 CHANNEL_DATA_BYTES 旁的對照表。
+ * data1／data2 的意義依 type 而定，見 midiFile.js 的 CHANNEL_DATA_BYTES 旁的對照表。
  * @typedef {object} MidiChannelEvent
  * @property {number} ticks * @property {'channel'} kind
  * @property {'noteOff'|'noteOn'|'polyAftertouch'|'controlChange'|'programChange'|'channelAftertouch'|'pitchBend'} type
@@ -147,7 +139,7 @@ export { byFileOrder } from './instruments.js';
 
 /**
  * 一個聲部（part）＝ MuseScore 的一個樂器，可指派的單位；底下有一個以上的 staff（鋼琴兩行譜是兩個 staff）。
- * 切分規則見 instruments.js 的「聲部切分」說明。
+ * 切分規則見 parts.js 的「聲部切分」說明。
  * @typedef {object} MidiPart
  * @property {string} id  p{首軌的 track 序號}
  * @property {string} name  GM 繁中音色名（取主 staff 的音色；同名依序加序號）
@@ -173,7 +165,7 @@ export { byFileOrder } from './instruments.js';
  */
 
 /**
- * 某個 tick 之前一個 channel 的控制器狀態（scoreQueries.js 的 controllerStateAt()）。null＝檔案還沒設過（接收端的預設值）。
+ * 某個 tick 之前一個 channel 的控制器狀態（parts.js 的 controllerStateAt()）。null＝檔案還沒設過（接收端的預設值）。
  * @typedef {object} ControllerState
  * @property {(number|null)[]} cc  每個控制器編號最後的值（原始資料；CC121 重設過的是預設值）；120～127 是 channel mode 訊息，不在這裡
  * @property {number|null} program
@@ -251,7 +243,7 @@ export function parseMidi(input) {
   const midiTicksToSeconds = makeMidiTicksToSeconds(tempoMap, division);
   const timeSignatures = buildTimeSignatures(tracks);
   const keySignatures = buildKeySignatures(tracks);
-  // program 依時間軸查詢（沒有初始化區塊的 staff 用），見 instruments.js 的 buildProgramResolver()。
+  // program 依時間軸查詢（沒有初始化區塊的 staff 用），見 parts.js 的 buildProgramResolver()。
   const programResolver = buildProgramResolver(tracks);
   const { parts, notes } = collectPartsAndNotes(tracks, midiTicksToSeconds, warn, programResolver);
   const durationTicks = tracks.reduce((max, t) => Math.max(max, t.endTick), 0);

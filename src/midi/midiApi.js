@@ -1,10 +1,5 @@
-// ============================================================
-//  midiApi.js — 遠端 MIDI 曲庫 client（分類／搜尋／下載），純資料層、無 DOM
-//
-//  所有請求都有逾時保護；曲庫 API 回傳的每一筆都當成可能是壞的（型別檢查後跳過）。
-//  這裡的逾時涵蓋「連線 ＋ 整個 body 下載」（MIDI 檔只有幾 KB）。大檔（音色庫、姿勢模型）不用逾時：
-//  慢不等於壞，只有真的出錯才換來源（見 synth.js 的 SOUNDFONT_URLS、vision.js 的 POSE_MODEL_URLS）。
-// ============================================================
+// midiApi.js — 遠端 MIDI 曲庫 client（分類／搜尋／下載），純資料層、無 DOM。
+// 這裡的逾時涵蓋「連線＋整個 body 下載」（MIDI 檔只有幾 KB）。大檔（音色庫、姿勢模型）不設逾時：慢不等於壞，只有真的出錯才換來源。
 
 const MIDI_LIBRARY_API = "https://imuse.ncnu.edu.tw/Midi-library/api";
 const FETCH_TIMEOUT_MS = 12000;
@@ -37,8 +32,7 @@ export async function downloadMidiFile(id) {
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
-    // 開發者要拿這個連結把曲庫的 MIDI 下載下來、用 MuseScore 開啟檢查：CLAUDE.md「console 只在
-    // 真的出問題時輸出」規則允許的兩個確認性 log 之一（另一個是現場人數切換成功）。
+    // 讓開發者能拿連結把曲庫 MIDI 下載下來用 MuseScore 開啟檢查（根目錄 CLAUDE.md 允許的 console.log 例外之一）
     console.log(`[雲端下載] ID: ${id} | URL: ${downloadUrl}`);
     const response = await fetch(downloadUrl, { signal: controller.signal });
     if (!response.ok) throw new Error("下載失敗：" + response.status);
@@ -82,8 +76,7 @@ function normalizeCategories(payload) {
     }).filter(Boolean);
 }
 
-// 遠端曲庫是控制不了的第三方來源：回傳陣列裡混進一個 null、或某個 category 不是字串，
-// 都不該讓整個搜尋顯示「API 讀取失敗」。
+// 遠端曲庫是第三方來源：陣列混進 null 或 category 不是字串，都不該讓整個搜尋顯示「API 讀取失敗」
 function extractItemCategories(item) {
   if (!item || typeof item !== "object") return [];
   const categories = [];
@@ -113,8 +106,7 @@ export async function fetchCategories() {
   return [];
 }
 
-// 搜尋：回傳 { items, categories }。items 只留有 id 的（缺 id 的異常項目跳過）；categories 是這批
-// items 分類的聯集，呼叫端累積進自己的分類集合。
+// 搜尋：回傳 { items, categories }；items 只留有 id 的，categories 是這批 items 分類的聯集，呼叫端累積進自己的分類集合
 export async function searchSongs({ query, category }) {
   const payload = await fetchJson(buildSearchUrl({ query, category }));
   const raw = Array.isArray(payload?.items) ? payload.items : [];
