@@ -13,8 +13,9 @@ export const MAX_PLAYBACK_RATE = 64;
 export const PRESS_PERIOD_MIN_S = 0.06;
 export const PRESS_PERIOD_MAX_S = 30;
 
-// 近距起音分組的門檻：一個輸入來源連按兩下最短隔多久（秒），更近的起音放行時併成一組（scheduler.js）。鍵盤＝PRESS_PERIOD_MIN_S；手勢接回時量測後再加，其他來源先用鍵盤的值。
-const MIN_PRESS_INTERVAL_S = { keyboard: PRESS_PERIOD_MIN_S };
+// 近距起音分組的門檻：一個輸入來源連按兩下最短隔多久（秒），更近的起音放行時併成一組（scheduler.js）。鍵盤＝PRESS_PERIOD_MIN_S；
+// 手勢＝0.3 是猜的暫定值（約每秒 3 下是手臂能持續揮的上限），沒有量測依據，待實機量測連續兩次有效揮手的最短間隔後再定；其他來源先用鍵盤的值。
+const MIN_PRESS_INTERVAL_S = { keyboard: PRESS_PERIOD_MIN_S, gesture: 0.3 };
 export const minPressIntervalSec = (source) => MIN_PRESS_INTERVAL_S[source] ?? PRESS_PERIOD_MIN_S;
 
 // 去抖窗口＝預估這一步真實長度的 60%（取自同事 SmartEnsemble），夾在 [50, 500]ms：下限比它的 150ms 低，125ms 的十六分音符才彈得出來；
