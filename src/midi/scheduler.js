@@ -565,7 +565,7 @@ export class Scheduler {
 
   /**
    * 觸發一次：放行這個槽位所屬群組的下一個 driver segment，裡面的音在這次呼叫內立刻 noteOn，同時啟動它負責的那一段 follower。
-   * trigger(輸入事件)（鍵盤，keyboard.js）與 trigger(槽位, 時刻)（日後的手勢、測試）走同一條路徑；發聲與錨點用程式收到的時刻，事件發生的時刻（eventTimeMs）只記在按鍵事件與按鍵記錄裡。
+   * trigger(輸入事件)（鍵盤 keyboard.js、揮手 gestureTrigger.js）與 trigger(槽位, 時刻)（測試）走同一條路徑；發聲與錨點用程式收到的時刻，事件發生的時刻（eventTimeMs）只記在按鍵事件與按鍵記錄裡。
    * @param {number|string|{ slot: number|string, source: string|null, eventTimeMs: number|null, receivedMs: number }} input
    *   演奏者槽位（要有指派聲部才有資格），或輸入事件：source＝來源（'keyboard'…）、eventTimeMs＝事件發生的時刻（鍵盤的
    *   event.timeStamp，跟 performance.now() 同一個時間原點）、receivedMs＝程式收到的時刻（performance.now()）

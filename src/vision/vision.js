@@ -1,4 +1,4 @@
-// vision.js — 攝影機、WebGL 視訊與骨架繪製、姿勢模型生命週期；逐幀呼叫追蹤（tracking.js）與手勢（gesture.js），送出手勢狀態（目前沒有接收者，見規格文件）
+// vision.js — 攝影機、WebGL 視訊與骨架繪製、姿勢模型生命週期；逐幀呼叫追蹤（tracking.js）與手勢（gesture.js），送出手勢狀態（main.js 註冊 input/gestureTrigger.js 接收）
 
 // 版本固定 1.1.0：bundle、loader JS、.wasm 三個檔必須同一版。不用 @latest：jsDelivr 邊緣節點曾同時回傳不同版本的 loader JS 與 .wasm
 // （2026-10-07 實測），載入時 assignWasmExports 讀到 undefined 而失敗。升級時下面兩個網址（import 與 forVisionTasks）一起改。
@@ -54,7 +54,7 @@ const FRAME_ERROR_THRESHOLD = 90; // 連續幾幀處理失敗才判定為持續�
 let tracker = new PersonTracker({ maxUsers: CONFIG.maxUsers });
 
 // 手勢（gesture.js 的 updateGestures()）：每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號」＋「這一幀真的在場的槽位」，
-// 經 setPerformanceStateListener 註冊的回呼送出。目前沒有人註冊（觸發來源是鍵盤）；接回方式見規格文件。
+// 經 setPerformanceStateListener 註冊的回呼送出。main.js 註冊 input/gestureTrigger.js 的監聽，揮手與鍵盤並存。
 const EMPTY_PERFORMANCE_STATE = { arcTriggerSeqBySlot: {}, presentSlots: [] };
 
 let performanceStateListener = null;
@@ -703,7 +703,7 @@ export function hardReset() {
   ctx2d.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 }
 
-// 註冊「手勢演奏狀態」的監聽者；每次回呼收到 { arcTriggerSeqBySlot: {1..maxUsers → 拋物線觸發的累加計數，變動代表有新的一次有效拋物線}, presentSlots: [在場的 ID] }。目前沒有人註冊，接回方式見規格文件。
+// 註冊「手勢演奏狀態」的監聽者；每次回呼收到 { arcTriggerSeqBySlot: {1..maxUsers → 拋物線觸發的累加計數，變動代表有新的一次有效拋物線}, presentSlots: [在場的 ID] }。main.js 註冊的是 input/gestureTrigger.js 的監聽。
 export function setPerformanceStateListener(fn) {
   performanceStateListener = typeof fn === "function" ? fn : null;
 }

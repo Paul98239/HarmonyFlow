@@ -26,7 +26,7 @@ function formatTime(sec) {
 const PLAYER_COUNT = 4;      // 可指派的演奏者 ID 數上限（對齊 vision.js 的 CONFIG.maxUsers）；
                              // 實際列幾個由系統控制 bar 的「現場人數」決定（見 setPlayerCount）
 
-// 排程 tick 週期（scheduler.js 的播放頭推進與到期收音的驅動頻率；有指派時起音不經過它，見 triggerSlot）。
+// 排程 tick 週期（scheduler.js 的播放頭推進與到期收音的驅動頻率；有指派時起音不經過它，見 triggerInput）。
 const SCHEDULER_TICK_MS = 12;
 // 播完偵測／humanGate 補算的 UI tick 週期。
 const UI_TICK_MS = 200;
@@ -117,7 +117,7 @@ const updateHumanGate = () => {
   synth.setHumanGate(armed);
 };
 
-// 觸發一次（main.js 把鍵盤接到這裡）：輸入事件（keyboard.js 的 { slot, source, eventTimeMs, receivedMs }）放行這個槽位的下一個 segment。
+// 觸發一次（main.js 把鍵盤與揮手接到這裡）：輸入事件（keyboard.js、gestureTrigger.js 的 { slot, source, eventTimeMs, receivedMs }）放行這個槽位的下一個 segment。
 // 同步呼叫排程器，這個 segment 的所有音在這次呼叫內就送進合成器（不經計時器）。試聽中、暫停中、還沒載入時排程器沒在播放，trigger() 自己會忽略。
 export function triggerInput(input) {
   synth.scheduler.trigger(input);
@@ -126,11 +126,6 @@ export function triggerInput(input) {
 // 放開一個鍵（main.js 把鍵盤的 keyup 接到這裡）：輸入事件帶 key（keyboard.js 的 { slot, source, key, eventTimeMs, receivedMs }），收掉登記這個鍵的你的音（keyup 模式，見 scheduler.js 的 lift()）。
 export function liftInput(input) {
   synth.scheduler.lift(input);
-}
-
-// 用槽位觸發一次（日後手勢接回時的入口：觸發序號變動時呼叫）。沒有來源與事件發生的時刻，時刻取現在。
-export function triggerSlot(slot) {
-  synth.scheduler.trigger(slot, performance.now());
 }
 
 // 量測（main.js 的 window.__stats 用）：電腦音比排好的時刻晚多少，見 scheduler.js 的 lateStats()。

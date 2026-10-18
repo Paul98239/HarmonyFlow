@@ -2,8 +2,9 @@
 
 import * as midiPlayer from './midi/midiPlayer.js';
 import { initUi, setLoadingStatus, dismissLoading, showError } from './ui.js';
-import { startVision, setPoseCountListener, warmPoseModel } from './vision/vision.js';
+import { startVision, setPoseCountListener, setPerformanceStateListener, warmPoseModel } from './vision/vision.js';
 import { startKeyboardTrigger, getInputDelays } from './input/keyboard.js';
+import { createGestureTrigger } from './input/gestureTrigger.js';
 import { summarizeMs } from './midi/tempo.js';
 
 // __stats() 只量 JS 層，音訊段由「音訊輸出」補上，「估計按下到出聲ms」把整條路串起來。
@@ -37,8 +38,9 @@ async function bootSystem() {
     midiPlayer.warmUpMidiEngine(),
   ]);
 
-  // 觸發來源目前是鍵盤；手勢接回見規格文件「手勢輸出目前沒有接收者」
+  // 觸發來源：鍵盤（槽位 'kb'）與揮手（槽位 1~4＝演奏者 ID）並存，都進同一個入口 triggerInput
   startKeyboardTrigger(midiPlayer.triggerInput, midiPlayer.KEYBOARD_SLOT, midiPlayer.liftInput);
+  setPerformanceStateListener(createGestureTrigger(midiPlayer.triggerInput));
 
   // 視覺初始化失敗時錯誤畫面已經顯示，載入畫面不收、inert 也維持
   if (!visionOk) return;

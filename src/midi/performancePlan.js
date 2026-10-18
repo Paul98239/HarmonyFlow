@@ -1,6 +1,6 @@
 // performancePlan.js — 演奏計畫：樂譜＋指派 → 譜表（staff：發聲與輸出 channel 的單位）、driver 群組、總音數與 hold 容差上限。載入、改指派時重建，之後不變；
 // 游標、錨點、電腦音佇列這些執行期狀態在 scheduler.js 的群組狀態。一個 MuseScore 樂器是一個 part，底下有一個以上 staff（鋼琴兩行譜＝兩個）；指派以 part 為單位，發聲與輸出 channel 以 staff 為單位。
-// 現在永遠只有一個群組；多群組時 follower 跟誰、群組怎麼對時屬於多人分工規則，等手勢接回再定。
+// 現在永遠只有一個群組；多群組時 follower 跟誰、群組怎麼對時屬於多人分工規則，尚未決定（手勢已接回，多人目前共用這一個群組）。
 // 控制器屬於輸入 channel（parser 的 channelLanes），扇出到所有來源是該 channel 的譜表（lanes）；播放中途的控制器跟 follower 音一樣依 driver 起音切段。
 
 import { rateBoundsFor } from './tempo.js';

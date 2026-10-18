@@ -1,6 +1,6 @@
 # HarmonyFlow
 
-瀏覽器端的 MIDI 演奏應用：觸發來源（目前是電腦鍵盤文字鍵（四排字元鍵＋空白鍵）＝分譜下拉的「PC 鍵盤手」，攝影機 → MediaPipe 姿勢追蹤＋拋物線手勢暫時沒有接進播放器）每觸發一次，就放行你的聲部的下一個起音，音在按下的當下立刻發聲；一個演奏者可以同時控制多個聲部。沒被你控制的聲部由電腦輔助、不用按，跟著你的位置與速度走（依你最近的按鍵估速度），與你的起音同一個 tick 的電腦音跟你的音同刻發聲；音長依你的速度等比例縮放（結尾接著或橫跨你下一個起音的音會 loop 到你按下去；你早按時電腦聲部不會往前跳）。任何一首歌（含單聲部）都能指派，播放中改指派會從目前位置接續。另有「試聽」鈕，用官方 SpessaSynth Sequencer 播同一份 MIDI 讓你用耳朵對照。純原生 JavaScript（ES module），沒有 build step、沒有後端、沒有 Node 工具鏈。
+瀏覽器端的 MIDI 演奏應用：觸發來源（電腦鍵盤文字鍵（四排字元鍵＋空白鍵）＝分譜下拉的「PC 鍵盤手」；攝影機 → MediaPipe 姿勢追蹤＋拋物線揮手＝「演奏者 1～4」，兩者並存）每觸發一次，就放行你的聲部的下一個起音，音在觸發的當下立刻發聲；一個演奏者可以同時控制多個聲部。沒被你控制的聲部由電腦輔助、不用按，跟著你的位置與速度走（依你最近的按鍵估速度），與你的起音同一個 tick 的電腦音跟你的音同刻發聲；音長依你的速度等比例縮放（結尾接著或橫跨你下一個起音的音會 loop 到你按下去；你早按時電腦聲部不會往前跳）。任何一首歌（含單聲部）都能指派，播放中改指派會從目前位置接續。另有「試聽」鈕，用官方 SpessaSynth Sequencer 播同一份 MIDI 讓你用耳朵對照。純原生 JavaScript（ES module），沒有 build step、沒有後端、沒有 Node 工具鏈。
 
 ## 需求
 
@@ -16,11 +16,12 @@ clone 下來直接用 VS Code 的 Live Server（ritwickdey.liveserver）開：�
 ```
 index.html        唯一進入點；完整的靜態 UI markup 都在這裡（HTML-first），preload／modulepreload 也在這裡
 src/
-  main.js         組裝（composition root）：initUi(midiPlayer)、接 vision → 播放器的人數監聽與鍵盤 → 播放器的觸發、並行推進兩條啟動軌道；開發用 __stats／__pressLog
+  main.js         組裝（composition root）：initUi(midiPlayer)、接 vision → 播放器的人數監聽與鍵盤、揮手 → 播放器的觸發、並行推進兩條啟動軌道；開發用 __stats／__pressLog
   ui.js           UI 外殼：Store（EventTarget 狀態容器）＋ rafThrottle、uiStore、載入／錯誤遮罩＋inert、--ui-fs、
                   系統控制列、面板開合、事件代理、render 排程
   input/          觸發來源（日後併入的肢體動作 js 也放這裡）
     keyboard.js   鍵盤觸發：keydown／keyup → 輸入事件；文字鍵（四排字元鍵＋空白鍵）＝PC 鍵盤手（防呆：按住重複、組合鍵、打字、下拉 type-ahead）
+    gestureTrigger.js  揮手觸發：vision 送來的各槽位拋物線計數變動 → 輸入事件；槽位 1~4＝演奏者 ID，與鍵盤並存
   vision/         攝影機、追蹤、手勢
     vision.js     攝影機、WebGL 視訊與骨架繪製、姿勢模型生命週期；逐幀呼叫追蹤與手勢，送出手勢狀態
     tracking.js   多人槽位追蹤與平滑
