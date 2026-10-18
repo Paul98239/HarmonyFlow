@@ -1,17 +1,14 @@
-// synth.js — spessasynth 合成器：兩個合成器（電腦輔助聲部 synth／真人聲部 synthHuman）、humanGain 閘門＋音量凸顯，加上試聽（官方 Sequencer 的薄包裝 PreviewPlayer）。
-// 不知道「分譜」「指派」是什麼，也不碰 DOM。
-// 演奏不用 Sequencer：兩個合成器只接收 scheduler.js 送來的個別 noteOn／noteOff／初始 program 設定。試聽才用官方 Sequencer（走 synth），
+// synth.js — spessasynth 合成器：兩個合成器（電腦輔助聲部 synth／真人聲部 synthHuman）、humanGain 閘門＋音量凸顯、試聽（官方 Sequencer 的薄包裝 PreviewPlayer）。
+// 演奏不用 Sequencer：兩個合成器只接收 scheduler.js 送來的個別 noteOn／noteOff／初始 program；試聽才用官方 Sequencer（走 synth），
 // 跟演奏互斥（共用 synth 的 channel），任何一邊開始前都先 flushPreviousSong() 把另一邊停掉。
-// 兩軌（bus）：被指派的聲部固定走 synthHuman（velocity 用樂譜原值），沒被指派的走 synth，跟你的聲部在同一個 segment 一起發聲。
-// humanGain 開啟時的目標值 HUMAN_EMPHASIS_GAIN 刻意大於 1.0，讓真人聲部比電腦輔助軌突出；電腦輔助軌不掛額外 gain，是音量對比的基準。
+// 被指派的聲部固定走 synthHuman（velocity 用樂譜原值），沒被指派的走 synth；HUMAN_EMPHASIS_GAIN 刻意大於 1.0 讓真人聲部突出，電腦輔助軌不掛額外 gain，是音量對比的基準。
 
 import { Scheduler, CHANNELS_PER_PORT, DEFAULT_PORTS, portsNeeded } from './scheduler.js';
+import { CC, DRUM_CHANNEL } from './midiParser.js';
 
-// ── 試聽：官方 SpessaSynth Sequencer 的薄包裝 ──
-// 試聽不經過我們的 parser，位元組原樣交給官方 Sequencer 自己解析、自己排程（整個在 AudioWorklet 裡，不走 scheduler.js 的主執行緒 tick），
-// 所以我們的 parser 解析失敗時試聽仍可用，聽感也能拿來跟演奏對照。這裡只做：
-//  1) 等官方非同步載入的結果（songChange／midiError／逾時／被中斷）；2) 播放列需要的最小控制與狀態；3) 關掉官方預設的循環播放。
-// Sequencer 由 initEngine() 注入，所以這裡可以在 Node 用假的測試。
+// 試聽（PreviewPlayer）：位元組原樣交給官方 Sequencer 自己解析、自己排程（整個在 AudioWorklet 裡，不走 scheduler.js 的主執行緒 tick），
+// 所以我們的 parser 解析失敗時試聽仍可用，聽感也能跟演奏對照。這裡只做：等官方非同步載入的結果（songChange／midiError／逾時／被中斷）、
+// 播放列需要的最小控制與狀態、關掉官方預設的循環播放；Sequencer 由 initEngine() 注入。
 
 const LOAD_TIMEOUT_MS = 8000;
 const EVENT_ID = 'harmonyflow-preview';
@@ -105,33 +102,25 @@ export class PreviewPlayer {
   }
 }
 
-// ── 常數 ──
 // 音色庫：CDN 的 2.0.3 為主、本地 2.0.1 為備（依序試，任何一步失敗就換下一個）。CDN 網址釘在 SpessaSynth 官方 repo 的 commit（6f75050），不可變；兩版 preset 清單逐筆相同。
-// 不用逾時當備援條件：GitHub Pages 載 10.6MB 實測要 200 秒以上，慢不等於壞；只有網路錯誤、HTTP 錯誤、下載到一半斷線、檔案壞了載不進合成器才換來源。
+// 不用逾時當備援條件：GitHub Pages 載 10.6MB 實測要 200 秒以上，慢不等於壞。
 const SOUNDFONT_URLS = [
   'https://cdn.jsdelivr.net/gh/spessasus/SpessaSynth@6f75050/soundfonts/GeneralUserGS.sf3',
   './src/assets/GeneralUserGS.sf3',
 ];
 
-// spessasynth_lib 直接從 CDN 匯入（不經 import map）：jsDelivr 的 +esm 端點把 CJS/UMD 轉成瀏覽器能 import 的 ESM。AudioWorklet 處理器跟入口在同一個套件目錄，
-// 直接拼路徑，不用 import.meta.resolve（+esm 不是真實目錄，推不出位置）。版本刻意綁 @latest：不手動維護版本號，代價是 jsDelivr 對 @latest 有快取
-// （瀏覽器端 7 天／邊緣節點 12 小時），版本可能在快取到期後無預警改變；spessasynth_lib 對 spessasynth_core 的相依本來就是 latest，兩層都是刻意浮動。
+// spessasynth_lib 直接從 CDN 匯入（不經 import map）：jsDelivr 的 +esm 端點把 CJS/UMD 轉成瀏覽器能 import 的 ESM；AudioWorklet 處理器跟入口在同一個套件目錄，
+// 直接拼路徑（+esm 不是真實目錄，import.meta.resolve 推不出位置）。版本刻意綁 @latest：不手動維護版本號，代價是 jsDelivr 對 @latest 有快取
+// （瀏覽器端 7 天／邊緣節點 12 小時），版本可能無預警改變；它依賴的 spessasynth_core 本來就是 latest，兩層都是刻意浮動。
 const LIB_ESM_URL = `https://cdn.jsdelivr.net/npm/spessasynth_lib@latest/+esm`;
 const WORKLET_URL = `https://cdn.jsdelivr.net/npm/spessasynth_lib@latest/dist/spessasynth_processor.min.js`;
 
-const CC_BANK_SELECT_MSB = 0;
-const CC_BANK_SELECT_LSB = 32;
-const CC_ALL_SOUND_OFF = 120;
-const CC_RESET_ALL_CONTROLLERS = 121;
-const CC_ALL_NOTES_OFF = 123;
-const DRUM_CHANNEL_OFFSET = 9;
 // WorkletSynthesizer 預設只建 16 個 channel（1 個 port）；聲部數超過時多出來的聲部分不到輸出 channel、整段靜音（國旗歌 24 個旋律聲部實測重現）。
 // 用 addNewChannel() 動態加開：模仿官方 Sequencer，開機先補到 DEFAULT_PORTS 個 port，歌曲需要更多時在 load() 依 portsNeeded() 補，只增不減。
 
 const GATE_RAMP_TC = 0.03;   // humanGain on/off 的 setTargetAtTime 時間常數（防 click）
 const HUMAN_EMPHASIS_GAIN = 1.2; // humanGain 開啟時的目標值；1.4 時真人實測高音太突出、蓋過電腦的低音，所以降到 1.2（約 +1.6 dB）
 
-// ── 引擎狀態 ──
 let audioCtx, synth, masterGain;
 // 真人聲部是獨立的第二個合成器 synthHuman，經 humanGain（總開關，播放器決定開關、這裡只平滑切換）接到同一個 compressor
 let synthHuman, humanGain;
@@ -146,11 +135,9 @@ let lastGateTarget = -1;
 // previewUsed＝官方 Sequencer 動過合成器的狀態，下一次 flushPreviousSong() 要多做一次完整重設。
 let SequencerClass, previewPlayer = null, previewUsed = false;
 
-// 排程器（scheduler.js）：驅動 synth（未指派聲部，跟著指派聲部的位置走）與 synthHuman（指派聲部，觸發才發聲）；
-// 播放器呼叫 trigger()（觸發當下發聲）並用 12ms 排程 tick 呼叫 tick()（輔助聲部與到期收音）。
+// 排程器（scheduler.js）驅動兩個合成器；播放器呼叫 trigger()（觸發當下發聲）並用排程 tick 呼叫 tick()（輔助聲部與到期收音）。
 export const scheduler = new Scheduler();
 
-// ── MIDI 引擎核心 ──
 // 不能讀 s.midiChannels.length 當實際 channel 數：已查證 spessasynth_lib 原始碼（basic_synthesizer.ts），addNewChannel() 在主執行緒本地 push 一筆，
 // worklet 建好 channel 後又經 channelAdded 事件回呼再 push 一次，length 最終多算成兩倍（實測呼叫 48 次後是 112 不是 64）；
 // 對只有 64 個的 worklet 送 channel ≥64 的 controllerChange 會讓它丟 Uncaught TypeError。所以 channel 數只能自己計數（portCount）。
@@ -169,7 +156,7 @@ function ensurePorts(ports) {
   scheduler.setPortCount(portCount);
 }
 function isDrumChannelIndex(ch) {
-  return ch % CHANNELS_PER_PORT === DRUM_CHANNEL_OFFSET;
+  return ch % CHANNELS_PER_PORT === DRUM_CHANNEL;
 }
 
 export async function initEngine() {
@@ -274,11 +261,11 @@ export function flushPreviousSong() {
     for (let ch = 0; ch < channelCountOf(s); ch++) {
       if (isDrumChannelIndex(ch)) continue;
       try {
-        s.controllerChange(ch, CC_BANK_SELECT_MSB, 0);
-        s.controllerChange(ch, CC_BANK_SELECT_LSB, 0);
-        s.controllerChange(ch, CC_ALL_SOUND_OFF, 0);
-        s.controllerChange(ch, CC_RESET_ALL_CONTROLLERS, 0);
-        s.controllerChange(ch, CC_ALL_NOTES_OFF, 0);
+        s.controllerChange(ch, CC.BANK_MSB, 0);
+        s.controllerChange(ch, CC.BANK_LSB, 0);
+        s.controllerChange(ch, CC.ALL_SOUND_OFF, 0);
+        s.controllerChange(ch, CC.RESET_ALL, 0);
+        s.controllerChange(ch, CC.ALL_NOTES_OFF, 0);
       } catch (e) {}
     }
   }
@@ -350,7 +337,6 @@ export function isLoaded() { return isSongLoaded; }
 export function isPaused() { return !isSongLoaded || !scheduler.isPlaying(); }
 export function isFinished() { return isSongLoaded && scheduler.isFinished(); }
 
-// ── 試聽（官方 Sequencer，PreviewPlayer 見上）──
 // 開始試聽：bytes 是 MIDI 原始位元組，官方自己解析、不經 midiParser.js。先清場，載入完成就從第一個音播；
 // 失敗丟帶 kind 的 Error（engine＝引擎沒就緒，其餘見 PreviewPlayer），resolve 時已在播。
 const engineError = (message) => Object.assign(new Error(message), { kind: 'engine' });

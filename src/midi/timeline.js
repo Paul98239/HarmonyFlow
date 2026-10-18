@@ -1,7 +1,6 @@
-// timeline.js — 時間層（純邏輯，無 DOM／CDN）：速度表、tick ↔ 秒（midiTicksToSeconds／secondsToMIDITicks，名稱照官方 BasicMIDI）、
-// 拍號與調號表、port 偏移（絕對 channel）、小節與拍格線。
-// 規格寫進檔案的是格線：division、速度（FF 51）、拍號（FF 58），加起來足以把任何 tick 精確還原成第幾拍、第幾秒，這條鏈是確定性計算。
-// 規格沒寫的是格線上的音樂意義（小節線、弱起、強弱、swing、複拍子律動），只能推導，推導必帶假設：只在明確標示假設的地方做（規格文件假設表的 A 項目）。
+// timeline.js — 時間層：速度表、tick ↔ 秒（midiTicksToSeconds／secondsToMIDITicks，名稱照官方 BasicMIDI）、拍號與調號表、port 偏移（絕對 channel）、小節與拍格線。
+// 規格寫進檔案的是格線（division、FF 51 速度、FF 58 拍號），足以把任何 tick 精確還原成第幾拍、第幾秒；格線上的音樂意義（小節線、弱起、強弱、swing、複拍子律動）
+// 規格沒寫，只能推導，推導必帶假設，只在明確標示假設的地方做（規格文件假設表的 A 項目）。
 
 import { META, makeWarn } from './midiFile.js';
 
@@ -11,8 +10,6 @@ import { META, makeWarn } from './midiFile.js';
 /** @typedef {import('./midiParser.js').ParsedMidi} ParsedMidi */
 
 const DEFAULT_TEMPO_US = 500000; // 規格：沒有 FF51 時視為 120 BPM
-
-// ── 解析：時間軸（速度表／拍號／調號）──
 
 function collectMeta(tracks, type) {
   const list = [];
@@ -140,8 +137,6 @@ export function buildKeySignatures(tracks) {
   );
 }
 
-// ── port 偏移（絕對 channel）──
-
 // 每條 track 的 channel 偏移（絕對 channel＝軌內 channel＋偏移），跟官方 SpessaSynth 一致：沒指定 port（FF21）的 track 用最小的已指定 port（都沒有就 0）；
 // 依軌序（只看有 channel 事件的軌）第一次出現的 port 配偏移 0、16、32…，用的是出現順序而非 port 數值。
 export function buildPortOffsets(tracks) {
@@ -158,7 +153,7 @@ export function buildPortOffsets(tracks) {
   return offsets;
 }
 
-// ── 小節格線（不塞進 parseMidi() 的回傳值：排程器目前不用它，逐音放行只看 startTick）──
+// 小節與拍格線不塞進 parseMidi() 的回傳值：排程器目前不用它，逐音放行只看 startTick。
 
 /**
  * @typedef {{index:number, startTick:number, endTick:number, startSeconds:number,

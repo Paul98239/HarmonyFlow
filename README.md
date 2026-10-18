@@ -16,14 +16,27 @@ clone 下來直接用 VS Code 的 Live Server（ritwickdey.liveserver）開：�
 ```
 index.html        唯一進入點；完整的靜態 UI markup 都在這裡（HTML-first），preload／modulepreload 也在這裡
 src/
-  main.js         啟動點（composition root）：initUi(midiPlayer)、接 vision → 播放器的人數監聽與鍵盤 → 播放器的觸發、並行推進兩條啟動軌道
-  keyboard.js     鍵盤觸發：文字鍵（四排字元鍵＋空白鍵）＝PC 鍵盤手的一次觸發（防呆：按住重複、組合鍵、打字、下拉 type-ahead）
+  main.js         組裝（composition root）：initUi(midiPlayer)、接 vision → 播放器的人數監聽與鍵盤 → 播放器的觸發、並行推進兩條啟動軌道；開發用 __stats／__pressLog
   ui.js           UI 外殼：Store（EventTarget 狀態容器）＋ rafThrottle、uiStore、載入／錯誤遮罩＋inert、--ui-fs、
                   系統控制列、面板開合、事件代理、render 排程
-  vision/         攝影機／WebGL／MediaPipe（vision.js）＋ 純邏輯的多人追蹤（tracking.js）與揮手手勢（gesture.js）
-  midi/           spessasynth 合成器（synth.js）、播放器狀態＋動作＋畫面（midiPlayer.js）、雲端曲庫 client（midiApi.js）
-                  ＋ 純邏輯的 SMF 解析與聲部切分（midiParser.js）、排程器（scheduler.js：每次觸發放行你的聲部的下一個起音並立刻發聲、
-                  按鍵啟動電腦聲部負責的那一段）、按鍵節奏（pressTiming.js：估速、去抖）、試聽（previewPlayer.js：官方 Sequencer 的薄包裝）
+  input/          觸發來源（日後併入的肢體動作 js 也放這裡）
+    keyboard.js   鍵盤觸發：keydown／keyup → 輸入事件；文字鍵（四排字元鍵＋空白鍵）＝PC 鍵盤手（防呆：按住重複、組合鍵、打字、下拉 type-ahead）
+  vision/         攝影機、追蹤、手勢
+    vision.js     攝影機、WebGL 視訊與骨架繪製、姿勢模型生命週期；逐幀呼叫追蹤與手勢，送出手勢狀態
+    tracking.js   多人槽位追蹤與平滑
+    gesture.js    手勢：單手拋物線偵測、雙手合成與慣用手鎖定、各槽位的手勢狀態
+  midi/           MIDI 解析、演奏引擎、播放器
+    midiFile.js   SMF 位元組 → 軌與事件
+    timeline.js   速度表、tick ↔ 秒、拍號調號、小節拍格線
+    parts.js      聲部切分、音符配對、控制器軌、控制器狀態；MIDI 規格常數與表的唯一定義處
+    midiParser.js 解析入口與資料型別（對外唯一出口）
+    performancePlan.js  樂譜＋指派 → 演奏計畫
+    tempo.js      估速、速度區間、去抖
+    voices.js     輸出 channel 分配、OutputRouter、VoiceLedger、hold
+    scheduler.js  排程器（每次觸發放行你的聲部的下一個起音並立刻發聲、按鍵啟動電腦聲部負責的那一段）、對外事件與統計
+    synth.js      spessasynth 合成器、試聽（官方 Sequencer）
+    midiApi.js    雲端曲庫 client
+    midiPlayer.js 播放器狀態＋動作＋畫面（頂端 pill、選歌面板、曲庫）
   styles.css      唯一的樣式檔（@layer base／ui／states）
   assets/         MediaPipe 模型（.task）與 soundfont（.sf3）的本地備用副本（平常走 CDN，CDN 失敗才載這裡），進 git
 ```

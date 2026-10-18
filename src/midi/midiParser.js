@@ -1,9 +1,6 @@
-// midiParser.js — Standard MIDI File 解析的對外入口（純邏輯，無 DOM／CDN）；呼叫端一律只 import 這個檔。
-// 用法：const parsed = parseMidi(await file.arrayBuffer())。parsed.parts＝聲部（MuseScore 一個樂器＝一個 part，底下是 staff＝譜表 × channel）；
-// parsed.segments＝全曲垂直切片（scheduler.js 一次觸發放行一個）；parsed.notes＝連同 parts 建立 staff。包成 Blob 是呼叫端的事。
-// 分層（每層只依賴下面的層）：midiFile.js 讀檔層（位元組 → 檔頭與每軌原始事件）→ timeline.js 時間層（速度表、tick ↔ 秒、拍號／調號、port 偏移、小節與拍格線）
-// → parts.js（名稱表、聲部切分、音符配對、控制器軌／系統軌／文字軌、控制器狀態查詢與 chase 序列）。
-// 本檔：parseMidi() 依序呼叫各層、解析結果的 JSDoc typedef，並轉出各層對外的名稱。
+// midiParser.js — 解析入口與資料型別，對外唯一出口：呼叫端一律只 import 這個檔。parseMidi(await file.arrayBuffer())；
+// parsed.parts＝聲部（MuseScore 一個樂器＝一個 part，底下是 staff＝譜表 × channel），parsed.segments＝全曲垂直切片（scheduler.js 一次觸發放行一個），parsed.notes＝連同 parts 建立 staff。
+// 分層（每層只依賴下面的層）：midiFile.js 讀檔 → timeline.js 時間（速度表、tick ↔ 秒、拍號／調號、port 偏移、格線）→ parts.js（名稱表、聲部切分、音符配對、控制器軌／系統軌／文字軌、控制器狀態與 chase）；本檔依序呼叫各層並轉出它們的名稱。
 
 import { makeWarn, readSmf, findLastVoiceEventTick } from './midiFile.js';
 import { buildTempoMap, makeMidiTicksToSeconds, makeSecondsToMIDITicks, buildTimeSignatures, buildKeySignatures, buildPortOffsets } from './timeline.js';
@@ -11,6 +8,7 @@ import { buildProgramResolver, collectPartsAndNotes, collectChannelLanes, collec
 
 export { META, MidiParseError } from './midiFile.js';
 export { gmProgramNameZh, midiNoteName, ChannelStateTracker, controllerStateAt, chaseEventsAt, byFileOrder } from './parts.js';
+export { CC, DRUM_CHANNEL, BANK_MSB_RHYTHM, BANK_MSB_MELODY, PITCH_BEND_CENTER, RESET_CC, PARAMETER_CC, GM_DEFAULT_MIXER } from './parts.js';
 export { buildMeasureGrid, buildBeatGrid } from './timeline.js';
 
 // 全曲的垂直切片（名稱借自 MuseScore 的 Segment）：notes 已依 startTick 排序，相同 startTick 的音一定相鄰，線性掃描 O(n) 即可。
@@ -25,8 +23,7 @@ export function buildSegments(notes) {
   return segments;
 }
 
-// ── 資料模型的型別（JSDoc typedef）──
-// 手寫一份而不用 ReturnType<typeof parseMidi>：TypeScript 把 .js 的物件字面量當「開放的」，讀到不存在的屬性不會報錯，要抓錯字就得有「封閉」的宣告。
+// 資料模型的型別（JSDoc typedef）：手寫一份而不用 ReturnType<typeof parseMidi>：TypeScript 把 .js 的物件字面量當「開放的」，讀到不存在的屬性不會報錯，要抓錯字就得有「封閉」的宣告。
 // 改了 midiFile.js 的 parseTrack、parts.js 的 makeNote／collectPartsAndNotes 的欄位時同步改這裡。其他模組用 import('./midiParser.js').ParsedMidi 取得。
 
 /**

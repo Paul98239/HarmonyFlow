@@ -1,23 +1,19 @@
-// tempo.js — 按鍵節奏（純邏輯，無 DOM／CDN）：估速（playbackRate＝樂譜秒 ÷ 真實秒，命名同官方 Sequencer）、速度區間、去抖，
-// 以及保管這些狀態、套用停手與變速規則的 TempoFollower（N6、N7；每個 driver 群組一份）。
-// 檔案 BPM 已包含在樂譜秒裡（midiTicksToSeconds 走過速度表），所以「檔案 BPM × playbackRate」就是你現在的有效 BPM。
-// 常數的依據是 test/tools/rate-eval.mjs 的模擬評估（曲庫實際樂譜、七種演奏者模型）。
+// tempo.js — 按鍵節奏：估速（playbackRate＝樂譜秒 ÷ 真實秒，命名同官方 Sequencer）、每首歌的速度區間、去抖，與保管這些狀態的 TempoFollower（N6、N7；每個 driver 群組一份）。
+// 檔案 BPM 已包含在樂譜秒裡，所以「檔案 BPM × playbackRate」就是你現在的有效 BPM。常數的依據是對曲庫實際樂譜、七種演奏者模型的模擬評估（見規格文件 N6）。
 
-// 估速視窗：最近 8 個間隔（9 個按鍵）。只看 1 個間隔手抖會被直接放大；視窗 4～8 個按鍵在所有情境都穩，8 個最好（rate-eval.mjs）
+// 估速視窗：最近 8 個間隔（9 個按鍵）。只看 1 個間隔手抖會被直接放大；視窗 4～8 個按鍵在所有情境都穩，8 個最好。
 export const RATE_WINDOW_INTERVALS = 8;
 // 速度的絕對保險範圍：只擋同一毫秒連按（趨近無限大）或隔幾分鐘才按（趨近 0）的極端；真正用的是每首歌自己的區間（rateBoundsFor）
 export const MIN_PLAYBACK_RATE = 1 / 256;
 export const MAX_PLAYBACK_RATE = 64;
 
-// 每首歌的速度區間：容許兩次按鍵的真實間隔落在 [PRESS_PERIOD_MIN_S, PRESS_PERIOD_MAX_S]。
-//  · 下界 0.06 秒 ≈ 16.7 下/秒（持續連按的上限；去抖下限 50ms 在它之內）；上界 30 秒：更久的空檔一律當成停手，不是你很慢（使用者決定）。
-//  · 這首歌的典型起音間隔 g（樂譜秒）對應區間 [g / 30, g / 0.06]：對數域寬度固定、中心依 g 平移，所以任何新 MIDI 都自動有合適的區間，不必手調。
-//  · 比 PRESS_PERIOD_MIN_S 還短的起音間隔不算典型間隔：按不及，放行時併成一下按（近距起音分組，scheduler.js）；算進去會把中位數壓小、上限低於原速。
+// 每首歌的速度區間：兩次按鍵的真實間隔容許在 [PRESS_PERIOD_MIN_S, PRESS_PERIOD_MAX_S]。下界 0.06 秒 ≈ 16.7 下/秒（持續連按的上限）；
+// 上界 30 秒：更久的空檔一律當成停手，不是你很慢（使用者決定）。這首歌的典型起音間隔 g（樂譜秒）對應 [g / 30, g / 0.06]，任何新 MIDI 都自動有合適的區間。
+// 比 PRESS_PERIOD_MIN_S 還短的起音間隔不算典型間隔：按不及，放行時併成一下按（近距起音分組，scheduler.js）；算進去會把中位數壓小、上限低於原速。
 export const PRESS_PERIOD_MIN_S = 0.06;
 export const PRESS_PERIOD_MAX_S = 30;
 
-// 近距起音分組的門檻：一個輸入來源連按兩下最短隔多久（秒），更近的起音放行時併成一組（scheduler.js）。
-// 鍵盤＝PRESS_PERIOD_MIN_S（同一個常數）；手勢接回時量測後再加，其他來源先用鍵盤的值。
+// 近距起音分組的門檻：一個輸入來源連按兩下最短隔多久（秒），更近的起音放行時併成一組（scheduler.js）。鍵盤＝PRESS_PERIOD_MIN_S；手勢接回時量測後再加，其他來源先用鍵盤的值。
 const MIN_PRESS_INTERVAL_S = { keyboard: PRESS_PERIOD_MIN_S };
 export const minPressIntervalSec = (source) => MIN_PRESS_INTERVAL_S[source] ?? PRESS_PERIOD_MIN_S;
 
@@ -86,8 +82,6 @@ export function summarizeMs(samples) {
     over30: samples.filter((x) => x > 30).length, // 30ms：跟另一個聲部／節奏對不齊開始聽得出來的量級（不是規格，只是量測的刻度）
   };
 }
-
-// ── TempoFollower：停手與變速的判斷，與去抖 ──
 
 // 停手與變速的判斷（accept()）：這一下隱含的速度 x ＝ Δ樂譜秒 ÷ Δ真實秒。
 //  · x 低於速度區間下緣（兩次按鍵隔超過 30 秒）＝停手：歷史清掉、速度維持。

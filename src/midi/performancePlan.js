@@ -1,14 +1,11 @@
-// performancePlan.js — 演奏計畫（純邏輯，無 DOM）：依樂譜＋指派建出譜表（staff：發聲與輸出 channel 的單位）、driver 群組、總音數與 hold 容差上限。
-// 載入、改指派時重建，之後不變；游標、錨點、電腦音佇列這些執行期狀態在排程器的群組狀態（scheduler.js）。
-// 現在永遠只有一個群組（所有被指派的槽位、全部的 follower）；多群組時 follower 跟誰、群組怎麼對時屬於多人分工規則，等手勢接回再定。
-// 一個 MuseScore 樂器是一個 part，底下有一個以上 staff（鋼琴兩行譜＝兩個）；指派以 part 為單位，發聲與輸出 channel 以 staff 為單位。
+// performancePlan.js — 演奏計畫：樂譜＋指派 → 譜表（staff：發聲與輸出 channel 的單位）、driver 群組、總音數與 hold 容差上限。載入、改指派時重建，之後不變；
+// 游標、錨點、電腦音佇列這些執行期狀態在 scheduler.js 的群組狀態。一個 MuseScore 樂器是一個 part，底下有一個以上 staff（鋼琴兩行譜＝兩個）；指派以 part 為單位，發聲與輸出 channel 以 staff 為單位。
+// 現在永遠只有一個群組；多群組時 follower 跟誰、群組怎麼對時屬於多人分工規則，等手勢接回再定。
 // 控制器屬於輸入 channel（parser 的 channelLanes），扇出到所有來源是該 channel 的譜表（lanes）；播放中途的控制器跟 follower 音一樣依 driver 起音切段。
 
 import { rateBoundsFor } from './tempo.js';
-import { GM_DEFAULT_VOLUME, holdCapTicksFor } from './voices.js';
-import { byFileOrder } from './midiParser.js';
-
-// ── 譜表（staff）建構 ──
+import { holdCapTicksFor } from './voices.js';
+import { byFileOrder, GM_DEFAULT_MIXER, BANK_MSB_RHYTHM } from './midiParser.js';
 
 // 一個 part 的 staff 規格：沒有 staves 的 part（手工組的舊資料形狀）視為單一 staff，id 沿用 part.id
 export function staffSpecsOf(part) {
@@ -24,7 +21,7 @@ function makeStaff(spec, slot, notes, kind, channel) {
     id: spec.id, partId: spec.partId, slot, kind, channel, notes,
     sourceChannel: spec.channel,   // 檔案裡的（絕對）輸入 channel：控制器軌依它扇出（舊資料形狀沒有）
     program: spec.program ?? 0, bank: spec.bank, init: spec.init ?? null, percussionKit: !!spec.percussionKit,
-    baseVolume: spec.init?.volume ?? GM_DEFAULT_VOLUME, // 檔案 tick 0 的 CC7，沒有就是 GM 預設 100；載入時送一次
+    baseVolume: spec.init?.volume ?? GM_DEFAULT_MIXER.volume, // 檔案 tick 0 的 CC7，沒有就是 GM 預設 100；載入時送一次
     sounding: new Map(),    // 音高 → [{ endTick, offMs }]：正在響的音，同音高重疊時先進先出收音（voices.js 操作它）
   };
 }
@@ -75,11 +72,9 @@ function buildStaves(score, assignments, router) {
   return { staves, unplaced };
 }
 
-// ── 控制器 ──
-
 // 播放中途的 bank select 若會讓輸出 channel 在打擊與旋律之間互換（打擊的判定同 parser：bank MSB 120），不送到這個譜表：
 // 輸出 channel 是依打擊／旋律分配的，中途互換要重新分配（不做，見 buildControls 的警告）。
-export const switchesKit = (staff, ev) => ev.type === 'controlChange' && ev.data1 === 0 && (ev.value === 120) !== staff.percussionKit;
+export const switchesKit = (staff, ev) => ev.type === 'controlChange' && ev.data1 === 0 && (ev.value === BANK_MSB_RHYTHM) !== staff.percussionKit;
 
 // 狀態補送（chase）不送 tick 0 的 bank select／program change：tick 0 的音色是初始音色的事（staff.program／bank，A9），從控制器軌重送可能矛盾
 const isPatchEvent = (ev) => ev.type === 'programChange' || (ev.type === 'controlChange' && (ev.data1 === 0 || ev.data1 === 32));
@@ -148,8 +143,6 @@ function buildControls(score, lanes) {
   if (skipped) warnOnce(score, 'sysex', `這首歌有 ${skipped} 個 SysEx 沒有送出（指定 part 的參數，或分不出用途的訊息）`);
   return controls.sort((a, b) => byFileOrder(a.ev, b.ev));
 }
-
-// ── driver 群組 ──
 
 // 某 tick 屬於第幾段：第 k 個 driver 起音（含）到第 k+1 個之前＝第 k+1 段，第一個 driver 起音之前＝第 0 段（前奏）。二分搜尋 upper bound，driverTicks 遞增
 export function sliceOfTick(driverTicks, tick) {

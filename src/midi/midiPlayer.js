@@ -1,18 +1,11 @@
-// midiPlayer.js — MIDI 播放器：狀態 store ＋ 動作 ＋ 三個區塊的畫面（頂端 pill／選歌面板／曲庫）
-// 上半部是狀態與動作（無 DOM）：playerStore 是唯一的真相，動作函式改它；合成器在 synth.js。下半部是畫面：每個區塊各自的 DOM 參照、handler（經 ui.js 的委派表）
-// 與 render(snapshot)，render 只在值不同時寫 DOM；檔尾把三段合成一個區塊模組 { actions, fields, inputs, mount, render } 給 ui.js。
-// 對外：main.js 用 startPlayer()、warmUpMidiEngine()、triggerInput()、liftInput()、triggerSlot()、setPlayerCount()、KEYBOARD_SLOT；ui.js 用 playerStore 與檔尾的區塊模組。
-//
+// midiPlayer.js — 播放器：playerStore（唯一的真相）＋動作＋三個畫面區塊（頂端播放 pill／選歌面板的分譜與本地檔／雲端曲庫）；合成器在 synth.js。
+// 每個畫面區塊各自有 DOM 參照、handler（經 ui.js 的委派表）與 render(snapshot)（只在值不同時寫 DOM）；檔尾合成一個區塊模組 { actions, fields, inputs, mount, render } 給 ui.js。
 // 選歌＝載入，播放鍵才是播放：選了本地檔或雲端曲目只解析並更新狀態（歌名／分譜清單），不啟動音源引擎。
-// 分譜的互動是「指派演奏者」：每個指派單位一個下拉（無／PC 鍵盤手／演奏者 1~N），選了＝那個聲部交給那個人，其餘沒指派的聲部由電腦輔助播放。
-// 指派單位通常是 part（一個樂器）；只有一個 part 而它有多個譜表（鋼琴兩行譜）時改列 staff。完全沒有人指派時整份照時間連續自動播放。
-// 改下拉不重新載入：還沒播過就只更新指派，下次 ▶ 依 selectionSignature 重新載入；播放中（含暫停）改指派則從目前位置接續（synth.reassign()）。
-// 指派是持久設定，不隨追蹤雜訊變動：N＝系統控制 bar 選的「現場人數」（playerCount，還沒選是 0 → 只有「無」和「PC 鍵盤手」；PC 鍵盤手不依賴現場人數）。
-// 演奏＝每次觸發（triggerInput，目前來自鍵盤；手勢接回時用 triggerSlot）放行全曲的下一個 segment，你的聲部與電腦輔助聲部在同一次呼叫內一起發聲（見 scheduler.js）。
-//
-// 試聽（♪）：用官方 SpessaSynth Sequencer 播同一份 MIDI（不經過我們的 parser，見 synth.js）對照聽感。跟演奏互斥（共用同一個合成器的 channel）：
-// 進入試聽會結束目前的演奏進度，離開後回到「已載入、還沒播過」，下次 ▶ 重新載入。store 的 mode：'perform'＝播放列作用在演奏，'preview'＝▶ ❚❚ ↻ 作用在試聽；
-// 哪顆鈕能按照同一張狀態表（transportButtonState）。
+// 分譜的互動是「指派演奏者」：每個指派單位一個下拉（無／PC 鍵盤手／演奏者 1~N），選了＝那個聲部交給那個人，其餘由電腦輔助播放；
+// 指派單位通常是 part（一個樂器），只有一個 part 而它有多個譜表（鋼琴兩行譜）時改列 staff。指派是持久設定，不隨追蹤雜訊變動。
+// 改下拉不重新載入：還沒播過就只更新指派，下次 ▶ 依 selectionSignature 重新載入；播放中（含暫停）則從目前位置接續（synth.reassign()）。
+// 試聽（♪）用官方 Sequencer 播同一份 MIDI 對照聽感（見 synth.js），跟演奏互斥（共用同一個合成器的 channel）：進入試聽會結束目前的演奏進度，離開後回到「已載入、還沒播過」。
+// store 的 mode：'perform'＝播放列作用在演奏，'preview'＝▶ ❚❚ ↻ 作用在試聽；哪顆鈕能按照同一張狀態表（transportButtonState）。
 
 import { Store, rafThrottle, setMarqueeText } from '../ui.js';
 import * as synth from './synth.js';
@@ -22,7 +15,6 @@ import { KEYBOARD_SLOT } from './scheduler.js';
 
 export { KEYBOARD_SLOT };   // main.js 交給 keyboard.js 的觸發槽位
 
-// ── 共用小工具 ──
 // 秒數 → m:ss；NaN／負數一律 0:00（分譜資訊列用）。
 function formatTime(sec) {
   if (isNaN(sec) || sec < 0) return '0:00';
@@ -31,7 +23,6 @@ function formatTime(sec) {
   return `${m}:${s}`;
 }
 
-// ── 常數 ──
 const PLAYER_COUNT = 4;      // 可指派的演奏者 ID 數上限（對齊 vision.js 的 CONFIG.maxUsers）；
                              // 實際列幾個由系統控制 bar 的「現場人數」決定（見 setPlayerCount）
 
@@ -41,7 +32,6 @@ const SCHEDULER_TICK_MS = 12;
 const UI_TICK_MS = 200;
 const LOADING_INDICATOR_DELAY_MS = 120; // 按播放後延遲這麼久才顯示 ⋯（本地檔幾乎瞬間就好）
 
-// ── 狀態 ──
 /**
  * @typedef {object} PlayerState
  * @property {null | { kind: 'local', file: File, name: string } | { kind: 'cloud', id: string, blob: Blob, name: string }} source
@@ -86,7 +76,6 @@ let sourceLoadToken = 0;
 let isSongLoading = false;         // 按播放後到引擎載入完成之間的重入防護（立即生效，不等 120ms）
 let endHandled = false;            // 歌曲播完的收尾只做一次
 
-// ── 純函式 ──
 // 播放來源的身分：本地檔案用「檔名＋大小＋修改時間」，雲端曲目用它的 id。
 function sourceIdentity(source) {
   return source.kind === 'local'
@@ -122,7 +111,6 @@ const allUnitIds = () => assignmentUnits(playerStore.state.parts).map((u) => u.i
 // 目前確實存在於 score 又被指派出去的單位 id。
 const assignedUnitIds = () => allUnitIds().filter((id) => playerStore.state.assignments.has(id));
 
-// ── 觸發與 humanGate ──
 // humanGain 總開關該不該開：播放中、沒播完、且真的有指派。
 const updateHumanGate = () => {
   const armed = synth.isLoaded() && !synth.isPaused() && !endHandled && assignedUnitIds().length > 0;
@@ -171,7 +159,7 @@ export function audioLatency() {
 }
 
 // 量測（同上）：錄音 v3，給 main.js 的 __pressLog 匯出做離線分析：歌、指派（Map 展開成 [partId, 槽位][] 才能轉 JSON）、每次按鍵嘗試（鍵、事件發生與程式收到的時刻、排程器時鐘、有沒有放行）、每次放開（lifts：鍵、時鐘、收了幾顆音）、
-// 事件串流（錨點、速度、每顆音實際發聲的時刻…）與匯出時刻。commit 不在這裡（app 不知道），登記到 corpus 時由 test/tools/recording-register.mjs 補上。
+// 事件串流（錨點、速度、每顆音實際發聲的時刻…）與匯出時刻。
 export function pressLog() {
   const { source, songTitle, assignments } = playerStore.state;
   return {
@@ -185,7 +173,6 @@ export function pressLog() {
   };
 }
 
-// ── 分譜載入 ──
 function clearScore() {
   playerStore.set({ score: null, parts: [], assignments: new Map(), positionSeconds: 0 });
 }
@@ -205,7 +192,6 @@ function loadScore(arrayBuffer, label) {
   }
 }
 
-// ── 選歌（本地／雲端）──
 // 每次換來源的共同前置：停掉引擎（演奏與試聽都停，載入中的試聽也中斷）、清殘響、簽章失效，並發新的請求代號。
 function beginSourceChange() {
   synth.flushPreviousSong();
@@ -262,7 +248,6 @@ function clearSource() {
   setNoSource();
 }
 
-// ── 播放（本地／雲端共用同一套邏輯）──
 // 「目前引擎裡在播的到底是什麼」的簽章：來源身分 + 分譜／指派狀態。兩者都相同才能直接續播，
 // 任一項不同都要重新交給 scheduler.load() 重建 staff 與全曲的 segment。
 const buildPlaybackSignature = (source) =>
@@ -319,7 +304,6 @@ function pauseCurrentSource() {
   updateHumanGate();
 }
 
-// ── 試聽（官方 Sequencer，見 synth.js）──
 // 官方解析器要的是原始位元組：本地檔案與雲端 blob 都有 arrayBuffer()，每次讀都是新的一份。
 const sourceBytes = (source) => (source.kind === 'local' ? source.file : source.blob).arrayBuffer();
 
@@ -397,7 +381,6 @@ async function playPreview({ fromStart = false } = {}) {
   }
 }
 
-// ── 指派／人數 ──
 // 下拉的值 → 槽位：'kb' 是 PC 鍵盤手（不看現場人數）；數字要在 1~現場人數 之內；空字串／不合法＝沒有指派（null）。
 function slotOfOption(value) {
   if (value === KEYBOARD_SLOT) return KEYBOARD_SLOT;
@@ -438,7 +421,6 @@ export function setPlayerCount(n) {
   updateHumanGate();
 }
 
-// ── 開場暖機、兩個 tick ──
 // MIDI 引擎掛掉不擋整個 app（攝影機、骨架都還能用），但一定要讓使用者看得到：寫在頂端狀態列。
 export async function warmUpMidiEngine() {
   const ok = await synth.initEngine();
@@ -484,7 +466,6 @@ export function startPlayer() {
   setInterval(schedulerTick, SCHEDULER_TICK_MS);
 }
 
-// ── 畫面 1／3：頂端播放 pill（四顆按鈕＋歌名）──
 // 四顆獨立按鈕（▶ 播放／❚❚ 暫停／↻ 重播／♪ 試聽）互相防呆：哪顆能按、哪顆是「目前狀態」（accent 黃底）由 transportButtonState() 依 store 推導，
 // 畫面照表寫 DOM（規格文件有同一張表）。
 //   沒歌（idle）／載入中（loading）／處理中（busy） → 全灰（載入中 ▶ 顯示 ⋯）
@@ -505,8 +486,7 @@ const topProgressBar = document.getElementById('topProgressBar');
 
 const IDLE_TITLE = '等待選擇歌曲...';
 
-// ── 歌名優先單行，超長才縮小字級（見 src/styles.css 的 .player-status-bar）──
-// scrollWidth 是文字實際想要的寬度（不受目前有沒有被壓縮影響），跟 pill 扣掉按鈕組與 gap 後能分給文字的寬度比較，超出就縮小 --song-title-scale；
+// 歌名優先單行，超長才縮小字級（見 src/styles.css 的 .player-status-bar）：scrollWidth 是文字實際想要的寬度（不受目前有沒有被壓縮影響），跟 pill 扣掉按鈕組與 gap 後能分給文字的寬度比較，超出就縮小 --song-title-scale；
 // 縮到下限 MIN_SONG_TITLE_SCALE 還放不下，才加 .allow-wrap 退回換行。
 const MIN_SONG_TITLE_SCALE = 0.6;
 function fitSongTitle() {
@@ -591,8 +571,7 @@ function renderTopProgress({ player }) {
   }
 }
 
-// ── 畫面 2／3：選歌面板的雲端曲庫（分類下拉／關鍵字搜尋／歌曲下拉）──
-// 資料來自 midiApi.js；搜尋狀態放 playerStore.library，兩個下拉的 option 只在 items／categories 參照變了才重建。分類集合跨搜尋累積（曲庫的分類端點可能失敗，搜尋結果裡的分類也要收）。
+// 雲端曲庫（分類下拉／關鍵字搜尋／歌曲下拉）：資料來自 midiApi.js；搜尋狀態放 playerStore.library，兩個下拉的 option 只在 items／categories 參照變了才重建。分類集合跨搜尋累積（曲庫的分類端點可能失敗，搜尋結果裡的分類也要收）。
 // 選到一首就下載＋解析（selectCloudSong），不啟動播放；退回「請選擇歌曲」就清掉來源。
 const SEARCH_DEBOUNCE_MS = 300;
 
@@ -720,7 +699,6 @@ function renderLibraryPicker({ player }) {
   setMarqueeText(songMirrorEl, shown, songSelectEl.selectedIndex > 0 ? shown : '');
 }
 
-// ── 畫面 3／3：選歌面板的本地檔案／分譜清單（指派演奏者）──
 // 分譜清單每一列＝「聲部名（GM 音色的繁體中文名；單聲部多行譜是「聲部名・譜表 N」）＋一個下拉（無／PC 鍵盤手／演奏者 1~N）」，由 index.html 的 <template id="tpl-part-row"> clone，
 // 聲部名用 textContent 填（來自檔案內容，不當 HTML）。列只在 parts 參照或 playerCount 變了才重建，每次 render 都校正各下拉的值與 is-mine。畫面不標示指派的人在不在場：指派本身留著，不隨追蹤雜訊變動。
 const localInput = document.getElementById('localMidiInput');
@@ -782,7 +760,6 @@ function renderSongPanel({ player }) {
   }
 }
 
-// ── 合成一個區塊模組給 ui.js（{ actions, fields, inputs, mount, render }）──
 export const actions = { ...transportActions };
 export const fields = { ...songPanelFields, ...libraryFields };
 export const inputs = { ...libraryInputs };

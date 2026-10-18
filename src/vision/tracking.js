@@ -1,16 +1,11 @@
-// tracking.js — 多人槽位追蹤核心（純邏輯，無 DOM／CDN）：這一幀這個人該貼哪個已鎖定槽位、新面孔何時才能鎖定空位。
-// ID 只是槽位編號的顯示提示，不做身分認回（槽位釋放後下一個偵測到的人直接取用空槽位）；純粹依位置（螢幕座標接近程度，門檻依肩寬縮放）判斷，不用服裝顏色。
-// vision.js 負責從 video 擷取 MediaPipe landmarks 與 WebGL／2D 繪製。
+// tracking.js — 多人槽位追蹤與平滑：這一幀這個人該貼哪個已鎖定槽位、新面孔何時才能鎖定空位，加上逐關節的自適應平滑（AdaptivePoseFilter）。
+// 純粹依位置（螢幕座標接近程度，門檻依肩寬縮放）判斷，不用服裝顏色；ID 只是槽位編號的顯示提示，不做身分認回。
 
-import { clamp01 } from './gesture.js';
+const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
 
 export const DEFAULT_TRACKING_CONFIG = Object.freeze({
   maxUsers: 4,
 
-  // ── 原則：只貼標籤，不動畫面 ──
-  // 畫面上永遠是 MediaPipe 這一幀真的給的人；追蹤層只決定每個人貼哪個 ID。判斷不了時寧可這一幀不貼標籤，也不刪、不合併、不替換任何一筆偵測。
-
-  // ── 逐幀配對（已鎖定槽位 vs 這一幀偵測）──
   // 位置門檻＝max(gatePos, gatePosRatio × 這個人的肩寬)：同一個動作站得近的人在正規化座標上走得比較遠；絕對值下限給遠處的小人。
   gatePos: 0.15,
   gatePosRatio: 0.45,
@@ -25,7 +20,7 @@ export const DEFAULT_TRACKING_CONFIG = Object.freeze({
   // 沒辦法用公式算準，需照實機測試繼續調。
   ambiguityFloorRatio: 0.4,
 
-  // ── 「同一具身體」的判準（dedupe／幽靈抑制／硬保險三處共用，見 isSameBody）──
+  // 「同一具身體」的判準（dedupe／幽靈抑制／硬保險三處共用，見 isSameBody）：
   // 兩筆偵測（或兩個槽位）的肩膀中點距離 < max(sameBodyDist, sameBodyRatio × 較小的肩寬) 就視為同一具身體：兩個真人的肩膀中點不可能靠到半個肩寬以內，
   // 而幽靈（MediaPipe 對同一具身體多吐一組骨架）是同一對肩膀、中點幾乎重合。取較小的肩寬：站在使用者正後方、看起來比較小的第二個人，才不會被近處那個人的尺度吞掉。
   sameBodyDist: 0.03,
@@ -40,7 +35,7 @@ export const DEFAULT_TRACKING_CONFIG = Object.freeze({
   // 肩寬本身也要平滑，否則單幀的肩寬雜訊會讓上面那些門檻跟著跳動。
   shoulderWidthEmaAlpha: 0.2,
 
-  // ── 繪製用的短暫保留（getDrawableTracks）──
+  // 繪製用的短暫保留（getDrawableTracks）：
   // MediaPipe 偶爾漏一幀，已鎖定的人這一幀沒配對到偵測就會整具骨架眨一下，所以 getDrawableTracks() 把「最後一次配對到之後 drawHoldMs 內」的槽位也交給繪製端
   // （100ms＝3 幀，人真的離開仍幾乎立刻消失）。手勢與在場名單仍用嚴格的 getActiveTracks()。
   drawHoldMs: 100,
@@ -73,7 +68,7 @@ export const DEFAULT_TRACKING_CONFIG = Object.freeze({
 
 function isFinitePoint(p) { return !!p && Number.isFinite(p.x) && Number.isFinite(p.y); }
 
-// ── 非人物體防呆：過濾 MediaPipe 對背景圖案／假人模型等非人物件誤判出的姿勢 ──
+// 非人物體防呆：過濾 MediaPipe 對背景圖案／假人模型等非人物件誤判出的姿勢。
 // 幾何上像不像一個人：肩寬在合理範圍、髖部可信時肩膀要在髖部上方。這是硬拒絕。
 function hasHumanGeometry(landmarks, cfg) {
   const lS = landmarks[11], rS = landmarks[12];
@@ -104,7 +99,7 @@ function shoulderVisibility(landmarks) {
   return Math.min(landmarks[11].visibility ?? 0, landmarks[12].visibility ?? 0);
 }
 
-// ── 由原始 landmark 建立一筆「偵測」：肩膀中點是位置匹配與「同一具身體」判定的唯一依據；回傳 null 代表數值異常、幾何不像真人、或可見度連寬鬆門檻都不到，呼叫端須過濾掉 ──
+// 由原始 landmark 建立一筆「偵測」：肩膀中點是位置匹配與「同一具身體」判定的唯一依據；回傳 null 代表數值異常、幾何不像真人、或可見度連寬鬆門檻都不到，呼叫端須過濾掉。
 export function buildDetection(landmarks, { cfg = DEFAULT_TRACKING_CONFIG } = {}) {
   const lShoulder = landmarks[11], rShoulder = landmarks[12];
   const lHip = landmarks[23], rHip = landmarks[24];
@@ -176,8 +171,7 @@ export function dedupeDetections(detections, cfg = DEFAULT_TRACKING_CONFIG, anch
   return kept;
 }
 
-// ── AdaptivePoseFilter ──
-// 「動得越像真的在動，就越信任新值」的一階平滑，外加一個等於自身群延遲的前瞻量，等速運動時輸出精準落回真值，「穩定」與「不跟隨延遲」不再互相衝突。
+// AdaptivePoseFilter：「動得越像真的在動，就越信任新值」的一階平滑，外加一個等於自身群延遲的前瞻量，等速運動時輸出精準落回真值，「穩定」與「不跟隨延遲」不再互相衝突。
 //   ① 「有沒有在動」用 max(|Δ|, |v̂|·dt) 判斷：雜訊的方向每幀亂跳、v̂ 永遠接近 0；真實移動即使每幀很小，方向一致會讓 v̂ 累積起來，慢揮才不會被吃掉。
 //   ② alpha 從 smoothingAtRest 連續升到 maxAlpha（< 1），永遠保留一點雜訊抑制；靜止時 alpha 很小但不是 0，沒有凍結／解凍的階梯。
 //   ③ 前瞻量用平滑後的速度 v̂，長度取 dt·(1-alpha)/alpha ＝ 這個一階濾波器的群延遲。
@@ -186,13 +180,12 @@ export function dedupeDetections(detections, cfg = DEFAULT_TRACKING_CONFIG, anch
 // 跟 snapDist 是兩回事：snapDist 是「動到這個量級就該完全信任新值」，jumpDist 是「這個位移不可能是人做出來的」。
 export const DEFAULT_JUMP_DIST = 0.10; // ≈ 3 單位/秒，真人的關節到不了
 
-// ── 前瞻預測量 PREDICT_MS：抵銷「上游」的延遲 ──
-// 濾波器輸出的是「大約 PREDICT_MS 毫秒後這個關節會在哪」。濾波器自己只貢獻幾 ms 延遲，真正的延遲在上游（攝影機曝光＋傳輸解碼 → MediaPipe 推論 → 繪製合成，30fps 下合計 60~100ms）；
+// 前瞻預測量 PREDICT_MS：抵銷「上游」的延遲。濾波器輸出的是「大約 PREDICT_MS 毫秒後這個關節會在哪」。濾波器自己只貢獻幾 ms 延遲，真正的延遲在上游（攝影機曝光＋傳輸解碼 → MediaPipe 推論 → 繪製合成，30fps 下合計 60~100ms）；
 // 前瞻量上限是濾波器自己的群延遲，補不了上游那一段，這一項是程式裡唯一能往前推的槓桿。
 // 另一條速度估計 vRaw：vHat 用濾波後的位移算，已被 alpha 衰減；vRaw 用原始位移，沒有衰減。兩項各司其職：
 //   vHat × min(leadCapMs, 群延遲)  → 抵銷濾波器自己的延遲
 //   vRaw × PREDICT_MS × t²         → 抵銷上游的延遲（權重 t²：靜止時雜訊仍讓 t ≈ 0.14，平方後 vRaw 的雜訊幾乎不進輸出；快速移動時 t 飽和在 1）
-// 調整只有這一個數字：實機覺得拖 → 調高；節點會甩過頭 → 調低。調之前先用 DevTools 的 Rendering 面板看實際 fps，掉到 28 以下該修的是效能而不是這裡。
+// 實機覺得拖就調高、節點會甩過頭就調低；調之前先看實際 fps（DevTools 的 Rendering 面板），掉到 28 以下該修的是效能而不是這裡。
 export const PREDICT_MS = 30;
 const PREDICT_TAU_MS = 110; // vRaw 的 EMA 時間常數（約 3 幀）
 
@@ -306,7 +299,7 @@ export function getFilterParams(index) {
   return { deadZone: 0.004, snapDist: 0.016, smoothingAtRest: 0.12, maxAlpha: 0.50, velTauMs: 120, leadCapMs: 60 };
 }
 
-// ── PersonTracker：多人 ID 鎖定狀態機（固定 maxUsers 個槽位，ID 恆等於槽位編號 1~maxUsers）──
+// PersonTracker：多人 ID 鎖定狀態機（固定 maxUsers 個槽位，ID 恆等於槽位編號 1~maxUsers）。
 export class PersonTracker {
   constructor(config = {}) {
     this.cfg = { ...DEFAULT_TRACKING_CONFIG, ...config };

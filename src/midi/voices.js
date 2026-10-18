@@ -1,31 +1,23 @@
-// voices.js — 輸出路由與發聲帳本（純邏輯，無 DOM；合成器由呼叫端注入：synth.js，測試用假物件）。
-// OutputRouter：輸出 channel 的分配與 port 數、每個 staff 的初始音色、lookahead 的時間戳，以及排程器裡唯一呼叫合成器方法的地方
-// （電腦輔助 assist、真人 human 兩個合成器）；每次呼叫都包 try／catch，音源掛掉不能拖垮排程。
-// 控制器：每個合成器 × 輸出 channel 一份 shadow（每個 CC、program、pitch bend、channel pressure 最後送出的值）；狀態類的補送（載入、早按的 chase、重播、改指派）
+// voices.js — 輸出路由與發聲帳本。OutputRouter：輸出 channel 的分配與 port 數、每個 staff 的初始音色、lookahead 的時間戳，以及排程器裡唯一呼叫合成器方法的地方
+// （電腦輔助 assist、真人 human 兩個合成器由 synth.js 注入）；每次呼叫都包 try／catch，音源掛掉不能拖垮排程。VoiceLedger：正在響的音、hold、尾巴收尾。
+// 控制器 shadow：每個合成器 × 輸出 channel 一份（每個 CC、program、pitch bend、channel pressure 最後送出的值）；狀態類的補送（載入、早按的 chase、重播、改指派）
 // 只送跟 shadow 不同的值，暫停時放開延音踏板、彎音歸中央，續播再恢復。同一個輸出 channel 的控制器依送出順序生效（_ordered()），shadow 才會等於合成器最後的狀態。
+
+import { CC, RESET_CC, PARAMETER_CC, GM_DEFAULT_MIXER, PITCH_BEND_CENTER } from './midiParser.js';
 
 // channel 的單一來源（synth.js 經 scheduler.js 轉出 import）。模仿官方 SpessaSynth Sequencer：一個 port 16 個 channel，依需要的 port 數往上補、只增不減，每個 port 的 channel 9 是打擊。
 // DEFAULT_PORTS 是合成器開機就補到的 port 數；歌曲需要更多時由 synth.js 的 load() 依 portsNeeded() 補，再用 setPortCount() 告訴排程器。
 // 不能讀 synth.midiChannels.length 當 channel 數（addNewChannel() 會雙重 push，見 synth.js），數字只由這裡與 synth.js 自己計數。
 export const CHANNELS_PER_PORT = 16;
 export const DEFAULT_PORTS = 4;
-// GM 預設的混音值：CC121 不會重設音量、聲像、Program（GM2 §3.5.2），channel 又跨曲重複使用，所以沒有 init 的 staff 也要明確送一次，免得沿用別首歌留在同一個 channel 的設定
-export const GM_DEFAULT_VOLUME = 100, GM_DEFAULT_PAN = 64, GM_DEFAULT_REVERB = 0, GM_DEFAULT_CHORUS = 0;
-// RPN／NRPN 的選參數與 data entry：接收端的 data entry 套在「當下選的參數」上，要照順序成組送，不能用「跟上次一樣就不送」過濾。
-const PARAMETER_CCS = new Set([6, 38, 96, 97, 98, 99, 100, 101]);
-const CC_HOLD = 64, CC_SOSTENUTO = 66, CC_RESET_ALL = 121, CC_MONO = 126, CC_POLY = 127, BEND_CENTER = 8192;
-// CC121 Reset All Controllers 重設的控制器與值（RP-015／GM2 §3.5.2，官方 resetRP15 同一張表）；另外 pitch bend 回中央、channel pressure 回 0。
-const RP15_RESET = [[1, 0], [11, 127], [64, 0], [65, 0], [66, 0], [67, 0]];
 // GM 預設值（官方 SpessaSynth 的 DEFAULT_MIDI_CONTROLLERS；沒列的是 0）：重設 channel 時，中途改過、CC121 不管的控制器送回這個值。
 const CC_DEFAULTS = new Map([[7, 100], [8, 64], [10, 64], [11, 127], [71, 64], [72, 64], [73, 64], [74, 64], [75, 64], [76, 64], [77, 64], [78, 64], [81, 64], [83, 64]]);
 // 重設 channel 時不送回預設值的 CC：bank 與初始音色的混音 CC7／10／91／93（之後一定重送）、RPN／NRPN（chase 照順序重播）、
 // channel mode 訊息 120～127（瞬間指令，不是狀態）。
 const RESEND_LATER = new Set([0, 32, 7, 10, 91, 93]);
-const notState = (cc) => RESEND_LATER.has(cc) || PARAMETER_CCS.has(cc) || cc >= 120;
+const notState = (cc) => RESEND_LATER.has(cc) || PARAMETER_CC.has(cc) || cc >= 120;
 const ccEvent = (cc, value) => ({ type: 'controlChange', data1: cc, data2: value, value });
 const bendEvent = (value) => ({ type: 'pitchBend', data1: value & 0x7f, data2: value >> 7, value });
-
-// ── 輸出 channel 分配 ──
 
 // 這個合成器上可用的旋律輸出 channel＝跳過每個 port 的打擊槽（ch % 16 === drumChannel）。
 function melodicChannelsFor(synth, drumChannel, ports) {
@@ -72,7 +64,6 @@ export function portsFor(pools) {
   return Math.max(DEFAULT_PORTS, ...pools.map((p) => Math.max(Math.ceil(p.melodic / melodicPerPort), p.kits.size)));
 }
 
-// ── OutputRouter ──
 export class OutputRouter {
   constructor(drumChannel) {
     this.drumChannel = drumChannel;
@@ -115,11 +106,9 @@ export class OutputRouter {
     const { bank, init } = staff;
     this.sendStateDiff(staff, [
       ccEvent(0, bank?.msb || 0), ccEvent(32, bank?.lsb || 0), { type: 'programChange', data1: staff.program || 0, data2: 0, value: staff.program || 0 },
-      ccEvent(7, staff.baseVolume), ccEvent(10, init?.pan ?? GM_DEFAULT_PAN), ccEvent(91, init?.reverb ?? GM_DEFAULT_REVERB), ccEvent(93, init?.chorus ?? GM_DEFAULT_CHORUS),
+      ccEvent(7, staff.baseVolume), ccEvent(10, init?.pan ?? GM_DEFAULT_MIXER.pan), ccEvent(91, init?.reverb ?? GM_DEFAULT_MIXER.reverb), ccEvent(93, init?.chorus ?? GM_DEFAULT_MIXER.chorus),
     ]);
   }
-
-  /* ── 控制器 ── */
 
   // 輸出 channel 的鍵（shadow 與時間戳下限共用）：哪個合成器＋哪個 channel
   _keyOf(staff) { return `${staff.kind === 'human' ? 'human' : 'assist'}:${staff.channel}`; }
@@ -144,8 +133,8 @@ export class OutputRouter {
     const sh = this._shadowOf(staff);
     switch (ev.type) {
       case 'controlChange':
-        if (ev.data1 === CC_RESET_ALL) this._markReset(sh);
-        else if (ev.data1 === CC_MONO || ev.data1 === CC_POLY) sh.mode = ev.data1;
+        if (ev.data1 === CC.RESET_ALL) this._markReset(sh);
+        else if (ev.data1 === CC.MONO || ev.data1 === CC.POLY) sh.mode = ev.data1;
         else if (ev.data1 < 120) sh.cc.set(ev.data1, ev.value);
         break;
       case 'programChange': sh.program = ev.value; break;
@@ -157,8 +146,8 @@ export class OutputRouter {
 
   // CC121 之後合成器的狀態（RP-015）：重設的控制器記成預設值；暫停前記下的值也作廢（channel 已重設，續播不該恢復）
   _markReset(sh) {
-    for (const [cc, value] of RP15_RESET) sh.cc.set(cc, value);
-    sh.pitchBend = BEND_CENTER;
+    for (const [cc, value] of RESET_CC) sh.cc.set(cc, value);
+    sh.pitchBend = PITCH_BEND_CENTER;
     sh.channelPressure = 0;
     sh.paused = null;
   }
@@ -207,7 +196,7 @@ export class OutputRouter {
    */
   resetChannel(staff) {
     if (!this.synthOf(staff)) return;
-    this.sendChannelEvent(staff, ccEvent(CC_RESET_ALL, 0));
+    this.sendChannelEvent(staff, ccEvent(CC.RESET_ALL, 0));
     const sh = this._shadowOf(staff);
     for (const [cc, value] of sh.cc) {
       const def = CC_DEFAULTS.get(cc) ?? 0;
@@ -223,8 +212,8 @@ export class OutputRouter {
     for (const ev of events) {
       if (ev.type === 'controlChange') {
         // CC126／127 合成器會先停掉整個 channel 的音再切模式（CC121 不動它），所以模式沒變就不能重送
-        if (ev.data1 === CC_MONO || ev.data1 === CC_POLY) { if (sh.mode === ev.data1) continue; }
-        else if (!PARAMETER_CCS.has(ev.data1) && sh.cc.get(ev.data1) === ev.value) continue;
+        if (ev.data1 === CC.MONO || ev.data1 === CC.POLY) { if (sh.mode === ev.data1) continue; }
+        else if (!PARAMETER_CC.has(ev.data1) && sh.cc.get(ev.data1) === ev.value) continue;
         if (ev.data1 === 0 || ev.data1 === 32) bankChanged = true;
       } else if (ev.type === 'programChange') {
         if (sh.program === ev.value && !bankChanged) continue;
@@ -243,13 +232,13 @@ export class OutputRouter {
   releaseForPause(staff) {
     const sh = this._shadow.get(this._keyOf(staff));
     if (!sh || sh.paused) return;                                  // 沒送過東西／已經放開過、還沒續播
-    const saved = { hold: sh.cc.get(CC_HOLD), sostenuto: sh.cc.get(CC_SOSTENUTO), pitchBend: sh.pitchBend };
-    const bent = saved.pitchBend !== null && saved.pitchBend !== BEND_CENTER;
+    const saved = { hold: sh.cc.get(CC.HOLD), sostenuto: sh.cc.get(CC.SOSTENUTO), pitchBend: sh.pitchBend };
+    const bent = saved.pitchBend !== null && saved.pitchBend !== PITCH_BEND_CENTER;
     if (!(saved.hold > 0) && !(saved.sostenuto > 0) && !bent) return;
     sh.paused = saved;
-    if (saved.hold > 0) this.sendChannelEvent(staff, ccEvent(CC_HOLD, 0));
-    if (saved.sostenuto > 0) this.sendChannelEvent(staff, ccEvent(CC_SOSTENUTO, 0));
-    if (bent) this.sendChannelEvent(staff, bendEvent(BEND_CENTER));
+    if (saved.hold > 0) this.sendChannelEvent(staff, ccEvent(CC.HOLD, 0));
+    if (saved.sostenuto > 0) this.sendChannelEvent(staff, ccEvent(CC.SOSTENUTO, 0));
+    if (bent) this.sendChannelEvent(staff, bendEvent(PITCH_BEND_CENTER));
   }
 
   // 續播：恢復暫停前的踏板與彎音（只恢復一次）
@@ -257,9 +246,9 @@ export class OutputRouter {
     const sh = this._shadow.get(this._keyOf(staff)), saved = sh?.paused;
     if (!saved) return;
     sh.paused = null;
-    if (saved.hold > 0) this.sendChannelEvent(staff, ccEvent(CC_HOLD, saved.hold));
-    if (saved.sostenuto > 0) this.sendChannelEvent(staff, ccEvent(CC_SOSTENUTO, saved.sostenuto));
-    if (saved.pitchBend !== null && saved.pitchBend !== BEND_CENTER) this.sendChannelEvent(staff, bendEvent(saved.pitchBend));
+    if (saved.hold > 0) this.sendChannelEvent(staff, ccEvent(CC.HOLD, saved.hold));
+    if (saved.sostenuto > 0) this.sendChannelEvent(staff, ccEvent(CC.SOSTENUTO, saved.sostenuto));
+    if (saved.pitchBend !== null && saved.pitchBend !== PITCH_BEND_CENTER) this.sendChannelEvent(staff, bendEvent(saved.pitchBend));
   }
 
   // 暫停中改指派：舊的「暫停前的值」對不上新的分配，丟掉（排程器重送 chase 之後再依新的狀態放開一次）
@@ -291,8 +280,6 @@ export class OutputRouter {
     return true;
   }
 
-  /* ── lookahead 的時間戳 ── */
-
   // 排程器的 tick() 開始時設、結束時清（null）：只有這段期間的電腦輔助聲部會帶時間戳。
   setAudioBase(base) {
     this._audioBase = base;
@@ -320,8 +307,6 @@ export class OutputRouter {
     return { time: Math.max(stamp?.time ?? -Infinity, entry.onTime + 0.001) };
   }
 
-  /* ── 合成器呼叫（每一個都包 try／catch）── */
-
   noteOn(staff, pitch, velocity, opts) {
     try { this.synthOf(staff)?.noteOn(staff.channel, pitch, velocity, opts); } catch (err) { this._warnOnce('noteOn', err); }
   }
@@ -332,17 +317,15 @@ export class OutputRouter {
 
   // CC123 All Notes Off：暫停、停止時的保險
   allNotesOff(staff) {
-    try { this.synthOf(staff)?.controllerChange(staff.channel, 123, 0); } catch (err) { this._warnOnce('allNotesOff', err); }
+    try { this.synthOf(staff)?.controllerChange(staff.channel, CC.ALL_NOTES_OFF, 0); } catch (err) { this._warnOnce('allNotesOff', err); }
   }
 }
 
-// ── VoiceLedger：發聲帳本 ──
-// 每個譜表正在響的音（staff.sounding：音高 → 依發聲順序排隊的佇列）、同音高先進先出收音、hold（loop 等你按下一個起音，N10）的判定與放行、
+// VoiceLedger：發聲帳本。每個譜表正在響的音（staff.sounding：音高 → 依發聲順序排隊的佇列）、同音高先進先出收音、hold（loop 等你按下一個起音，N10）的判定與放行、
 // 尾巴收尾（同譜表新音發聲時截短舊音，N3）、你的下一次按鍵時依 tick 先收、暫停時全部收音。合成器指令都經 OutputRouter，收發音事件排進對外事件（scheduler.js）。
 // 帳本只管「正在響的音」：時鐘、driver 游標、速度這些「目前」的值由排程器呼叫時傳進來；driver 起音 tick、hold 容差、tick → 樂譜秒的換算在載入／改指派時綁定（bind()）。
 
-// ── 應用層常數（不是規格）──
-// 有限的音長（檔案音長 ÷ 速度）上限：極慢（如 0.015×）時 0.1 秒的短音會被拉成 6 秒，所以被「拉長」的部分最多到 NOTE_MAX_MS；但不會比檔案本身的長度更短
+// 應用層常數（不是規格）：有限的音長（檔案音長 ÷ 速度）上限：極慢（如 0.015×）時 0.1 秒的短音會被拉成 6 秒，所以被「拉長」的部分最多到 NOTE_MAX_MS；但不會比檔案本身的長度更短
 // （檔案裡 12 秒的長音在 1× 就是 12 秒，整首自動播放與你彈得跟原譜一樣快時都不能被切）。起音位置仍用完整速度排開，hold 著等你按的音照舊響到你按下去。排程器排電腦音的長度也用它，所以 export。
 const NOTE_MAX_MS = 8000;
 export const scaledMs = (lenSec, rate) => Math.min((lenSec * 1000) / rate, Math.max(NOTE_MAX_MS, lenSec * 1000));

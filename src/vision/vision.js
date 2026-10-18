@@ -1,15 +1,17 @@
-// vision.js — MediaPipe 骨架偵測模組：WebGL 視訊渲染 + 多人 ID 鎖定追蹤 + 自適應平滑濾波（最多 4 人），並產出手勢觸發序號（目前沒有接收者，見規格文件）
+// vision.js — 攝影機、WebGL 視訊與骨架繪製、姿勢模型生命週期；逐幀呼叫追蹤（tracking.js）與手勢（gesture.js），送出手勢狀態（目前沒有接收者，見規格文件）
 
-// 直接從 CDN 匯入（不經 import map），版本固定 1.1.0：bundle、loader JS、.wasm 三個檔必須同一版。不用 @latest：jsDelivr 邊緣節點曾同時回傳不同版本的 loader JS 與 .wasm
+// 版本固定 1.1.0：bundle、loader JS、.wasm 三個檔必須同一版。不用 @latest：jsDelivr 邊緣節點曾同時回傳不同版本的 loader JS 與 .wasm
 // （2026-10-07 實測），載入時 assignWasmExports 讀到 undefined 而失敗。升級時下面兩個網址（import 與 forVisionTasks）一起改。
 import {
   PoseLandmarker,
   FilesetResolver,
 } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/vision_bundle.mjs";
 import { PersonTracker, buildDetection } from "./tracking.js";
-import { ArcDetector } from "./gesture.js";
+import {
+  MP_LEFT_WRIST, MP_RIGHT_WRIST, MP_LEFT_ELBOW, MP_RIGHT_ELBOW, MP_LEFT_SHOULDER, MP_RIGHT_SHOULDER, MP_LEFT_HAND, MP_RIGHT_HAND,
+  mergedHandPoint, updateGestures, resetGestures, lockedHandOf,
+} from "./gesture.js";
 
-// ── 基礎設定 ──
 const CONFIG = {
   // 攝影機解析度與幀率的「上限」（getUserMedia 用 max 而非只給 ideal）：外接攝影機的原生模式常是 1080p60，真的拿到會讓每幀多搬四倍像素、rVFC 一秒觸發 60 次推論，多數機器跟不上；
   // 用 max 收成硬上限後瀏覽器會自行降採樣，實際協商到的規格若超出會在 console 警告。
@@ -36,59 +38,24 @@ export function warmPoseModel() {
 
 // MediaPipe 的 numPoses（同時追幾個人）決定它的工作模式：「追到的人數 ≥ numPoses」時偵測器跳過、每個人的 ROI 由上一幀的 landmark 延續——沒有幽靈骨架、節點最穩；
 // 「追到的人數 < numPoses」時偵測器每幀重跑，幽靈與抖動都是這個狀態的產物。設小了多出來的人不會被偵測到，這是設定的字面意思。
-// landmarker 完全懶惰載入：開頁不預建，還沒選「現場人數」之前不推論（chosenPoseCount 為 0 時 processFrame 跳過 detectForVideo）；使用者選 N 才第一次建置 numPoses=N 的實例，
-// 追蹤層的槽位數（＝ ID 上限）也設成 N（見 setPoseCount）。只維持一份使用中的實例（見 requestLandmarker()）：新的建好才換手，等待期間畫面用舊的繼續推論不凍結，只是新設定有 1~2 秒延遲。
+// landmarker 完全懶惰載入、同一時間只維持一份使用中的實例（requestLandmarker()）：選了「現場人數」N 才建 numPoses=N 的實例，追蹤層的槽位數（＝ ID 上限）也設成 N（setPoseCount）；
+// 新的建好才換手，等待期間畫面用舊的繼續推論不凍結，只是新設定有 1~2 秒延遲。
+
 const POSE_COLORS = ["#00FFFF", "#FF6B6B", "#51CF66", "#FFD43B"]; // 4 人的代表色彩（依鎖定槽位對應）
 const BONE_WIDTH = 2;      // 骨架連線寬度（px）
 const JOINT_RADIUS = 2;    // 關節圓點半徑（px）
 const TAU = Math.PI * 2;
 // 嘴巴中點正下方的虛擬「下巴」節點偏移量：以肩寬為單位（同 ArcDetector 門檻、ID 標籤字級的慣例），人離鏡頭遠近不同時比例才一致
 const CHIN_OFFSET_RATIO = 0.18;
-// 慣用手鎖定的兩道放開條件：HAND_LOCK_RELEASE_MS 是保險絲（排程器是觸發事件驅動，停頓幾秒——例如對著一顆長音不動——是正常演奏節奏，所以門檻放寬）；
-// 真正負責「換手」體驗的是 HAND_STILL_RADIUS／HAND_STILL_MS：鎖定的手連續待在小範圍內夠久就視為靜止（藏起來的手通常也是靜止的），
-// 比「多久沒觸發」更直接對應「手被藏起來但還沒觸發過」——MediaPipe 對被遮擋的手常猜一個信心分數還過得去的位置，可見度旗標未必掉到不可見，光調可見度遲滯沒有用。
-const HAND_LOCK_RELEASE_MS = 8000;
-const HAND_STILL_RADIUS = 0.10;  // 肩寬單位，小於 ArcDetector 的 minDepthRatio(0.15)：真正的
-                                  // 拋物線手勢一定會讓手離開這個半徑，不會誤放開正在使用的手
-const HAND_STILL_MS = 700;       // 連續待在半徑內這麼久才放開鎖定
 
 const FRAME_ERROR_THRESHOLD = 90; // 連續幾幀處理失敗才判定為持續性錯誤並顯示錯誤畫面（約 1.5~3 秒）
 
-// 誰匹配誰、新面孔何時鎖定空位的純邏輯在 tracking.js。let 而非 const：槽位數要跟「現場人數」走（applyPoseCount 會用新的 maxUsers 重建）。
+// 誰匹配誰、新面孔何時鎖定空位，都在 tracking.js。let 而非 const：槽位數要跟「現場人數」走（applyPoseCount 會用新的 maxUsers 重建）。
 let tracker = new PersonTracker({ maxUsers: CONFIG.maxUsers });
 
-// 手勢：每個鎖定槽位左右手各一個 ArcDetector（拋物線手勢 → 換音符的觸發；不輸出音量）。每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號」＋「這一幀真的在場的槽位」，
+// 手勢（gesture.js 的 updateGestures()）：每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號」＋「這一幀真的在場的槽位」，
 // 經 setPerformanceStateListener 註冊的回呼送出。目前沒有人註冊（觸發來源是鍵盤）；接回方式見規格文件。
-const MP_LEFT_WRIST = 15, MP_RIGHT_WRIST = 16;
-const MP_LEFT_ELBOW = 13, MP_RIGHT_ELBOW = 14;
-const MP_LEFT_SHOULDER = 11, MP_RIGHT_SHOULDER = 12;
-// 手掌點（拇指／食指／小指）：跟手腕平均起來當「手掌＋手腕合併」的單一座標，ArcDetector 追蹤與骨架繪製的合併大點共用（renderSkeletonOverlay()）。
-const MP_LEFT_HAND = [17, 19, 21], MP_RIGHT_HAND = [18, 20, 22];
-const arcDetectors = Array.from({ length: CONFIG.maxUsers },
-  () => ({ left: new ArcDetector(), right: new ArcDetector() }));
-// 合成雙手結果時需要「上一幀各手的 triggerSeq」判斷有沒有新觸發（combineArcTriggers()）：ArcDetector 的 triggerSeq 是累加值，不是「這一幀有沒有觸發」的旗標。
-const arcLastSeqBySlot = Array.from({ length: CONFIG.maxUsers },
-  () => ({
-    left: 0, right: 0, combinedSeq: 0, lockedHand: null, lastTriggerMs: undefined,
-    stillAnchor: null, stillSinceMs: undefined,
-  }));
-// 注意：combinedSeq 刻意不在這裡歸零。接收端靠它「有沒有變」判斷有沒有新觸發，歸零會讓下一次比對誤判成新事件、平白多彈一個音（實測：走出鏡頭超過 SLOT_RELEASE_MS、按重置骨架 ID、改現場人數都會呼叫到這裡）；它單調遞增、永不重置。
-const resetSlotDetectors = (arcSlot, lastSeq) => {
-  arcSlot.left.reset(); arcSlot.right.reset();
-  lastSeq.left = 0; lastSeq.right = 0;
-  lastSeq.lockedHand = null; lastSeq.lastTriggerMs = undefined;
-  lastSeq.stillAnchor = null; lastSeq.stillSinceMs = undefined;
-};
-// 一次歸位所有槽位的手勢偵測器（重置骨架 ID、關閉攝影機、人數改變重建追蹤器時共用）。
-const resetAllSlotDetectors = () => {
-  for (let slot = 0; slot < arcDetectors.length; slot++) {
-    resetSlotDetectors(arcDetectors[slot], arcLastSeqBySlot[slot]);
-  }
-};
 const EMPTY_PERFORMANCE_STATE = { arcTriggerSeqBySlot: {}, presentSlots: [] };
-// 槽位這一幀沒有 active track 時的「不在場起算時刻」（0＝在場）。連續不在場超過 SLOT_RELEASE_MS 才把偵測器整個 reset；在那之前只餵 null 讓追蹤中斷，避免追蹤閃斷一兩幀就丟掉進行中的動作。
-const slotInactiveSinceMs = new Array(CONFIG.maxUsers).fill(0);
-const SLOT_RELEASE_MS = 1000;
 
 let performanceStateListener = null;
 let lastSentState = null;
@@ -122,12 +89,9 @@ function emitGesturePerformanceState(state, nowMs) {
   }
 }
 
-// ── 播放環境能力偵測 ──
-// requestVideoFrameCallback 能精準對齊視訊幀（新幀到達才觸發，比 rAF 輪詢更省電更準時）；
-// scheduleNextFrame() 依此決定排程 API：支援則用 rVFC，否則降級為 requestAnimationFrame。
+// requestVideoFrameCallback（rVFC）只在新幀到達時觸發，比 rAF 輪詢省電也準；不支援時 scheduleNextFrame() 降級為 requestAnimationFrame。
 const useRVFC = "requestVideoFrameCallback" in HTMLVideoElement.prototype;
 
-// ── DOM 參照 ──
 const video = document.getElementById("webcam");
 const glCanvas = document.getElementById("gl-canvas");
 const overlayCanvas = document.getElementById("overlay-canvas");
@@ -138,7 +102,6 @@ let onStatus = null;
 let onError = null;
 const stageHint = document.getElementById("stage-hint"); // 舞台中央的提示（攝影機關閉／還沒選現場人數）
 
-// ── 狀態 ──
 let poseLandmarker = null;
 let gl = null;      // WebGL context
 let glTexture = null;      // video texture
@@ -152,19 +115,16 @@ let chosenPoseCount = 0;  // 系統控制 bar 選的「現場人數」；0 ＝ �
 // 只有一份在飛，用物件識別（pendingBuild !== build）判斷是否被取代。
 let pendingBuild = null;
 
-// ── 幀迴圈 ──
 // frameHandle：已排程的下一幀代號（rVFC 與 rAF 的 id 都 ≥ 1，0＝沒有排程中的回呼）。isLoopStopped：迴圈停止中（攝影機關閉、致命錯誤）；已排隊的回呼另外真的取消掉（stopFrameLoop），旗標只是第二道防線。
 let frameHandle = 0;
 let isLoopStopped = true;
 
-// ── 攝影機狀態機（見下方「攝影機開啟／關閉」）──
 let cameraStream = null;          // 開啟中的 MediaStream；null ＝ 關閉
 let cameraState = "off";          // "off" | "starting" | "on" | "stopping"
 let cameraOffReason = "";         // 關閉時舞台提示的文字；"" ＝ 使用者主動關閉（顯示預設文字）
 let cameraOp = Promise.resolve(); // start／stop／ended 序列化用的 promise 鏈
 let cameraStateListener = null;
 
-// ── WebGL 初始化 ──
 const VERT_SRC = `
   attribute vec2 a_position;
   attribute vec2 a_texCoord;
@@ -288,18 +248,6 @@ function renderVideoGL() {
 
 function isFacePoint(i) { return i >= 0 && i <= 10; }
 
-// 手腕＋手掌（拇指／食指／小指）平均起來的合併座標，ArcDetector 追蹤與骨架繪製的大點共用（renderSkeletonOverlay()）。手腕本身不可見就視為這隻手不在畫面。
-function mergedHandPoint(sm, wristIdx, handIdxs) {
-  const wrist = sm[wristIdx];
-  if (!wrist.visible) return null;
-  let sx = wrist.x, sy = wrist.y, n = 1;
-  for (const i of handIdxs) {
-    const p = sm[i];
-    if (p.visible) { sx += p.x; sy += p.y; n++; }
-  }
-  return { x: sx / n, y: sy / n };
-}
-
 // 兩肩中點當虛擬「脖子」節點——MediaPipe Pose 沒有脖子 landmark。
 function virtualNeckPoint(lm) {
   const ls = lm[MP_LEFT_SHOULDER], rs = lm[MP_RIGHT_SHOULDER];
@@ -317,67 +265,6 @@ function virtualChinPoint(lm, shoulderWidth) {
   };
 }
 
-// 把一個在場槽位的骨架餵給它那對 ArcDetector；回傳的可見度、座標與肩寬供 combineArcTriggers() 判斷鎖定的手是否該放開（可見度、靜止偵測都要用到實際座標）。
-function updateSlotArc(arcDet, track, nowMs) {
-  const sm = track.smoothed;
-  const ls = sm[MP_LEFT_SHOULDER], rs = sm[MP_RIGHT_SHOULDER];
-  const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
-  const leftPoint = mergedHandPoint(sm, MP_LEFT_WRIST, MP_LEFT_HAND);
-  const rightPoint = mergedHandPoint(sm, MP_RIGHT_WRIST, MP_RIGHT_HAND);
-  return {
-    left: arcDet.left.update({ point: leftPoint, shoulderWidth }, nowMs),
-    right: arcDet.right.update({ point: rightPoint, shoulderWidth }, nowMs),
-    leftVisible: !!leftPoint,
-    rightVisible: !!rightPoint,
-    leftPoint, rightPoint, shoulderWidth,
-  };
-}
-
-// 合成雙手的 ArcDetector 結果，並套用「自動鎖定慣用手」：哪隻手先做出有效拋物線就鎖定它，之後只認那隻手的觸發——避免另一隻閒置手被模型猜出來後在畫面上飄移、湊出假拋物線造成誤觸發（實測發現）。
-// 鎖定的手連續不可見、連續 HAND_LOCK_RELEASE_MS 沒有新觸發（保險絲）、或連續 HAND_STILL_MS 幾乎沒在動（主要機制，見常數註解）才放開讓使用者換手。
-// combinedSeq 是槽位自己的累加計數，供接收端判斷「有沒有新事件」；state 就是 arcLastSeqBySlot[slot]，逐幀被這個函式直接改動（歸位見 resetSlotDetectors）。
-function combineArcTriggers(state, arc, nowMs) {
-  const { left, right, leftVisible, rightVisible, leftPoint, rightPoint, shoulderWidth } = arc;
-
-  if (state.lockedHand === "left" && !leftVisible) state.lockedHand = null;
-  if (state.lockedHand === "right" && !rightVisible) state.lockedHand = null;
-  if (state.lockedHand && nowMs - (state.lastTriggerMs ?? nowMs) > HAND_LOCK_RELEASE_MS) {
-    state.lockedHand = null;
-  }
-
-  if (state.lockedHand) {
-    const point = state.lockedHand === "left" ? leftPoint : rightPoint;
-    const radius = HAND_STILL_RADIUS * Math.max(shoulderWidth || 0, 0.04);
-    const dist = point && state.stillAnchor ? Math.hypot(point.x - state.stillAnchor.x, point.y - state.stillAnchor.y) : Infinity;
-    if (dist > radius) {
-      state.stillAnchor = point;
-      state.stillSinceMs = nowMs;
-    } else if (nowMs - state.stillSinceMs > HAND_STILL_MS) {
-      state.lockedHand = null;
-    }
-  } else {
-    state.stillAnchor = null;
-  }
-
-  const leftChanged = left.triggerSeq !== state.left;
-  const rightChanged = right.triggerSeq !== state.right;
-  state.left = left.triggerSeq;
-  state.right = right.triggerSeq;
-
-  if (!state.lockedHand) {
-    if (leftChanged) state.lockedHand = "left";
-    else if (rightChanged) state.lockedHand = "right";
-  }
-
-  const triggered = (state.lockedHand === "left" && leftChanged)
-    || (state.lockedHand === "right" && rightChanged);
-  if (triggered) {
-    state.lastTriggerMs = nowMs;
-    state.combinedSeq = (state.combinedSeq || 0) + 1;
-  }
-  return { triggerSeq: state.combinedSeq || 0 };
-}
-
 // 精簡骨架只畫手勢相關的手臂鏈（肩-肘-手掌大點）＋臉部簡化輪廓，不畫全身連線（髖／膝／踝／腳掌沒有被任何手勢或播放邏輯讀取）。
 // 只到肘為止：肘→手掌大點那一段要連到合併後的座標，不是原始手腕點，兩者位置不同，用索引表連不出正確的線（會跟大點之間留一截空隙）。
 const ARM_CONNECTIONS = [
@@ -388,7 +275,7 @@ const ARM_CONNECTIONS = [
 const MOUTH_PAIR = [9, 10];
 const HAND_DOT_RADIUS = JOINT_RADIUS * 2.2; // 手腕＋手掌合併後的大點，比一般關節明顯
 
-// ── 2D 覆蓋層繪製骨架（依鎖定槽位上色，同一人跨幀顏色不變）──
+// 2D 覆蓋層繪製骨架：依鎖定槽位上色，同一人跨幀顏色不變。
 function renderSkeletonOverlay(activeTracks) {
   const W = overlayCanvas.width;
   const H = overlayCanvas.height;
@@ -409,7 +296,7 @@ function renderSkeletonOverlay(activeTracks) {
     const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
 
     // 只畫目前鎖定的那隻手（未鎖定時兩隻都畫）：另一隻閒置手消失，使用者才看得出系統現在認哪隻手（combineArcTriggers() 的自動鎖定慣用手）。
-    const lockedHand = arcLastSeqBySlot[track.slot]?.lockedHand;
+    const lockedHand = lockedHandOf(track.slot);
     const showLeftHand = lockedHand !== "right";
     const showRightHand = lockedHand !== "left";
     // 手腕＋手掌合併點要先算出來：肘→手掌那段連線與手掌大點都要用同一個座標，兩處對不齊就會看起來中間有空隙。
@@ -425,7 +312,6 @@ function renderSkeletonOverlay(activeTracks) {
       bones.moveTo(p.x * W, p.y * H);
       bones.lineTo(q.x * W, q.y * H);
     }
-    // 肘 → 手掌合併點：連到合併後的座標，不是原始手腕點，線才會直接接上下面畫的大點。
     const lElbow = lm[MP_LEFT_ELBOW], rElbow = lm[MP_RIGHT_ELBOW];
     if (leftHand && (lElbow.visible ?? true)) {
       bones.moveTo(lElbow.x * W, lElbow.y * H);
@@ -435,12 +321,10 @@ function renderSkeletonOverlay(activeTracks) {
       bones.moveTo(rElbow.x * W, rElbow.y * H);
       bones.lineTo(rightHand.x * W, rightHand.y * H);
     }
-    // 兩肩到虛擬脖子節點的連線。
     if (neck) {
       bones.moveTo(ls.x * W, ls.y * H); bones.lineTo(neck.x * W, neck.y * H);
       bones.moveTo(rs.x * W, rs.y * H); bones.lineTo(neck.x * W, neck.y * H);
     }
-    // 嘴巴兩節點＋虛擬下巴節點連成倒三角形。
     if (chin) {
       const mLeft = lm[MOUTH_PAIR[0]], mRight = lm[MOUTH_PAIR[1]];
       bones.moveTo(mLeft.x * W, mLeft.y * H); bones.lineTo(mRight.x * W, mRight.y * H);
@@ -451,7 +335,7 @@ function renderSkeletonOverlay(activeTracks) {
     ctx2d.lineWidth = BONE_WIDTH;
     ctx2d.stroke(bones);
 
-    // 關節點：肩／肘／脖子／下巴正常大小；雙眼與鼻子各畫一個獨立節點、不連線；手腕與手掌合併畫成一個較大的點（與 updateSlotArc() 的 mergedHandPoint() 同一套合併邏輯，畫面跟手勢追蹤的點位一致）。
+    // 關節點：肩／肘／脖子／下巴正常大小；雙眼與鼻子各畫一個獨立節點、不連線；手腕與手掌合併畫成一個較大的點（mergedHandPoint() 與手勢偵測共用，畫面跟手勢追蹤的點位一致）。
     const joints = new Path2D();
     const addJoint = (x, y, radius) => {
       // arc 從角度 0（圓的右端）起筆，先 moveTo 過去，否則會從上一個圓拉一條線過來
@@ -512,7 +396,6 @@ function renderSkeletonOverlay(activeTracks) {
   ctx2d.restore();
 }
 
-// ── 核心幀處理 ──
 function processFrame() {
   frameHandle = 0;           // 這一次回呼已經觸發，沒有排程中的了（startFrameLoop 據此決定要不要排新的）
   if (isLoopStopped) return; // 已停止：連已排隊的回呼也一併作廢（取消失敗時的第二道防線）
@@ -544,41 +427,8 @@ function processFrame() {
     tracker.update(detections, nowMs);
     const activeTracks = tracker.getActiveTracks();
 
-    // ▶ 手勢：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector，另外回報這一幀真的在場的槽位。
-    const arcTriggerSeqBySlot = {};
-    const presentSlots = [];
-    // 先把 active track 攤成「槽位 → track」的查表；上限是追蹤器目前的槽位數（＝現場人數），追蹤器只有 2 個槽位時送出去的 map 不該還帶永遠是空的 3、4
-    const slotCount = tracker.cfg.maxUsers;
-    const trackBySlot = new Array(slotCount).fill(null);
-    for (const t of activeTracks) trackBySlot[t.slot] = t;
-
-    for (let slot = 0; slot < slotCount; slot++) {
-      const track = trackBySlot[slot];
-      const arcDet = arcDetectors[slot];
-      let arc;
-      if (track) {
-        slotInactiveSinceMs[slot] = 0;
-        presentSlots.push(slot + 1);
-        arc = updateSlotArc(arcDet, track, nowMs);
-      } else {
-        // 不在場：釋放窗內兩隻手都餵「看不到」讓拋物線追蹤中斷；連續不在場超過 SLOT_RELEASE_MS 才真的 reset（下次鎖進來從乾淨開始）。
-        if (slotInactiveSinceMs[slot] === 0) slotInactiveSinceMs[slot] = nowMs;
-        if (nowMs - slotInactiveSinceMs[slot] > SLOT_RELEASE_MS) {
-          resetSlotDetectors(arcDet, arcLastSeqBySlot[slot]);
-          arc = { left: { triggerSeq: 0 }, right: { triggerSeq: 0 }, leftVisible: false, rightVisible: false };
-        } else {
-          arc = {
-            left: arcDet.left.update({ point: null }, nowMs),
-            right: arcDet.right.update({ point: null }, nowMs),
-            leftVisible: false,
-            rightVisible: false,
-          };
-        }
-      }
-      const combinedArc = combineArcTriggers(arcLastSeqBySlot[slot], arc, nowMs);
-      arcTriggerSeqBySlot[slot + 1] = combinedArc.triggerSeq;
-    }
-    emitGesturePerformanceState({ arcTriggerSeqBySlot, presentSlots }, nowMs);
+    // ▶ 手勢（gesture.js）：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector，另外回報這一幀真的在場的槽位；槽位數＝追蹤器目前的槽位數（＝現場人數）
+    emitGesturePerformanceState(updateGestures(activeTracks, tracker.cfg.maxUsers, nowMs), nowMs);
 
     // ▶ WebGL 渲染攝影機畫面當背景
     renderVideoGL();
@@ -625,12 +475,10 @@ function startFrameLoop() {
   if (!frameHandle) scheduleNextFrame();
 }
 
-// ── 工具函式 ──
 function setStatus(msg) { onStatus?.(msg); }
 
 function showError(title, detail = "") { onError?.(title, detail); }
 
-// ── 攝影機開啟／關閉（畫質／幀率封頂、可停可開）──
 // getUserMedia 失敗時給使用者看的文字：開機失敗的錯誤畫面（initSystem）與執行期重開失敗的舞台提示／狀態列（startCamera）共用。
 const CAMERA_ERROR_MESSAGES = {
   NotAllowedError: ["鏡頭權限被拒絕", "請在瀏覽器設定中允許本頁面使用鏡頭。"],
@@ -720,8 +568,7 @@ function detachCamera(reason) {
   cameraOffReason = reason;
   try { gl?.clear(gl.COLOR_BUFFER_BIT); } catch (e) { /* context 可能正在遺失 */ }
   ctx2d.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
-  resetAllSlotDetectors();
-  slotInactiveSinceMs.fill(0);
+  resetGestures();
   // 讓接收端立刻知道沒有人在場，不等它的斷訊看門狗。
   emitGesturePerformanceState(EMPTY_PERFORMANCE_STATE, performance.now());
 }
@@ -763,8 +610,7 @@ function refreshStageHint() {
   stageHint.hidden = !text;
 }
 
-// ── Pose 模型載入（單一實例，懶惰載入）──
-// 純粹建置，不動任何模組層狀態。
+// 建好一份 landmarker 並回傳，不動使用中的 poseLandmarker（換手在 setPoseCount）；來源失敗才前進 poseModelIndex。
 async function loadPoseModel(numPoses) {
   for (;;) {
     const idx = poseModelIndex;
@@ -822,7 +668,6 @@ function abandonPendingBuild() {
   build?.promise.catch(() => {});
 }
 
-// ── 初始化流程 ──
 async function initSystem() {
   try {
     setStatus("正在初始化 WebGL 渲染引擎⋯");
@@ -850,12 +695,10 @@ async function initSystem() {
   }
 }
 
-// ── 外部 API ──
-// 重置骨架 ID：釋放所有已鎖定的槽位、候選名單與身分記憶，讓下一幀重新鎖定
+// 重置骨架 ID：釋放所有已鎖定的槽位與候選名單，讓下一幀重新鎖定
 export function hardReset() {
   tracker.hardReset();
-  resetAllSlotDetectors();
-  slotInactiveSinceMs.fill(0);
+  resetGestures();
   emitGesturePerformanceState(EMPTY_PERFORMANCE_STATE, performance.now());
   ctx2d.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 }
@@ -903,8 +746,7 @@ function applyPoseCount(count) {
   chosenPoseCount = count;
   if (tracker.cfg.maxUsers !== count) {
     tracker = new PersonTracker({ maxUsers: count });
-    resetAllSlotDetectors();
-    slotInactiveSinceMs.fill(0);
+    resetGestures();
     ctx2d.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
     emitGesturePerformanceState(EMPTY_PERFORMANCE_STATE, performance.now());
   }
@@ -915,7 +757,6 @@ function applyPoseCount(count) {
   }
 }
 
-// ── 攝影機開關（系統控制 bar 的按鈕；開機也走同一條路）──
 // getCameraState() 回傳 { on, busy, message }：on＝攝影機開著、busy＝開啟／關閉進行中（按鈕該 disabled）、message＝關閉的原因或開啟失敗的文字（""＝使用者自己關的）。ui.js 用它畫按鈕與狀態列。
 export function getCameraState() {
   return {
@@ -958,7 +799,6 @@ export function stopCamera() {
   });
 }
 
-// ── 資源清理 ──
 window.addEventListener("beforeunload", () => {
   stopFrameLoop();
   cameraStream?.getTracks().forEach((t) => t.stop());
@@ -975,8 +815,7 @@ window.addEventListener("beforeunload", () => {
   }
 });
 
-// ── 啟動（必須由呼叫端明確呼叫）──
-// 啟動攝影機與姿勢偵測。由 main.js 明確呼叫 startVision()，不靠模組頂層的 import 副作用（那樣「攝影機會不會開」會取決於有沒有人 import 到這個檔案，搬動 import 就默默黑畫面）。
+// 啟動攝影機與姿勢偵測。必須由 main.js 明確呼叫 startVision()，不靠模組頂層的 import 副作用（那樣「攝影機會不會開」會取決於有沒有人 import 到這個檔案，搬動 import 就默默黑畫面）。
 // 回傳 promise，resolve 值為是否初始化成功（失敗時已經經由 onError 回呼顯示錯誤畫面）。重複呼叫安全：一律回傳同一個 promise，不會啟動第二次。
 let startPromise = null;
 export function startVision({ onStatus: statusFn, onError: errorFn } = {}) {

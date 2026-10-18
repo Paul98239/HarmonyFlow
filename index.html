@@ -7,11 +7,9 @@
 
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🎹</text></svg>">
 
-  <!-- 全域樣式：唯一的樣式來源。 -->
   <link rel="stylesheet" href="./src/styles.css">
 
-  <!-- ── 開場資源背景預先載入（瀏覽器原生機制，不經任何自訂 JS）──
-       音色庫 preload 在 HTML 解析階段就把請求發出去；之後 SpessaSynth（fetch soundfont）載入同一個 URL 時直接沿用背景下載好的
+  <!-- 音色庫 preload 在 HTML 解析階段就把請求發出去；之後 SpessaSynth（fetch soundfont）載入同一個 URL 時直接沿用背景下載好的
        回應，不會重抓。網址必須跟 src/midi/synth.js 的 SOUNDFONT_URLS[0] 逐字相同，不然預載白費；本地副本只在 CDN 失敗時才載，不預載。
        姿勢模型不預載：它要等使用者選了現場人數才會用到（可能永遠不選），預載了卻沒在幾秒內用掉，Chrome 會在 console 報黃色警告；
        改由 src/vision/vision.js 的 warmPoseModel() 在開機完成後用低優先序 fetch 暖機。
@@ -20,7 +18,7 @@
 
   <link rel="modulepreload" href="./src/main.js">
   <link rel="modulepreload" href="./src/ui.js">
-  <link rel="modulepreload" href="./src/keyboard.js">
+  <link rel="modulepreload" href="./src/input/keyboard.js">
   <link rel="modulepreload" href="./src/midi/synth.js">
   <link rel="modulepreload" href="./src/midi/midiPlayer.js">
   <link rel="modulepreload" href="./src/midi/midiParser.js">

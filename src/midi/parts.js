@@ -1,10 +1,8 @@
 import { buildPortOffsets } from './timeline.js';
 
-// parts.js — 聲部層（純邏輯，無 DOM／CDN）：
-//  1) 名稱表：GM 繁中（台灣用語）音色名、鼓組名、音名（分譜清單與 midiPlayer.js 用）；
-//  2) 樂器層：track 分組成聲部（part）與譜表（staff）、依 GM family 拆 part、staff 的初始音色、命名、音符配對，
-//     以及控制器軌（每個絕對 channel 的非音符 channel 事件）、系統軌（SysEx 與分類）、文字軌（FF01～FF0F）；
-//  3) 衍生層：某個 tick 之前的控制器狀態與 chase 序列（segments 在 midiParser.js 的 buildSegments()）。
+// parts.js — 名稱表（GM 繁中音色名、鼓組名、音名；分譜清單與 midiPlayer.js 用）、聲部切分（track → part／staff、依 GM family 拆 part、初始音色、命名）、音符配對、
+// 控制器軌（每個絕對 channel 的非音符 channel 事件）、系統軌（SysEx 與分類）、文字軌（FF01～FF0F）、某個 tick 之前的控制器狀態與 chase 序列；
+// 也是 MIDI 規格常數與表的唯一定義處。segments 在 midiParser.js 的 buildSegments()。
 
 // GM1 打擊樂固定使用第 10 個 MIDI channel（索引 9）上 program 代表的鼓組而非旋律樂器；GM2 §2.4／§3.3.1 允許用 Bank Select 在任何 channel 切換：
 // bank 79H(121)＝旋律、78H(120)＝節奏——staff 的 percussionKit 依這條規則判定（buildPart()），不是只看 channel 號碼。這張表只用來檢查鼓組 program 是不是 GM2 附錄 B 定義的編號。
@@ -80,14 +78,17 @@ export function midiNoteName(midiNote) {
   return PITCH_CLASS_NAMES[midiNote % 12] + (Math.floor(midiNote / 12) - 1);   // MIDI 0 ＝ C-1，所以八度要減 1
 }
 
-// ── 樂器層：聲部切分、命名、控制器軌、系統軌、文字軌 ──
-
 /** @typedef {import('./midiParser.js').MidiChannelEvent} MidiChannelEvent */
 /** @typedef {import('./midiParser.js').MidiNote} MidiNote */
 
-const DRUM_CHANNEL = 9; // GM1 的打擊 channel（第 10 個，索引 9）；GM2 另外允許用 Bank Select 切換，見 GM_DRUM_KITS 的說明
-
-// ── 聲部切分（Part／staff）與音符配對 ──
+// MIDI 規格常數與表：唯一定義處（RESET_CC、PARAMETER_CC、GM_DEFAULT_MIXER 在後面），其他檔經 midiParser.js import，不再各自定義。
+export const DRUM_CHANNEL = 9; // GM1 的打擊 channel（第 10 個，索引 9）；GM2 另外允許用 Bank Select 切換，見 GM_DRUM_KITS 的說明
+export const BANK_MSB_RHYTHM = 120, BANK_MSB_MELODY = 121;   // GM2 §2.4／§3.3.1：Bank Select MSB 78H＝節奏、79H＝旋律
+export const PITCH_BEND_CENTER = 8192;                       // 14-bit，LSB 在 data1、MSB 在 data2
+export const CC = Object.freeze({
+  BANK_MSB: 0, DATA_MSB: 6, BANK_LSB: 32, DATA_LSB: 38, HOLD: 64, SOSTENUTO: 66, DATA_INC: 96, DATA_DEC: 97,
+  NRPN_LSB: 98, NRPN_MSB: 99, RPN_LSB: 100, RPN_MSB: 101, ALL_SOUND_OFF: 120, RESET_ALL: 121, ALL_NOTES_OFF: 123, MONO: 126, POLY: 127,
+});
 
 // 切分規則（一條規則，沒有「是不是 MuseScore 檔」的分支）：
 //   part ＝ MuseScore 的一個樂器（可指派的單位）。MuseScore 一個譜表一條 track，只有樂器最上面一行譜的 track 在 tick 0 對這個樂器的每個 channel 寫初始化區塊
@@ -97,13 +98,10 @@ const DRUM_CHANNEL = 9; // GM1 的打擊 channel（第 10 個，索引 9）；GM
 //   不推導譜號、旋律／伴奏、Voice 1–4、演奏法、踏板線、動態曲線、反覆記號：MIDI 裡不存在或不精準，硬推只會多出誤判。
 //   已知限制：同一條 track 內的多個 channel 視為同一個樂器的音色層（format 0 的多樂器 GM 檔不會被拆開）。
 
-const CC_BANK_MSB = 0;
-const CC_BANK_LSB = 32;
-const CC_RESET_ALL_CONTROLLERS = 121;
 // 混音器的四個 CC：音量、聲像、殘響、合唱（MuseScore 的 Mixer 面板數值）。
 const MIXER_CC = Object.freeze({ 7: 'volume', 10: 'pan', 91: 'reverb', 93: 'chorus' });
 // 沒有初始化區塊時下游送的 GM 預設值（CC121 依規格不會重設音量與聲像，見 GML-v1 §3.2.5.2）。
-const GM_DEFAULT_MIXER = Object.freeze({ volume: 100, pan: 64, reverb: 0, chorus: 0 });
+export const GM_DEFAULT_MIXER = Object.freeze({ volume: 100, pan: 64, reverb: 0, chorus: 0 });
 
 // 逐軌摘要：有音符的 channel、tick 0 的初始化（每個 channel 的 program／bank／混音 CC，同一個值取最後一次）、
 // hasInit（tick 0 有 CC121 或混音 CC；單獨的 Program Change 不算——MuseScore 下行譜有時只有 Program Change）。
@@ -121,9 +119,9 @@ function summarizeTrack(track) {
       init.program = ev.data1;
     } else if (ev.type === 'controlChange') {
       const cc = ev.data1;
-      if (cc === CC_RESET_ALL_CONTROLLERS || cc in MIXER_CC) hasInit = true;
-      if (cc === CC_BANK_MSB) init.msb = ev.data2;
-      else if (cc === CC_BANK_LSB) init.lsb = ev.data2;
+      if (cc === CC.RESET_ALL || cc in MIXER_CC) hasInit = true;
+      if (cc === CC.BANK_MSB) init.msb = ev.data2;
+      else if (cc === CC.BANK_LSB) init.lsb = ev.data2;
       else if (cc in MIXER_CC) init[MIXER_CC[cc]] = ev.data2;
     }
   }
@@ -161,12 +159,12 @@ function instrumentClassOf(group, summary, channel, absChannel) {
       if (ev.kind !== 'channel' || ev.channel !== channel) continue;
       if (ev.type === 'noteOn' && ev.data2 > 0) break;
       if (ev.type === 'programChange') ownProgram = ev.data1;
-      else if (ev.type === 'controlChange' && ev.data1 === CC_BANK_MSB) ownMsb = ev.data2;
+      else if (ev.type === 'controlChange' && ev.data1 === CC.BANK_MSB) ownMsb = ev.data2;
     }
     program ??= ownProgram ?? 0;
     msb ??= ownMsb;
   }
-  const isDrum = msb === 120 || (msb === undefined && absChannel % 16 === DRUM_CHANNEL);
+  const isDrum = msb === BANK_MSB_RHYTHM || (msb === undefined && absChannel % 16 === DRUM_CHANNEL);
   return isDrum ? '打擊' : `family ${program >> 3}`;
 }
 
@@ -314,10 +312,10 @@ function collectNotes(tracks, midiTicksToSeconds, warn, programResolver, staffIn
       const ev = track.events[eventIndex];
       if (ev.kind !== 'channel') continue;
       if (ev.type === 'programChange') { programResolver.noteProgramChange(ev.channel, ev.data1); continue; }
-      if (ev.type === 'controlChange' && (ev.data1 === CC_BANK_MSB || ev.data1 === CC_BANK_LSB)) {
+      if (ev.type === 'controlChange' && (ev.data1 === CC.BANK_MSB || ev.data1 === CC.BANK_LSB)) {
         let b = runningBank.get(ev.channel);
         if (!b) runningBank.set(ev.channel, (b = { msb: 0, lsb: 0 }));
-        if (ev.data1 === CC_BANK_MSB) b.msb = ev.data2; else b.lsb = ev.data2;
+        if (ev.data1 === CC.BANK_MSB) b.msb = ev.data2; else b.lsb = ev.data2;
         continue;
       }
       const isNoteOn = ev.type === 'noteOn' && ev.data2 > 0;
@@ -386,10 +384,10 @@ function buildPart(group, partId, statsByStaff, staffIndex, warn) {
       const st = statsByStaff.get(vk.staffId);
       const fromInit = group.first.initByChannel.get(channel) || null;
       const hasBank = fromInit && (fromInit.msb !== undefined || fromInit.lsb !== undefined);
-      const defaultMsb = vk.channel % 16 === DRUM_CHANNEL ? 120 : 121;
+      const defaultMsb = vk.channel % 16 === DRUM_CHANNEL ? BANK_MSB_RHYTHM : BANK_MSB_MELODY;
       const bank = hasBank ? { msb: fromInit.msb ?? defaultMsb, lsb: fromInit.lsb ?? 0 } : (st.bank ?? { msb: defaultMsb, lsb: 0 });
       const program = fromInit?.program ?? st.program;
-      const percussionKit = bank.msb === 120;
+      const percussionKit = bank.msb === BANK_MSB_RHYTHM;
       const hasMixer = fromInit && Object.values(MIXER_CC).some((k) => fromInit[k] !== undefined);
       const init = hasMixer ? Object.fromEntries(Object.entries(GM_DEFAULT_MIXER).map(([k, d]) => [k, fromInit[k] ?? d])) : null;
       if (percussionKit && !(program in GM_DRUM_KITS)) {
@@ -458,8 +456,6 @@ export function collectPartsAndNotes(tracks, midiTicksToSeconds, warn, programRe
   return { parts, notes };
 }
 
-// ── 控制器軌：每個絕對 channel 的非音符 channel 事件 ──
-
 // 全曲事件的排序鍵（tick → 軌序號 → 軌內序號）＝官方 BasicMIDI timeline 的順序；id 就是「軌序號:軌內序號」。
 export const byFileOrder = (a, b) => a.ticks - b.ticks || a.trackIndex - b.trackIndex || a.eventIndex - b.eventIndex;
 const eventRef = (trackIndex, eventIndex, ev) => ({ id: `${trackIndex}:${eventIndex}`, ticks: ev.ticks, trackIndex, eventIndex });
@@ -494,8 +490,6 @@ export function collectChannelLanes(tracks, portOffsets) {
   for (const lane of lanes.values()) lane.sort(byFileOrder);
   return new Map([...lanes].sort((a, b) => a[0] - b[0]));
 }
-
-// ── 系統軌（SysEx 與分類）與文字軌（FF01～FF0F）──
 
 // SysEx 分類：只解析、不送（要不要送由播放端決定）。data 是 F0 之後的位元組（含結尾的 F7，同官方 processor 收到的）。
 // 依據：MIDI 1.0 Universal SysEx（7E 非即時、7F 即時；第 2 個位元組是裝置 ID）：GM1 On 7E dev 09 01、GM Off 09 02、GM2 On 09 03；Roland GS 的 DT1：41 dev 42 12 位址(3) 資料… checksum
@@ -552,8 +546,6 @@ export function collectTextEvents(tracks) {
   return out.sort(byFileOrder);
 }
 
-// ── 衍生層：控制器狀態查詢與 chase 序列 ──
-
 /** @typedef {import('./midiParser.js').LaneEvent} LaneEvent */
 /** @typedef {import('./midiParser.js').ControllerState} ControllerState */
 
@@ -562,17 +554,15 @@ export function collectTextEvents(tracks) {
 // GM2 §3.3.1（Bank Select 要等下一個 Program Change 才生效）。對照官方 SpessaSynth：Sequencer 跳時間（setTimeTo）時選參數／data entry／bank select 依序全部重送、
 // 其他 CC 只送最後一次、CC121 當成狀態重設而不重送；這裡是同一個概念，但每個狀態只留決定它的最少事件。
 
-const CC = Object.freeze({
-  BANK_MSB: 0, DATA_MSB: 6, BANK_LSB: 32, DATA_LSB: 38, DATA_INC: 96, DATA_DEC: 97,
-  NRPN_LSB: 98, NRPN_MSB: 99, RPN_LSB: 100, RPN_MSB: 101, RESET_ALL: 121, MONO: 126, POLY: 127,
-});
 // CC121 Reset All Controllers（GM2 §3.5.2，與官方 SpessaSynth 依 RP-015 的實作一致）：調變 0、表情 127、延音踏板 0、滑音開關 0、持音踏板 0、弱音踏板 0；
 // 另外 pitch bend 回中心、channel pressure 回 0、RPN 回 null（7F 7F）。音量、聲像、program、bank、滑音時間（CC5）、殘響／合唱深度不動。
-const RESET_CC = new Map([[1, 0], [11, 127], [64, 0], [65, 0], [66, 0], [67, 0]]);
+export const RESET_CC = new Map([[1, 0], [11, 127], [64, 0], [65, 0], [66, 0], [67, 0]]);
 // 瞬間指令，不留狀態、不重播：All Sound Off、All Notes Off、Omni Off／On（GM2 §3.5.4／§3.5.5：只關音、不改模式）。
 const INSTANT_CC = new Set([120, 123, 124, 125]);
 const SELECT_CC = new Set([CC.RPN_MSB, CC.RPN_LSB, CC.NRPN_MSB, CC.NRPN_LSB]);
 const DATA_CC = new Set([CC.DATA_MSB, CC.DATA_LSB, CC.DATA_INC, CC.DATA_DEC]);
+// RPN／NRPN 的選參數與 data entry：接收端的 data entry 套在「當下選的參數」上，要照順序成組送，不能用「跟上次一樣就不送」過濾。
+export const PARAMETER_CC = new Set([...SELECT_CC, ...DATA_CC]);
 
 // 原檔沒有、由狀態推出來要補送的事件（CC121 之後的預設值、選參數）：位置借用推出它的那個事件（排序用），id 是 null。
 function syntheticEvent(at, type, data1, data2) {
@@ -625,7 +615,7 @@ export class ChannelStateTracker {
       const prev = this._cc.get(cc);
       this._cc.set(cc, { value, event: prev?.event ? syntheticEvent(ev, 'controlChange', cc, value) : null });
     }
-    this._pitchBend = { value: 8192, event: this._pitchBend?.event ? syntheticEvent(ev, 'pitchBend', 0, 64) : null };
+    this._pitchBend = { value: PITCH_BEND_CENTER, event: this._pitchBend?.event ? syntheticEvent(ev, 'pitchBend', 0, 64) : null };
     this._pressure = { value: 0, event: this._pressure?.event ? syntheticEvent(ev, 'channelAftertouch', 0, 0) : null };
     if (this._current) {   // 選過參數才需要還原成 RPN null；從沒選過等同 null
       this._regs.rpn = [syntheticEvent(ev, 'controlChange', CC.RPN_MSB, 127), syntheticEvent(ev, 'controlChange', CC.RPN_LSB, 127)];

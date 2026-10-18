@@ -1,5 +1,4 @@
-// midiApi.js — 遠端 MIDI 曲庫 client（分類／搜尋／下載），純資料層、無 DOM。
-// 這裡的逾時涵蓋「連線＋整個 body 下載」（MIDI 檔只有幾 KB）。大檔（音色庫、姿勢模型）不設逾時：慢不等於壞，只有真的出錯才換來源。
+// midiApi.js — 遠端 MIDI 曲庫 client：分類、搜尋、下載。逾時涵蓋「連線＋整個 body 下載」（MIDI 檔只有幾 KB）。
 
 const MIDI_LIBRARY_API = "https://imuse.ncnu.edu.tw/Midi-library/api";
 const FETCH_TIMEOUT_MS = 12000;
@@ -32,7 +31,7 @@ export async function downloadMidiFile(id) {
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
 
   try {
-    // 讓開發者能拿連結把曲庫 MIDI 下載下來用 MuseScore 開啟檢查（根目錄 CLAUDE.md 允許的 console.log 例外之一）
+    // 讓開發者能拿連結下載曲庫 MIDI 用 MuseScore 開啟檢查（console 只出 warn／error 的例外，見 CLAUDE.md）
     console.log(`[雲端下載] ID: ${id} | URL: ${downloadUrl}`);
     const response = await fetch(downloadUrl, { signal: controller.signal });
     if (!response.ok) throw new Error("下載失敗：" + response.status);
@@ -100,7 +99,7 @@ export async function fetchCategories() {
       const categories = normalizeCategories(await fetchJson(endpoint));
       if (categories.length) return categories;
     } catch (error) {
-      // 靜默略過單一 endpoint 的失敗，繼續嘗試下一個
+      // 單一 endpoint 失敗就換下一個
     }
   }
   return [];

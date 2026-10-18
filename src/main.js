@@ -1,13 +1,12 @@
-// main.js — 進入點（composition root）：把各功能接在一起，功能之間不互相 import。
-// 資源下載交給瀏覽器原生 preload；pose 模型要選了現場人數才用到，不預載，開機完成後由 warmPoseModel() 暖機。
+// main.js — 組裝：把各功能接在一起、開機流程、開發用 __stats／__pressLog。
 
 import * as midiPlayer from './midi/midiPlayer.js';
 import { initUi, setLoadingStatus, dismissLoading, showError } from './ui.js';
 import { startVision, setPoseCountListener, warmPoseModel } from './vision/vision.js';
-import { startKeyboardTrigger, getInputDelays } from './keyboard.js';
+import { startKeyboardTrigger, getInputDelays } from './input/keyboard.js';
 import { summarizeMs } from './midi/tempo.js';
 
-// 開發用：console 輸入 __stats() 讀延遲統計。只量 JS 層，音訊段由「音訊輸出」補上，「估計按下到出聲ms」把整條路串起來。
+// __stats() 只量 JS 層，音訊段由「音訊輸出」補上，「估計按下到出聲ms」把整條路串起來。
 window.__stats = () => {
   const audio = midiPlayer.audioLatency();
   const keyWaits = getInputDelays();
@@ -24,12 +23,11 @@ window.__stats = () => {
   };
 };
 
-// 開發用：copy(__pressLog()) 匯出錄音 v3（欄位見規格文件「開發／執行」）。
 window.__pressLog = midiPlayer.pressLog;
 
 async function bootSystem() {
-  midiPlayer.startPlayer(); // 200ms UI tick 與 12ms 排程 tick，不靠 import 副作用
-  // ui.js 不 import 播放器，由這裡交進去；畫面同步先接好，開機期間 #app-shell 是 inert
+  midiPlayer.startPlayer(); // 計時器不靠 import 副作用啟動
+  // 播放器由這裡交給 ui.js；畫面先同步接好，開機期間 #app-shell 是 inert
   initUi(midiPlayer);
   setPoseCountListener(midiPlayer.setPlayerCount);
 
@@ -39,7 +37,7 @@ async function bootSystem() {
     midiPlayer.warmUpMidiEngine(),
   ]);
 
-  // 觸發來源目前是鍵盤，揮手暫時關閉；手勢接回時用 midiPlayer.triggerSlot(槽位)（見規格文件）
+  // 觸發來源目前是鍵盤；手勢接回見規格文件「手勢輸出目前沒有接收者」
   startKeyboardTrigger(midiPlayer.triggerInput, midiPlayer.KEYBOARD_SLOT, midiPlayer.liftInput);
 
   // 視覺初始化失敗時錯誤畫面已經顯示，載入畫面不收、inert 也維持

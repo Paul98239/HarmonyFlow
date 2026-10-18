@@ -1,11 +1,8 @@
-// midiFile.js — 讀檔層：Standard MIDI File 位元組 → 檔頭與每一軌的原始事件（channel／meta／SysEx）。純邏輯，無 DOM／CDN。
-// 依 MMA 官方規格（SMF 1.0，RP-001）手寫，不依賴第三方套件，對照官方 SpessaSynth 的 BasicMIDI／MIDITrack／MIDIMessage。
+// midiFile.js — 讀檔層：Standard MIDI File 位元組 → 檔頭與每一軌的原始事件（channel／meta／SysEx）。依 MMA 官方規格（SMF 1.0，RP-001）手寫，對照官方 SpessaSynth 的 BasicMIDI／MIDITrack／MIDIMessage。
 // 容器容錯（RMID、檔頭雜訊）、running status、截斷軌、警告彙整都在這一層；這一層不解讀音樂（速度表、聲部切分在上面的層）。
 
 /** @typedef {import('./midiParser.js').MidiDivision} MidiDivision */
 /** @typedef {import('./midiParser.js').MidiTrack} MidiTrack */
-
-// ── 規格常數 ──
 
 // Meta 事件型別（SMF 規格第 5 節）。0x01~0x0F 全部是文字類。
 export const META = Object.freeze({
@@ -58,16 +55,12 @@ const CHANNEL_DATA_BYTES = Object.freeze({
 const MAX_PLAUSIBLE_TICK = 1e7;
 const WARNING_LIMIT = 100;
 
-// ── 錯誤型別 ──
-
 export class MidiParseError extends Error {
   constructor(message) {
     super(message);
     this.name = 'MidiParseError';
   }
 }
-
-// ── 位元組讀寫 ──
 
 const utf8Strict = new TextDecoder('utf-8', { fatal: true });
 const latin1 = new TextDecoder('latin1');
@@ -137,8 +130,6 @@ class ByteReader {
   }
 }
 
-// ── 解析：檔頭與 chunk ──
-
 function toBytes(input) {
   if (input instanceof Uint8Array) return input; // Node 的 Buffer 也走這條
   if (input instanceof ArrayBuffer) return new Uint8Array(input);
@@ -204,8 +195,6 @@ function parseDivision(raw) {
   if (!raw) throw new MidiParseError('檔頭的 division 為 0，無法決定時間單位');
   return { type: 'ppq', ticksPerQuarter: raw, raw };
 }
-
-// ── 解析：單一 MTrk ──
 
 function decorateMeta(ev, warn, trackIndex) {
   const d = ev.data;
@@ -395,8 +384,6 @@ function parseTrack(body, trackIndex, warn) {
   };
 }
 
-// ── RP-001 結構性慣例檢查（只加警告，不影響解析結果或播放）──
-
 // RP-001 p.7~9 講的是「應該放在哪裡」的慣例，不是位元組合法性：違反不代表損毀，常見記譜軟體也不見得遵守，所以只在違反時警告，方便追查怪異來源的檔案
 function validateStructuralConventions(tracks, format, warn) {
   const firstTrack = tracks[0];
@@ -448,8 +435,6 @@ function validateStructuralConventions(tracks, format, warn) {
     }
   }
 }
-
-// ── 對外：readSmf ──
 
 /**
  * 位元組 → 檔頭與每一軌的原始事件（parseMidi() 的第一步）。容器容錯、截斷、未知 chunk、RP-001 的結構慣例都在這裡警告。

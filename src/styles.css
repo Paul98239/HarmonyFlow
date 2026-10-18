@@ -2,9 +2,7 @@
    styles.css — HarmonyFlow 全域樣式（唯一樣式來源）
    層疊順序（@layer）：base（token／reset）→ ui（版面骨架與元件外觀，依 DOM 順序）→ states（狀態：[hidden]、accent「開啟」、:focus-visible、@media）。
    後宣告的層永遠贏過先宣告的層，所以 states 裡的規則不需要 !important；⚠️ 沒包進任何層的規則會贏過所有層，新規則一定要放進對應的層。
-   慣例：JS 不寫 element.style；顯示／隱藏切原生 hidden，其他狀態切 is-* class，純呈現一律在這裡用 CSS 表達。明文例外只有三個連續量：--ui-fs、--song-title-scale、--popup-max-height。
-   整體縮放：浮動 UI（播放 pill、控制列）以 --ui-fs 當基準字級、內部一律 em，整組一起縮放。--ui-fs 由 src/ui.js 的 applyUiFontSize() 動態寫在 :root，
-   值＝f(視窗實際像素寬) ÷ 瀏覽器縮放倍率，所以 Ctrl +/− 縮放時 UI 視覺大小不變；下方 :root 的 16px 只是 JS 跑起來前的靜態退路。
+   整體縮放：浮動 UI（播放 pill、控制列）以 --ui-fs 當基準字級、內部一律 em，整組一起縮放。
    ============================================================ */
 
 @layer base, ui, states;
@@ -35,7 +33,7 @@
   --dur-base: .2s;           /* 頂端浮動 UI 的淡化 */
   --idle-opacity: .35;       /* 頂端浮動 UI 沒碰到時的透明度：播放中手不會碰滑鼠，UI 幾乎永遠停在這個淡度，要保留淡出感但不能淡到看不清 */
 
-  /* 浮動 UI 的基準字級；實際值由 src/ui.js 的 applyUiFontSize() 執行期覆寫，16px 只是 JS 尚未執行前的靜態退路 */
+  /* 浮動 UI 的基準字級；實際值由 src/ui.js 的 applyUiFontSize() 執行期覆寫＝f(視窗實際像素寬) ÷ 瀏覽器縮放倍率，所以 Ctrl +/− 縮放時 UI 視覺大小不變；16px 只是 JS 尚未執行前的靜態退路 */
   --ui-fs: 16px;
   /* 選歌彈出面板的高度上限；實際值由 src/ui.js 的 applyPopupMaxHeight() 量測 #camera-frame 動態覆寫，70vh 只是靜態退路 */
   --popup-max-height: 70vh;
@@ -60,7 +58,7 @@ body, html {
 
 @layer ui {
 
-/* ── #webcam：純取樣來源，畫面上永久不顯示 ──
+/* #webcam：純取樣來源，畫面上永久不顯示。
    vision.js 的 texImage2D／drawImage 讀的是解碼幀，跟這裡的 CSS 無關；元素必須留在 DOM 裡（執行期不能搬動）才能繼續跑 requestVideoFrameCallback。
    畫面刻意永久黑幕（見 #stage-blackout），所以連模糊背景也不顯示。用 visibility 而不是 display:none：display:none 的 <video> 在部分瀏覽器會停止解碼，rVFC 就收不到新幀。 */
 #webcam {
@@ -71,7 +69,7 @@ body, html {
   visibility: hidden;
 }
 
-/* ── App shell：置中一個固定比例的攝影機方框 ──
+/* App shell：置中一個固定比例的攝影機方框。
    #app-shell 佔滿視窗、用 flex 把 #camera-frame 置中；背景透明，非 16:9 螢幕的黑邊直接是 body 的 #000。 */
 #app-shell {
   position: relative;
@@ -95,7 +93,7 @@ body, html {
   background: #000;
 }
 
-/* ── 頂端置中疊層：播放 pill 在上、系統控制／選歌控制列在下 ──
+/* 頂端置中疊層：播放 pill 在上、系統控制／選歌控制列在下。
    兩者垂直疊在同一個 flex 直欄、水平都置中，結構上不會互相搶寬度或遮蔽。維持 position:fixed（不放進 #camera-frame）：方框有 overflow:hidden，底下的彈出面板會被裁掉。
    z-index 50 < #loading-overlay 的 100（開機時被載入畫面蓋住）。開機期間擋互動的不是 z-index，是 #app-shell 的 inert 屬性（index.html 開頁就帶著、src/ui.js 收起載入畫面時解除）。 */
 #top-center-stack {
@@ -260,7 +258,7 @@ body, html {
 /* 面板內第一個元素不管是什麼都要讓開 ✕ 的位置，不綁死特定內容，之後面板順序調整也不用跟著改。 */
 .tl-scroll > *:first-child { padding-right: 2.4em; }
 
-/* ── 播放資訊 pill（#top-center-stack 第一個子元素，跟下面的控制列垂直疊在一起、都置中）──
+/* 播放資訊 pill（#top-center-stack 第一個子元素，跟下面的控制列垂直疊在一起、都置中）。
    內容只有播放／暫停／重播／試聽四顆鈕＋歌名；唯讀的播放進度是獨立元素 #topProgressBar（見 .top-progress-bar），不是這個 pill 的一部分。
    歌名完整顯示、不可用省略號截斷：pill 用 width:max-content 跟著內容變寬，只有 max-width 攔住。max-width 沿用 #camera-frame 的寬度公式（min(100vw, 100vh*16/9)），
    pill 最寬就是攝影機外框的寬度，天生不會超出外框，不用 JS 同步兩個元素的寬度。歌名預設單行（.player-status-bar 的 white-space:nowrap），太長時由 --song-title-scale 縮小字級，
@@ -281,7 +279,7 @@ body, html {
   box-shadow: var(--shadow-md);
 }
 
-/* ── 頂端進度條：獨立於播放 pill，純視覺 ──
+/* 頂端進度條：獨立於播放 pill，純視覺。
    寬度沿用 #camera-frame 的寬度公式，並用 left:50%+translateX(-50%) 置中，與 #app-shell 置中的外框水平中心對齊、左右邊緣切齊，不用 JS 量測（同 .toolbar-playback 的 max-width）。
    顏色：未播部分＝--border（同 pill 邊框的灰），已播部分＝--accent（同「播放中」「面板開啟」的黃）。
    不掛任何 hover 淡化規則是刻意的：它是一眼帶過的進度指示，不該要先把滑鼠移過去才看得到。 */
@@ -336,7 +334,7 @@ body, html {
   background: #000;
 }
 
-/* ── 舞台中央的提示（攝影機關閉／還沒選現場人數）──
+/* 舞台中央的提示（攝影機關閉／還沒選現場人數）。
    文字與顯示與否由 vision.js 的 refreshStageHint() 決定。必須是 absolute：#stage 是
    display:grid，多一個 in-flow 子元素就多一列。pointer-events:none 不擋任何點擊。 */
 #stage-hint {
@@ -356,7 +354,7 @@ body, html {
   pointer-events: none;
 }
 
-/* ── 雙層畫布：WebGL 視訊背景 + 2D 骨架覆蓋層 ──
+/* 雙層畫布：WebGL 視訊背景 + 2D 骨架覆蓋層。
    #canvas-container 單純滿版 #stage，子 canvas 的 object-fit:cover 自動處理裁切（滿版無縫隙
    優先於零裁切，不做 letterbox）。 */
 #canvas-container {
@@ -375,7 +373,7 @@ body, html {
 }
 #overlay-canvas { z-index: 1; }
 
-/* ── 永久黑幕：攝影機畫面刻意永遠不顯示（鏡頭與追蹤仍在背景運作，見 vision.js） ──
+/* 永久黑幕：攝影機畫面刻意永遠不顯示（鏡頭與追蹤仍在背景運作，見 vision.js）。
    沒有任何切換方式。z-index 蓋過 #gl-canvas（沒設 z-index，隱含 0）但蓋不過 #overlay-canvas
    （z-index:1）——只蓋攝影機畫面，骨架要畫在黑幕之上；同時仍在 #stage-hint（z-index 2）之下，
    讓「請選擇現場人數」之類的提示文字還是看得到。 */
@@ -388,8 +386,7 @@ body, html {
   background: #000;
 }
 
-/* ── 載入遮罩 ──
-   z-index 100 只管視覺上蓋住整個 app；開機期間點不到、Tab 不到底下的控制項是 #app-shell 的
+/* 載入遮罩：z-index 100 只管視覺上蓋住整個 app；開機期間點不到、Tab 不到底下的控制項是 #app-shell 的
    inert 屬性在擋（見 index.html），不靠這裡接住 pointer event。 */
 #loading-overlay {
   position: fixed; inset: 0;
@@ -418,7 +415,6 @@ body, html {
   font-size: 14px;
 }
 
-/* ── 錯誤遮罩 ── */
 #error-overlay {
   position: fixed; inset: 0;
   background: rgba(0, 0, 0, .92);
@@ -441,8 +437,7 @@ body, html {
   line-height: 1.6;
 }
 
-/* ── 元件外觀 ──
-   尺寸一律用 em：在 .tl-popup 裡相對面板字級、在 .toolbar-playback 裡相對 pill 字級，兩個容器各自縮放，同一個 class 自動跟對。 */
+/* 元件外觀：尺寸一律用 em，在 .tl-popup 裡相對面板字級、在 .toolbar-playback 裡相對 pill 字級，兩個容器各自縮放，同一個 class 自動跟對。 */
 .player-input-group {
   display: flex; flex-direction: column; gap: 0.45em; width: 100%;
 }
@@ -460,7 +455,7 @@ body, html {
 .player-input:focus { border-color: var(--accent); }
 .player-input:disabled { opacity: 0.35; cursor: not-allowed; }
 
-/* ── 自訂檔案選擇器 ──
+/* 自訂檔案選擇器：
    原生 input[type=file] 的「按鈕＋檔名」是瀏覽器自己排版的，檔名會被截斷成不受 CSS 控制的樣子。
    input 本身用 clip 視覺隱藏但保留可操作性（label 的 for 屬性負責觸發），按鈕與檔名各自是一般
    DOM 元素，檔名用 ellipsis，JS 端把完整檔名寫進 title。 */
@@ -478,7 +473,7 @@ body, html {
   font-size: 1em; color: var(--text-muted);
 }
 
-/* ── 頂端 pill 的播放／暫停／重播／試聽四顆鈕 ──
+/* 頂端 pill 的播放／暫停／重播／試聽四顆鈕：
    四顆獨立按鈕，哪顆能按由 midiPlayer.js 的 transportButtonState() 依播放狀態決定；不能按的
    disabled 變灰（見 .btn:disabled）。
      沒歌／載入中 → 全灰（載入中 ▶ 顯示 ⋯）
@@ -540,7 +535,7 @@ body, html {
   white-space: normal; overflow-wrap: anywhere;
 }
 
-/* ── 分譜清單（指派演奏者）──
+/* 分譜清單（指派演奏者）：
    每一列＝「聲部名（GM 音色的繁體中文名）＋一個下拉（無／PC 鍵盤手／演奏者 1~N）」，N＝系統控制 bar 選的「現場人數」。ID 只是槽位編號的顯示提示，畫面上不標示在不在場，指派本身留著。
    這個面板裡唯一真正捲動的地方是 .score-part-list：#scorePartSection 跟它的 min-height:0 都不可省——.tl-scroll 是 overflow:hidden，容不下的高度得靠這條鏈一路把「可以縮小」的權利傳到 .score-part-list，
    缺一層鏈就斷了，內容會被 .tl-popup 的 overflow:hidden 從底部裁掉，看不見也捲不到。 */
@@ -583,7 +578,7 @@ body, html {
 }
 .score-part-row.is-mine .score-part-id { border-color: var(--accent); color: var(--accent); }
 
-/* ── 跑馬燈（.mq）：文字超出欄位寬度時頭尾相連 loop，放得下就一動不動 ──
+/* 跑馬燈（.mq）：文字超出欄位寬度時頭尾相連 loop，放得下就一動不動。
    純 CSS，沒有 JS 計時或量測（Chromium 系限定；不支援的瀏覽器只是不 loop，退回 prefers-reduced-motion 同款的截斷顯示）。
    結構（index.html 的靜態 markup，文字由 ui.js 的 setMarqueeText() 寫入）：
      .mq            欄位本身：overflow:hidden 的 scroll-state 容器，只放原文（.mq-main）一份，所以它的「可捲動」＝原文超出欄位
@@ -640,9 +635,7 @@ body, html {
 
 }
 
-/* ══════════════════════════════════════════
-   狀態層：永遠贏過 ui 層，不需要 !important
-   ══════════════════════════════════════════ */
+/* 狀態層：永遠贏過 ui 層，不需要 !important */
 @layer states {
   /* 共用的顯示／隱藏慣例：JS 只切原生 hidden 屬性（el.hidden = bool）。UA 樣式表本來就有這條，
      但 ui 層的 display:flex 會蓋過 UA；放在 states 層就一定贏。 */
