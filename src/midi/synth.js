@@ -102,8 +102,8 @@ export class PreviewPlayer {
   }
 }
 
-// 音色庫：CDN 的 2.0.3 為主、本地 2.0.1 為備（依序試，任何一步失敗就換下一個）。CDN 網址釘在 SpessaSynth 官方 repo 的 commit（6f75050），不可變；兩版 preset 清單逐筆相同。
-// 不用逾時當備援條件：GitHub Pages 載 10.6MB 實測要 200 秒以上，慢不等於壞。
+// 音色庫：CDN 為主、本地為備（依序試，任何一步失敗就換下一個），兩邊是同一份 GeneralUser GS 2.0.3（逐位元相同）。CDN 網址釘在 SpessaSynth 官方 repo 的 commit（6f75050），不可變。
+// 不用逾時當備援條件：GitHub Pages 載舊的 10.6MB（2.0.1）實測要 200 秒以上，慢不等於壞。
 const SOUNDFONT_URLS = [
   'https://cdn.jsdelivr.net/gh/spessasus/SpessaSynth@6f75050/soundfonts/GeneralUserGS.sf3',
   './src/assets/GeneralUserGS.sf3',
