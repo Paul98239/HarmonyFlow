@@ -154,7 +154,7 @@ export function audioLatency() {
 }
 
 // 量測（同上）：錄音 v3，給 main.js 的 __pressLog 匯出做離線分析：歌、指派（Map 展開成 [partId, 槽位][] 才能轉 JSON）、每次按鍵嘗試（鍵、事件發生與程式收到的時刻、排程器時鐘、有沒有放行）、每次放開（lifts：鍵、時鐘、收了幾顆音）、
-// 事件串流（錨點、速度、每顆音實際發聲的時刻…）與匯出時刻。
+// 事件串流（錨點、速度、每顆音實際發聲與收音的時刻…）與匯出時刻。
 export function pressLog() {
   const { source, songTitle, assignments } = playerStore.state;
   return {

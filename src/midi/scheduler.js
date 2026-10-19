@@ -110,8 +110,8 @@ export function pressLogSubscriber(events) {
 }
 
 /**
- * 錄音用的事件記錄（enableEventLog() 才掛）：錨點與換錨（速度）、放行、每顆音實際發聲的時刻、早按處理，存成可轉 JSON 的小物件，音符用 id（「軌序號:軌內序號」，同一版 parser 解析同一個檔一定相同）。
- * 實際發聲時刻（排程器時鐘）：帶時間戳的電腦音在時間戳發聲（時間戳已經過去就在送出的當下），其餘在送出的當下。
+ * 錄音用的事件記錄（enableEventLog() 才掛）：錨點與換錨（速度）、放行、每顆音實際發聲與收音的時刻、早按處理，存成可轉 JSON 的小物件，音符用 id（「軌序號:軌內序號」，同一版 parser 解析同一個檔一定相同）。
+ * 實際發聲時刻（排程器時鐘）：帶時間戳的電腦音在時間戳發聲（時間戳已經過去就在送出的當下），其餘在送出的當下；收音時刻同理（沒有排定時刻的收音，例如 hold 著的音被暫停收掉，記送出的當下）。
  */
 export function eventLogSubscriber(events) {
   const sub = { entries: [], log() { return this.entries.map((e) => ({ ...e })); }, reset() { this.entries = []; } };
@@ -123,6 +123,7 @@ export function eventLogSubscriber(events) {
   events.on('group', (e) => push({ type: 'group', group: e.group, index: e.index, merged: e.merged.map((m) => m.index), clockMs: e.clockMs }));
   events.on('autoRelease', (e) => push({ type: 'autoRelease', group: e.group, index: e.index, ticks: e.ticks, dueMs: e.dueMs, clockMs: e.clockMs }));
   events.on('noteOn', (e) => push({ type: 'noteOn', noteId: e.noteId, staffId: e.staffId, kind: e.kind, atMs: e.timed ? Math.max(e.dueMs, e.clockMs) : e.clockMs }));
+  events.on('noteOff', (e) => push({ type: 'noteOff', noteId: e.noteId, staffId: e.staffId, kind: e.kind, atMs: e.timed && Number.isFinite(e.offMs) ? Math.max(e.offMs, e.clockMs) : e.clockMs }));
   events.on('chase', (e) => push({ type: 'chase', group: e.group, ticks: e.ticks, chased: ids(e.chased), skipped: ids(e.skipped) }));
   return sub;
 }
@@ -829,7 +830,7 @@ export class Scheduler {
   /** 量測：這一輪每次放開的記錄（keyup 模式；複本）：槽位、鍵、排程器時鐘、收了幾顆音與兩個時刻。重設時清空。 */
   liftLog() { return this._pressLog.liftLog(); }
 
-  /** 開啟錄音用的事件記錄（錨點、換錨、放行、每顆音實際發聲的時刻、早按處理；見 scheduler.js 的 eventLogSubscriber）。 */
+  /** 開啟錄音用的事件記錄（錨點、換錨、放行、每顆音實際發聲與收音的時刻、早按處理；見 scheduler.js 的 eventLogSubscriber）。 */
   enableEventLog() {
     if (!this._eventLog) this._eventLog = eventLogSubscriber(this.events);
   }
