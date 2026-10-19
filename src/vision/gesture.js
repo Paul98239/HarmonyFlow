@@ -200,11 +200,13 @@ function combineArcTriggers(state, arc, nowMs) {
  * @param {{slot: number, smoothed: object[]}[]} activeTracks  追蹤層這一幀的在場名單（tracker.getActiveTracks()）
  * @param {number} slotCount  追蹤器目前的槽位數（＝現場人數）；送出去的 map 只帶這麼多個槽位
  * @param {number} nowMs
- * @returns {{ arcTriggerSeqBySlot: Object<number, number>, presentSlots: number[] }}
+ * @returns {{ arcTriggerSeqBySlot: Object<number, number>, presentSlots: number[], frame: Array }} frame＝逐幀紀錄用（vision.js 的 __visionLog）：
+ *   在場槽位的 [ID, 肩寬, 左手 x, y, 右手 x, y, 鎖定的手, 累加計數]，手腕不可見時那隻手的座標是 null
  */
 export function updateGestures(activeTracks, slotCount, nowMs) {
   const arcTriggerSeqBySlot = {};
   const presentSlots = [];
+  const frame = [];
   // 攤成「槽位 → track」查表；只處理 slotCount 個槽位，送出去的 map 不該帶永遠是空的槽位
   const trackBySlot = new Array(slotCount).fill(null);
   for (const t of activeTracks) trackBySlot[t.slot] = t;
@@ -235,8 +237,12 @@ export function updateGestures(activeTracks, slotCount, nowMs) {
     }
     const combinedArc = combineArcTriggers(arcLastSeqBySlot[slot], arc, nowMs);
     arcTriggerSeqBySlot[slot + 1] = combinedArc.triggerSeq;
+    if (track) {
+      frame.push([slot + 1, arc.shoulderWidth, arc.leftPoint?.x ?? null, arc.leftPoint?.y ?? null, arc.rightPoint?.x ?? null, arc.rightPoint?.y ?? null,
+        arcLastSeqBySlot[slot].lockedHand, combinedArc.triggerSeq]);
+    }
   }
-  return { arcTriggerSeqBySlot, presentSlots };
+  return { arcTriggerSeqBySlot, presentSlots, frame };
 }
 
 // 所有槽位的手勢狀態歸位；combinedSeq 不歸零（見 resetSlotDetectors）。

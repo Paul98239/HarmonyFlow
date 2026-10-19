@@ -11,9 +11,9 @@ import { Store, rafThrottle, setMarqueeText } from '../ui.js';
 import * as synth from './synth.js';
 import { parseMidi, midiNoteName } from './midiParser.js';
 import { downloadMidiFile, fetchCategories, searchSongs } from './midiApi.js';
-import { KEYBOARD_SLOT } from './scheduler.js';
+import { KEYBOARD_SLOT, LOOKAHEAD_MS } from './scheduler.js';
 
-export { KEYBOARD_SLOT };   // main.js 交給 keyboard.js 的觸發槽位
+export { KEYBOARD_SLOT, LOOKAHEAD_MS };   // main.js 交給 keyboard.js 的觸發槽位；__latency() 拿 LOOKAHEAD_MS 當排程 tick 間隔的門檻
 
 // 秒數 → m:ss；NaN／負數一律 0:00（分譜資訊列用）。
 function formatTime(sec) {
@@ -450,8 +450,20 @@ function uiTick() {
 }
 
 // 排程 tick：交給 scheduler.tick()，由它推進播放頭、收掉到期的音（沒有指派時整首自動播放，也由它放出走到的 segment；見 scheduler.js）。
+// 順便記實際間隔（量測，main.js 的 __latency() 讀）：[時刻, 距上一個 tick 的 ms]；只記播放中的 tick，暫停的空檔不算；滿了丟最舊的一半。
+const TICK_LOG_MAX = 50000;   // 12ms 一次約 10 分鐘
+const tickLog = [];
+let lastTickAt = null;
+export const tickIntervals = () => tickLog.slice();
 function schedulerTick() {
-  if (synth.isLoaded() && !synth.isPaused()) synth.scheduler.tick(performance.now(), synth.audioNow());
+  if (!synth.isLoaded() || synth.isPaused()) { lastTickAt = null; return; }
+  const now = performance.now();
+  if (lastTickAt !== null) {
+    tickLog.push([now, now - lastTickAt]);
+    if (tickLog.length > TICK_LOG_MAX) tickLog.splice(0, TICK_LOG_MAX >> 1);
+  }
+  lastTickAt = now;
+  synth.scheduler.tick(now, synth.audioNow());
 }
 
 // main.js 呼叫一次；不靠 import 副作用啟動。

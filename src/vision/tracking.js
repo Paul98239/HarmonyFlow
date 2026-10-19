@@ -2,6 +2,7 @@
 // 純粹依位置（螢幕座標接近程度，門檻依肩寬縮放）判斷，不用服裝顏色；ID 只是槽位編號的顯示提示，不做身分認回。
 
 const clamp01 = (v) => (v < 0 ? 0 : v > 1 ? 1 : v);
+const round3 = (v) => Math.round(v * 1000) / 1000;
 
 export const DEFAULT_TRACKING_CONFIG = Object.freeze({
   maxUsers: 4,
@@ -309,9 +310,20 @@ export class PersonTracker {
   reset() {
     this.tracks = new Array(this.cfg.maxUsers).fill(null);
     this.pending = []; // 候選新目標，尚未持續出現足夠時間
+    this.events = [];  // 鎖定／釋放的紀錄（開發用）：vision.js 每幀 drainEvents() 取走，給 __visionLog 匯出，查「多出來的 ID 是怎麼被鎖進去的」
   }
 
   hardReset() { this.reset(); }
+
+  drainEvents() {
+    const events = this.events;
+    this.events = [];
+    return events;
+  }
+
+  _logEvent(nowMs, type, slot, extra) {
+    this.events.push({ t: Math.round(nowMs), type, slot: slot + 1, ...extra });
+  }
 
   // 對外 API：回傳「這一幀真的偵測到的人」，語意跟 getActiveTracks() 一致，只是欄位精簡過。
   getTrackedUsers() {
@@ -398,6 +410,7 @@ export class PersonTracker {
     track.missCount = 0;
     track.lastSeenMs = nowMs;
     track.centroid = det.centroid;
+    track.raw = det.landmarks;   // 這一幀沒平滑的原始 landmark（開發用的逐幀紀錄讀它）
     if (Number.isFinite(det.shoulderWidth)) {
       track.shoulderWidth += (det.shoulderWidth - track.shoulderWidth) * shoulderWidthEmaAlpha;
     }
@@ -485,6 +498,7 @@ export class PersonTracker {
       const slot = this._resolveSlotForNewIdentity();
       if (slot === -1) continue; // 這幀空槽位已被更靠近鏡頭的候選人用完，留著下一幀再排隊
       this.tracks[slot] = this._createTrack(slot, p.det, nowMs);
+      this._logEvent(nowMs, 'lock', slot, { sw: round3(p.det.shoulderWidth), vis: round3(p.det.meanVisibility), strict: p.det.strictPlausible });
       p.isLocked = true; // 已鎖定，下方過濾掉
     }
 
@@ -512,6 +526,7 @@ export class PersonTracker {
       if (track.duplicateSinceMs === 0) track.duplicateSinceMs = nowMs;
       if (nowMs - track.duplicateSinceMs < duplicateTrackConfirmMs) continue;
       this.tracks[track.slot] = null;
+      this._logEvent(nowMs, 'duplicate', track.slot);
     }
   }
 
@@ -541,7 +556,10 @@ export class PersonTracker {
     this.tracks.forEach((track, slot) => {
       if (!track || usedSlot.has(slot)) return;
       track.missCount++; // missCount === 0 是「這一幀真的有人」的判準（見 getActiveTracks）
-      if (nowMs - track.lastSeenMs > this.cfg.trackLossMs) this.tracks[slot] = null;
+      if (nowMs - track.lastSeenMs > this.cfg.trackLossMs) {
+        this.tracks[slot] = null;
+        this._logEvent(nowMs, 'loss', slot);
+      }
     });
 
     this._releaseDuplicateTracks(nowMs);

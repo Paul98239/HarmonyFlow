@@ -63,6 +63,65 @@ let lastEmitMs = 0;            // 上一次真的送出的時刻（心跳用，�
 // 接收端若有斷訊看門狗，它的門檻必須明顯大於這個心跳間隔。
 const EMIT_HEARTBEAT_MS = 100;
 
+// 逐幀紀錄（開發用）：console 的 copy(__visionLog()) 匯出。遮住一隻手時手點互相干擾、選的人數比現場人數多時多出來的幽靈 ID，都要有逐幀的原始資料才查得出來；
+// 也是不同現場人數下主執行緒負擔（推論與整幀耗時）的來源，見 main.js 的 __latency()。每幀一列；滿了一次丟最舊的八分之一，免得每筆 shift()。
+const FRAME_LOG_MAX = 20000;       // 30fps 約 11 分鐘
+const TRACKER_EVENT_LOG_MAX = 3000;
+let frameLog = [];
+let trackerEvents = [];
+const r1 = (v) => Math.round(v * 10) / 10;
+const r3 = (v) => (v === null || v === undefined ? null : Math.round(v * 1000) / 1000);
+
+function recordFrame(nowMs, detectMs, rawCount, detections, activeTracks, gestureRows) {
+  const rawBySlot = new Map(activeTracks.map((t) => [t.slot + 1, t.raw]));
+  const wrist = (raw, i) => (raw ? [r3(raw[i].x), r3(raw[i].y), r3(raw[i].visibility)] : [null, null, null]);
+  frameLog.push([
+    Math.round(nowMs), chosenPoseCount, rawCount, r1(detectMs), r1(performance.now() - nowMs),
+    detections.map((d) => [r3(d.centroid.x), r3(d.centroid.y), r3(d.shoulderWidth), r3(d.meanVisibility), d.strictPlausible ? 1 : 0]),
+    gestureRows.map(([id, sw, lx, ly, rx, ry, lock, seq]) => {
+      const raw = rawBySlot.get(id);
+      return [id, r3(sw), r3(lx), r3(ly), r3(rx), r3(ry), lock, seq, ...wrist(raw, MP_LEFT_WRIST), ...wrist(raw, MP_RIGHT_WRIST)];
+    }),
+  ]);
+  if (frameLog.length > FRAME_LOG_MAX) frameLog.splice(0, frameLog.length - (FRAME_LOG_MAX - (FRAME_LOG_MAX >> 3)));
+  trackerEvents.push(...tracker.drainEvents());
+  if (trackerEvents.length > TRACKER_EVENT_LOG_MAX) trackerEvents.splice(0, trackerEvents.length - (TRACKER_EVENT_LOG_MAX - (TRACKER_EVENT_LOG_MAX >> 3)));
+}
+
+// 匯出最近 seconds 秒的逐幀紀錄與追蹤層事件；欄位說明附在資料裡。
+export function visionLog(seconds = 30) {
+  const from = performance.now() - seconds * 1000;
+  return {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    seconds,
+    poseCount: chosenPoseCount,
+    cameraOn: cameraState === "on",
+    columns: {
+      frame: ["t（performance.now，ms）", "現場人數", "MediaPipe 偵測筆數", "推論ms", "整幀ms",
+        "偵測[[肩中點 x, y, 肩寬, 平均可見度, 嚴格可信 0/1]]",
+        "追蹤[[ID, 肩寬, 左手 x, y, 右手 x, y（手腕不可見是 null）, 鎖定的手, 累加計數, 原始左腕 x, y, 可見度, 原始右腕 x, y, 可見度]]"],
+      trackerEvent: "{ t, type: lock｜loss｜duplicate, slot（ID）；lock 另有 sw 肩寬、vis 平均可見度、strict }",
+    },
+    frames: frameLog.filter((f) => f[0] >= from),
+    trackerEvents: trackerEvents.filter((e) => e.t >= from),
+  };
+}
+
+// 依現場人數分組的幀耗時（main.js 的 __latency() 用）。segments＝同一個人數連續的時間段（幀間隔超過 1 秒就斷開，鏡頭關著的空檔不算），排程 tick 的間隔靠它歸到對應的人數。
+export function visionFrameStats() {
+  const byCount = {}, segments = [];
+  for (const [t, count, , detectMs, frameMs, , tracks] of frameLog) {
+    if (!count) continue;
+    const g = (byCount[count] ??= { frames: 0, detectMs: [], frameMs: [], present: 0 });
+    g.frames++; g.detectMs.push(detectMs); g.frameMs.push(frameMs); g.present += tracks.length;
+    const last = segments.at(-1);
+    if (last && last.count === count && t - last.to < 1000) last.to = t;
+    else segments.push({ count, from: t, to: t });
+  }
+  return { byCount, segments };
+}
+
 function performanceStatesDiffer(a, b) {
   if (!a || !b) return true;
   if (a.presentSlots.length !== b.presentSlots.length) return true;
@@ -417,9 +476,11 @@ function processFrame() {
 
     // ▶ MediaPipe 偵測（上限 currentPoseCount）。還沒選「現場人數」（chosenPoseCount 0）或模型切換中（poseLandmarker 為 null）就不推論；其餘管線照跑：
     //   tracker.update([]) 讓舊 track 自然過期、心跳照送 presentSlots: []、攝影機畫面照畫（不凍結）。
-    const rawPoses = (poseLandmarker && chosenPoseCount)
-      ? (poseLandmarker.detectForVideo(video, nowMs)?.landmarks ?? [])
-      : [];
+    let rawPoses = [], detectMs = 0;
+    if (poseLandmarker && chosenPoseCount) {
+      rawPoses = poseLandmarker.detectForVideo(video, nowMs)?.landmarks ?? [];
+      detectMs = performance.now() - nowMs;   // 推論在主執行緒同步跑完，這段時間鍵盤事件與排程 tick 都排在後面
+    }
 
     // ▶ 依位置將偵測結果匹配到已鎖定的槽位（並平滑），演算法見 tracking.js。buildDetection 對座標異常／不像人的偵測回傳 null 先濾掉；同一具身體的重複偵測由 tracker.update() 自己挑該留哪一筆。
     const detections = rawPoses.map((lm) => buildDetection(lm)).filter(Boolean);
@@ -428,7 +489,8 @@ function processFrame() {
     const activeTracks = tracker.getActiveTracks();
 
     // ▶ 手勢（gesture.js）：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector，另外回報這一幀真的在場的槽位；槽位數＝追蹤器目前的槽位數（＝現場人數）
-    emitGesturePerformanceState(updateGestures(activeTracks, tracker.cfg.maxUsers, nowMs), nowMs);
+    const gesture = updateGestures(activeTracks, tracker.cfg.maxUsers, nowMs);
+    emitGesturePerformanceState(gesture, nowMs);
 
     // ▶ WebGL 渲染攝影機畫面當背景
     renderVideoGL();
@@ -436,6 +498,7 @@ function processFrame() {
     // ▶ 2D 覆蓋層繪製骨架（漏偵測一兩幀的人用最後一次的骨架撐住，見 tracking.js 的 getDrawableTracks）
     renderSkeletonOverlay(tracker.getDrawableTracks(nowMs));
 
+    recordFrame(nowMs, detectMs, rawPoses.length, detections, activeTracks, gesture.frame);
     consecutiveFrameErrors = 0;
   } catch (err) {
     consecutiveFrameErrors++;

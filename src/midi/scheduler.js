@@ -163,7 +163,7 @@ const keyupOf = (key) => (key != null ? { key } : null);
 const MAX_TICK_DT_MS = 100;
 // lookahead：tick() 把「這麼久以內就要發聲／收音」的電腦音提早帶時間戳（eventOptions.time，AudioContext 時間）送進合成器，由 worklet 依取樣時鐘準時放，主執行緒被影像算繪卡住幾十毫秒也不會晚。
 // 取捨：worklet 沒有取消已送出事件的辦法（spessasynth_core 的 eventQueue 只有 push／shift），所以這段內的音「一定會響」。50ms 是蓋過實機量到的主執行緒停頓（攝影機開著，最大約 40ms）的最小值；只用在電腦輔助聲部（N9）。
-const LOOKAHEAD_MS = 50;
+export const LOOKAHEAD_MS = 50;   // main.js 的 __latency() 拿它當排程 tick 間隔的門檻
 
 // 這首歌至少需要幾個 port 的 channel（不低於 DEFAULT_PORTS）：旋律 staff 每個 port 15 個、打擊 staff 每種鼓組 program 佔一個 port 的打擊槽，指派與未指派兩個池子（兩個合成器）各自算、取較大的（voices.js 的 portsFor()）。assignments 同 load()。
 export function portsNeeded(score, assignments) {
