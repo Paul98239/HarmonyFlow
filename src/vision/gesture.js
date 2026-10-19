@@ -175,8 +175,9 @@ function combineArcTriggers(state, arc, nowMs) {
     state.stillAnchor = null;
   }
 
-  const leftChanged = left.triggerSeq !== state.left;
-  const rightChanged = right.triggerSeq !== state.right;
+  // 只認增加：ArcDetector 停滯（超過 staleMs 沒餵值）重設時 triggerSeq 會歸零，用 !== 會把歸零當成一次新揮手
+  const leftChanged = left.triggerSeq > state.left;
+  const rightChanged = right.triggerSeq > state.right;
   state.left = left.triggerSeq;
   state.right = right.triggerSeq;
 
