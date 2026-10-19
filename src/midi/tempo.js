@@ -14,9 +14,13 @@ export const PRESS_PERIOD_MIN_S = 0.06;
 export const PRESS_PERIOD_MAX_S = 30;
 
 // 近距起音分組的門檻：一個輸入來源連按兩下最短隔多久（秒），更近的起音放行時併成一組（scheduler.js）。鍵盤＝PRESS_PERIOD_MIN_S；
-// 手勢＝0.3 是猜的暫定值（約每秒 3 下是手臂能持續揮的上限），沒有量測依據，待實機量測連續兩次有效揮手的最短間隔後再定；其他來源先用鍵盤的值。
+// 手勢＝0.3：2026-10-19 單人手測（與鍵盤混用）57 個連續有效揮手間隔的 p5 是 0.30 秒，只有一份錄音；其他來源先用鍵盤的值。
 const MIN_PRESS_INTERVAL_S = { keyboard: PRESS_PERIOD_MIN_S, gesture: 0.3 };
 export const minPressIntervalSec = (source) => MIN_PRESS_INTERVAL_S[source] ?? PRESS_PERIOD_MIN_S;
+// 組的長度上限（起音距組頭的真實秒數）：手勢＝它的最短間隔，更遠的起音下一次揮手就按得到，不併進來；沒有條目（鍵盤）＝不設上限。
+// 只看相鄰間隔時，連續的快音整串併成一組（手測：222 個起音、64 秒），早按時整組被跳過、估速被推到上限，越併越大。
+const MAX_GROUP_SPAN_S = { gesture: MIN_PRESS_INTERVAL_S.gesture };
+export const maxGroupSpanSec = (source) => MAX_GROUP_SPAN_S[source] ?? Infinity;
 
 // 去抖窗口＝預估這一步真實長度的 60%（取自同事 SmartEnsemble），夾在 [50, 500]ms：下限比它的 150ms 低，125ms 的十六分音符才彈得出來；
 // 再取「你上一次的按鍵間隔」較小者，加速時窗口跟著縮小。這個間隔要算所有按鍵嘗試（含被忽略的）：

@@ -7,7 +7,7 @@
 // 預報入口 setForecaster()：每個 tick 問預報器「你會在什麼時刻按下一個起音」，收到有效預報就段中換錨、重排還沒送出的電腦音（_applyForecast）；預設沒有預報器，行為完全不變（N2）。
 // 所有合成器呼叫都經過 voices.js。
 
-import { summarizeMs, TempoFollower, minPressIntervalSec } from './tempo.js';
+import { summarizeMs, TempoFollower, minPressIntervalSec, maxGroupSpanSec } from './tempo.js';
 import { OutputRouter, portsFor, VoiceLedger, scaledMs, EPS_MS } from './voices.js';
 import { buildPlan, staffPools, sliceOfTick, switchesKit, stateEvents } from './performancePlan.js';
 import { ChannelStateTracker, chaseEventsAt, DRUM_CHANNEL } from './midiParser.js';
@@ -676,12 +676,14 @@ export class Scheduler {
     this._ledger.closeDue(this._clockMs);                           // 零長度的音
   }
 
-  // 近距起音分組：從組頭 j 往後串，相鄰兩個起音的樂譜間隔依目前速度換成真實時間，比這個輸入來源的最短間隔還短（按不及；鍵盤 0.06 秒，tempo.js 的 minPressIntervalSec）就併進來，一直串到不按不及為止（沒有長度上限）。
+  // 近距起音分組：從組頭 j 往後串，相鄰兩個起音的樂譜間隔依目前速度換成真實時間，比這個輸入來源的最短間隔還短（按不及；鍵盤 0.06 秒，tempo.js 的 minPressIntervalSec）就併進來，一直串到不按不及為止；
+  // 有長度上限的來源（手勢，tempo.js 的 maxGroupSpanSec）再加一條：這個起音距組頭的真實時間不超過上限，不然停在這裡，下一次揮手就按得到。
   // 彈得慢間隔被拉開、併的就少，彈得快併的就多。回傳這一組的結束（不含）。
   _groupEnd(g, j, rate, source) {
-    const segs = g.plan.driverSegs, minSec = minPressIntervalSec(source);
+    const segs = g.plan.driverSegs, minSec = minPressIntervalSec(source), spanSec = maxGroupSpanSec(source), headSec = this._secOf(segs[j].ticks);
     let m = j + 1;
-    while (m < segs.length && (this._secOf(segs[m].ticks) - this._secOf(segs[m - 1].ticks)) / rate < minSec) m++;
+    while (m < segs.length && (this._secOf(segs[m].ticks) - this._secOf(segs[m - 1].ticks)) / rate < minSec
+      && (this._secOf(segs[m].ticks) - headSec) / rate < spanSec) m++;
     return m;
   }
 
