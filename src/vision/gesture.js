@@ -8,13 +8,15 @@ export const DEFAULT_ARC_CONFIG = Object.freeze({
   // 這兩個門檻比較嚴：每次判定成立都立刻前進一步、沒有緩衝空間，調嚴降低誤觸發
   minDepthRatio: 0.15,      // 這段下沉至少要多深（肩寬單位）才算一次有效拋物線
   minXSpanRatio: 0.18,      // 下沉期間至少要有這麼多橫向位移（肩寬單位），用來跟「純上下抖」區分開
+  // 確認那一幀的 y 上限（畫面下緣＝1）：手放到畫面外時模型仍會推估位置，往上飄一點就湊出假拋物線；0.05 的邊界留給谷底剛擦過下緣的真揮手。暫定值（2026-10-20 兩份遮手紀錄）
+  maxConfirmY: 1.05,
 });
 
 /**
  * 拋物線手勢：手同時有橫向位移＋垂直先下沉（image y 變大）再回升；不看肩膀高度、不限開口大小與左右方向，只認這個相對形狀。
  * 單一狀態機逐幀更新起點 peak（Y 最小值）與最低點 trough（Y 最大值）：
  *  - Y 持續變大：延伸 trough，累積下沉期間的橫向位移範圍。
- *  - Y 從 trough 回升超過死區（確認反轉）：下沉結束，深度與橫向位移都達標就 triggerSeq +1；不論達不達標都以目前位置當新起點。
+ *  - Y 從 trough 回升超過死區（確認反轉）：下沉結束，深度與橫向位移都達標、且確認這一幀手還在畫面裡（y ≤ maxConfirmY）就 triggerSeq +1；不論達不達標都以目前位置當新起點。
  *  - 手不在畫面：中斷追蹤，等手回來重新認一次。
  */
 export class ArcDetector {
@@ -29,6 +31,7 @@ export class ArcDetector {
     this._minX = null;          // 下沉期間橫向位移範圍（用來跟「純上下抖」區分）
     this._maxX = null;
     this.triggerSeq = 0;        // 每次有效拋物線的谷底事件 +1
+    this.lastDepth = 0;         // 最近一次觸發的拋物線深度（肩寬單位），慣用手換手時比較用
     this._lastMs = null;
   }
 
@@ -65,8 +68,9 @@ export class ArcDetector {
     } else if (y < this.troughY - this.cfg.reversalNoiseFloor * sw) {
       const depth = this.troughY - this.peakY;
       const xSpan = this._maxX - this._minX;
-      if (depth >= this.cfg.minDepthRatio * sw && xSpan >= this.cfg.minXSpanRatio * sw) {
+      if (depth >= this.cfg.minDepthRatio * sw && xSpan >= this.cfg.minXSpanRatio * sw && y <= this.cfg.maxConfirmY) {
         this.triggerSeq++;
+        this.lastDepth = depth / sw;
       }
       this.peakY = y; this.troughY = y;
       this._minX = x; this._maxX = x;
@@ -105,6 +109,9 @@ const HAND_LOCK_RELEASE_MS = 8000;
 const HAND_STILL_RADIUS = 0.10;
 const HAND_STILL_MS = 700;       // 連續待在半徑內這麼久才放開鎖定
 const SLOT_RELEASE_MS = 1000;    // 槽位連續不在場這麼久才把偵測器整個 reset
+// 換手：另一隻手的拋物線深度達到鎖定手近期深度（EMA）的這麼多倍就改鎖它。暫定值：2026-10-20 兩份遮手紀錄，揮的手深度中位數 1.84／2.2 肩寬，打字的手 0.47／0.61
+const LOCK_STEAL_RATIO = 2;
+const LOCK_DEPTH_EMA_ALPHA = 0.5; // 用 EMA 而不是最後一次的深度：揮的手偶爾一下很淺（實測最淺 0.17），門檻不該跟著掉到讓閒置手搶走
 
 // 各槽位（＝演奏者 ID − 1）的狀態在第一次用到時才建立（ensureSlot），這裡不必知道槽位上限。
 const arcDetectors = [];
@@ -116,7 +123,7 @@ function ensureSlot(slot) {
   if (arcDetectors[slot]) return;
   arcDetectors[slot] = { left: new ArcDetector(), right: new ArcDetector() };
   arcLastSeqBySlot[slot] = {
-    left: 0, right: 0, combinedSeq: 0, lockedHand: null, lastTriggerMs: undefined,
+    left: 0, right: 0, combinedSeq: 0, lockedHand: null, lockedDepth: 0, lastTriggerMs: undefined,
     stillAnchor: null, stillSinceMs: undefined,
   };
   slotInactiveSinceMs[slot] = 0;
@@ -125,7 +132,7 @@ function ensureSlot(slot) {
 const resetSlotDetectors = (arcSlot, lastSeq) => {
   arcSlot.left.reset(); arcSlot.right.reset();
   lastSeq.left = 0; lastSeq.right = 0;
-  lastSeq.lockedHand = null; lastSeq.lastTriggerMs = undefined;
+  lastSeq.lockedHand = null; lastSeq.lockedDepth = 0; lastSeq.lastTriggerMs = undefined;
   lastSeq.stillAnchor = null; lastSeq.stillSinceMs = undefined;
 };
 const resetAllSlotDetectors = () => {
@@ -144,6 +151,8 @@ function updateSlotArc(arcDet, track, nowMs) {
   return {
     left: arcDet.left.update({ point: leftPoint, shoulderWidth }, nowMs),
     right: arcDet.right.update({ point: rightPoint, shoulderWidth }, nowMs),
+    leftDepth: arcDet.left.lastDepth,
+    rightDepth: arcDet.right.lastDepth,
     leftVisible: !!leftPoint,
     rightVisible: !!rightPoint,
     leftPoint, rightPoint, shoulderWidth,
@@ -151,6 +160,7 @@ function updateSlotArc(arcDet, track, nowMs) {
 }
 
 // 合成雙手結果並「自動鎖定慣用手」：哪隻手先做出有效拋物線就鎖定它、之後只認那隻手——避免閒置手被模型猜出位置、在畫面上飄移湊出假拋物線而誤觸發。
+// 換手：閒置手（例如打字的手在畫面下緣抖動）也可能先湊出一次淺的拋物線而被鎖到，所以另一隻手的拋物線夠深（LOCK_STEAL_RATIO）就把鎖定搶過去。
 // 放開條件：鎖定的手不可見、HAND_LOCK_RELEASE_MS 沒有新觸發、或 HAND_STILL_MS 幾乎沒在動。state 就是 arcLastSeqBySlot[slot]，逐幀被直接改動。
 function combineArcTriggers(state, arc, nowMs) {
   const { left, right, leftVisible, rightVisible, leftPoint, rightPoint, shoulderWidth } = arc;
@@ -181,9 +191,20 @@ function combineArcTriggers(state, arc, nowMs) {
   state.left = left.triggerSeq;
   state.right = right.triggerSeq;
 
+  const changed = { left: leftChanged, right: rightChanged };
+  const depth = { left: arc.leftDepth, right: arc.rightDepth };
   if (!state.lockedHand) {
     if (leftChanged) state.lockedHand = "left";
     else if (rightChanged) state.lockedHand = "right";
+    if (state.lockedHand) state.lockedDepth = depth[state.lockedHand];
+  } else {
+    const other = state.lockedHand === "left" ? "right" : "left";
+    if (changed[other] && depth[other] >= LOCK_STEAL_RATIO * state.lockedDepth) {
+      state.lockedHand = other;
+      state.lockedDepth = depth[other];
+    } else if (changed[state.lockedHand]) {
+      state.lockedDepth += LOCK_DEPTH_EMA_ALPHA * (depth[state.lockedHand] - state.lockedDepth);
+    }
   }
 
   const triggered = (state.lockedHand === "left" && leftChanged)
