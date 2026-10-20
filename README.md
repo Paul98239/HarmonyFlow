@@ -24,6 +24,7 @@ src/
     gestureTrigger.js  揮手觸發：vision 送來的各槽位拋物線計數變動 → 輸入事件；槽位 1~4＝演奏者 ID，與鍵盤並存
   vision/         攝影機、追蹤、手勢
     vision.js     攝影機、WebGL 視訊與骨架繪製、姿勢模型生命週期；逐幀呼叫追蹤與手勢，送出手勢狀態
+    poseWorker.js 姿勢推論 Worker：載入 tasks-vision、建 PoseLandmarker、收畫面回關節點（推論不佔主執行緒）
     tracking.js   多人槽位追蹤與平滑
     gesture.js    手勢：單手拋物線偵測、雙手合成與慣用手鎖定、各槽位的手勢狀態
   midi/           MIDI 解析、演奏引擎、播放器
@@ -44,7 +45,7 @@ src/
 
 ## 第三方套件
 
-`@mediapipe/tasks-vision`（`src/vision/vision.js`）與 `spessasynth_lib`（`src/midi/synth.js`）都直接寫死完整 CDN 網址（jsDelivr）匯入，`tasks-vision` 固定 `@1.1.0`、`spessasynth_lib` 綁 `@latest`；沒有 import map、JS 套件沒有本地副本。
+`@mediapipe/tasks-vision`（`src/vision/poseWorker.js`）與 `spessasynth_lib`（`src/midi/synth.js`）都直接寫死完整 CDN 網址（jsDelivr）匯入，`tasks-vision` 固定 `@1.1.0`、`spessasynth_lib` 綁 `@latest`；沒有 import map、JS 套件沒有本地副本。
 
 ## 文件
 

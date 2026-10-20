@@ -1,11 +1,5 @@
 // vision.js — 攝影機、WebGL 視訊與骨架繪製、姿勢模型生命週期；逐幀呼叫追蹤（tracking.js）與手勢（gesture.js），送出手勢狀態（main.js 註冊 input/gestureTrigger.js 接收）
 
-// 版本固定 1.1.0：bundle、loader JS、.wasm 三個檔必須同一版。不用 @latest：jsDelivr 邊緣節點曾同時回傳不同版本的 loader JS 與 .wasm
-// （2026-10-07 實測），載入時 assignWasmExports 讀到 undefined 而失敗。升級時下面兩個網址（import 與 forVisionTasks）一起改。
-import {
-  PoseLandmarker,
-  FilesetResolver,
-} from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/vision_bundle.mjs";
 import { PersonTracker, buildDetection } from "./tracking.js";
 import {
   MP_LEFT_WRIST, MP_RIGHT_WRIST, MP_LEFT_ELBOW, MP_RIGHT_ELBOW, MP_LEFT_SHOULDER, MP_RIGHT_SHOULDER, MP_LEFT_HAND, MP_RIGHT_HAND,
@@ -27,7 +21,7 @@ const POSE_MODEL_URLS = [
   "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
   "./src/assets/pose_landmarker_lite.task",
 ];
-let poseModelIndex = 0; // 目前採用的來源（POSE_MODEL_URLS 的索引）；CDN 失敗改用本地之後不再重試已經壞掉的那個
+let poseModelIndex = 0; // Worker 回報的目前來源（POSE_MODEL_URLS 的索引）；改用本地之後 warmPoseModel() 不再暖 CDN
 
 // 暖機：載入畫面收起之後，用低優先序的 fetch 把姿勢模型（約 5.8MB）先抓進 HTTP 快取（Google storage 的 Cache-Control: public, max-age=3600），使用者第一次選現場人數時 MediaPipe 對同一個 URL 的請求直接命中。
 // 不用 <link rel="preload">：模型要等選了人數才會用到，沒在幾秒內用掉 Chrome 會在 console 報黃色警告；呼叫端也刻意等開機完成才叫，不跟開頁時 8.4MB 的音色庫搶頻寬。失敗不處理：之後真的載入時會走備援並留下 warn。
@@ -38,8 +32,8 @@ export function warmPoseModel() {
 
 // MediaPipe 的 numPoses（同時追幾個人）決定它的工作模式：「追到的人數 ≥ numPoses」時偵測器跳過、每個人的 ROI 由上一幀的 landmark 延續——沒有幽靈骨架、節點最穩；
 // 「追到的人數 < numPoses」時偵測器每幀重跑，幽靈與抖動都是這個狀態的產物。設小了多出來的人不會被偵測到，這是設定的字面意思。
-// landmarker 完全懶惰載入、同一時間只維持一份使用中的實例（requestLandmarker()）：選了「現場人數」N 才建 numPoses=N 的實例，追蹤層的槽位數（＝ ID 上限）也設成 N（setPoseCount）；
-// 新的建好才換手，等待期間畫面用舊的繼續推論不凍結，只是新設定有 1~2 秒延遲。
+// landmarker 在 Worker（poseWorker.js）裡、只有一份：選了「現場人數」N 才建 numPoses=N 的那份，之後換人數用 setOptions() 原地更新；追蹤層的槽位數（＝ ID 上限）也設成 N（setPoseCount）。
+// 推論放在 Worker：detectForVideo 是同步的、會卡住呼叫它的執行緒（官方文件），放在主執行緒時按鍵、按鈕與伴奏排程都要排隊等它（見 docs/mediapipe-performance-reference.md）。
 
 const POSE_COLORS = ["#00FFFF", "#FF6B6B", "#51CF66", "#FFD43B"]; // 4 人的代表色彩（依鎖定槽位對應）
 const BONE_WIDTH = 2;      // 骨架連線寬度（px）
@@ -72,16 +66,17 @@ let trackerEvents = [];
 const r1 = (v) => Math.round(v * 10) / 10;
 const r3 = (v) => (v === null || v === undefined ? null : Math.round(v * 1000) / 1000);
 
-function recordFrame(nowMs, detectMs, rawCount, detections, activeTracks, gestureRows) {
+function recordFrame(ts, startMs, detectMs, rawCount, detections, activeTracks, gestureRows, captureLagMs, detectorRan, resultLagMs) {
   const rawBySlot = new Map(activeTracks.map((t) => [t.slot + 1, t.raw]));
   const wrist = (raw, i) => (raw ? [r3(raw[i].x), r3(raw[i].y), r3(raw[i].visibility)] : [null, null, null]);
   frameLog.push([
-    Math.round(nowMs), chosenPoseCount, rawCount, r1(detectMs), r1(performance.now() - nowMs),
+    Math.round(ts), chosenPoseCount, rawCount, r1(detectMs), r1(performance.now() - startMs),
     detections.map((d) => [r3(d.centroid.x), r3(d.centroid.y), r3(d.shoulderWidth), r3(d.meanVisibility), d.strictPlausible ? 1 : 0]),
     gestureRows.map(([id, sw, lx, ly, rx, ry, lock, seq]) => {
       const raw = rawBySlot.get(id);
       return [id, r3(sw), r3(lx), r3(ly), r3(rx), r3(ry), lock, seq, ...wrist(raw, MP_LEFT_WRIST), ...wrist(raw, MP_RIGHT_WRIST)];
     }),
+    captureLagMs === null ? null : r1(captureLagMs), detectorRan, resultLagMs === null ? null : r1(resultLagMs),
   ]);
   if (frameLog.length > FRAME_LOG_MAX) frameLog.splice(0, frameLog.length - (FRAME_LOG_MAX - (FRAME_LOG_MAX >> 3)));
   trackerEvents.push(...tracker.drainEvents());
@@ -92,15 +87,17 @@ function recordFrame(nowMs, detectMs, rawCount, detections, activeTracks, gestur
 export function visionLog(seconds = 30) {
   const from = performance.now() - seconds * 1000;
   return {
-    version: 1,
+    version: 3,
     exportedAt: new Date().toISOString(),
     seconds,
     poseCount: chosenPoseCount,
     cameraOn: cameraState === "on",
     columns: {
-      frame: ["t（performance.now，ms）", "現場人數", "MediaPipe 偵測筆數", "推論ms", "整幀ms",
+      frame: ["t（送去推論的時刻；沒推論時是處理時刻；performance.now，ms）", "現場人數", "MediaPipe 偵測筆數", "推論ms（在 Worker）", "主執行緒處理ms",
         "偵測[[肩中點 x, y, 肩寬, 平均可見度, 嚴格可信 0/1]]",
-        "追蹤[[ID, 肩寬, 左手 x, y, 右手 x, y（手腕不可見是 null）, 鎖定的手, 累加計數, 原始左腕 x, y, 可見度, 原始右腕 x, y, 可見度]]"],
+        "追蹤[[ID, 肩寬, 左手 x, y, 右手 x, y（手腕不可見是 null）, 鎖定的手, 累加計數, 原始左腕 x, y, 可見度, 原始右腕 x, y, 可見度]]",
+        "拍下→送出ms（rVFC 的 captureTime；瀏覽器沒提供是 null）", "偵測器可能有跑（上一次偵測筆數 < numPoses 是 1，否則 0；沒推論是 null）",
+        "拍下→結果進主執行緒ms（沒有拍下時刻時從送出算起；沒推論是 null）"],
       trackerEvent: "{ t, type: lock｜loss｜duplicate, slot（ID）；lock 另有 sw 肩寬、vis 平均可見度、strict }",
     },
     frames: frameLog.filter((f) => f[0] >= from),
@@ -109,18 +106,26 @@ export function visionLog(seconds = 30) {
 }
 
 // 依現場人數分組的幀耗時（main.js 的 __latency() 用）。segments＝同一個人數連續的時間段（幀間隔超過 1 秒就斷開，鏡頭關著的空檔不算），排程 tick 的間隔靠它歸到對應的人數。
+// end＝段內最後一幀處理完的時刻的下限（送出→推論→主執行緒處理依序發生，傳遞時間不計）：佔比的分母算到這裡，比例不會超過 100%。
 export function visionFrameStats() {
   const byCount = {}, segments = [];
-  for (const [t, count, , detectMs, frameMs, , tracks] of frameLog) {
+  for (const [t, count, , detectMs, frameMs, , tracks, captureLagMs, detectorRan, resultLagMs] of frameLog) {
     if (!count) continue;
-    const g = (byCount[count] ??= { frames: 0, detectMs: [], frameMs: [], present: 0 });
+    const g = (byCount[count] ??= { frames: 0, detectMs: [], frameMs: [], present: 0, detectWithDetector: [], detectTrackingOnly: [], captureLagMs: [], resultLagMs: [] });
     g.frames++; g.detectMs.push(detectMs); g.frameMs.push(frameMs); g.present += tracks.length;
+    if (detectorRan === 1) g.detectWithDetector.push(detectMs);
+    else if (detectorRan === 0) g.detectTrackingOnly.push(detectMs);
+    if (captureLagMs !== null) g.captureLagMs.push(captureLagMs);
+    if (resultLagMs !== null) g.resultLagMs.push(resultLagMs);
+    const end = t + detectMs + frameMs;
     const last = segments.at(-1);
-    if (last && last.count === count && t - last.to < 1000) last.to = t;
-    else segments.push({ count, from: t, to: t });
+    if (last && last.count === count && t - last.to < 1000) { last.to = t; last.end = end; }
+    else segments.push({ count, from: t, to: t, end });
   }
   return { byCount, segments };
 }
+
+export const getCameraInfo = () => cameraInfo;
 
 function performanceStatesDiffer(a, b) {
   if (!a || !b) return true;
@@ -161,18 +166,21 @@ let onStatus = null;
 let onError = null;
 const stageHint = document.getElementById("stage-hint"); // 舞台中央的提示（攝影機關閉／還沒選現場人數）
 
-let poseLandmarker = null;
+let poseWorker = null;          // 姿勢推論的 Worker（startPoseWorker()）；null ＝ 還沒載入
+let landmarkerReady = false;    // Worker 裡的 landmarker 建好了（第一次選人數之後）
+let inFlight = null;            // 送進 Worker、還沒拿到結果的那一張：{ ts, captureTime, captureLagMs, detectorRan }；同一時間只送一張
+let pendingFrame = null;        // 等結果期間又來的新畫面（只記最新一張的拍下時刻）：結果一回來就送，不等下一次 rVFC
+let configureSeq = 0;           // 換人數的請求編號：等待期間又選了別的人數，舊的這次不算數
+const pendingCalls = new Map(); // Worker 請求編號 → { resolve, reject }
 let gl = null;      // WebGL context
 let glTexture = null;      // video texture
 let glProgram = null;      // shader program
 let consecutiveFrameErrors = 0; // 連續幀處理失敗計數，超過 FRAME_ERROR_THRESHOLD 才視為持續性錯誤
 let lastProcessedVideoTime = -1; // 上一次真的送去推論的 video.currentTime（rAF 降級路徑用來跳過重複幀）
-let visionFileset = null; // FilesetResolver 的結果，換人數重建 landmarker 時重用，不必重新載入 WASM
 let currentPoseCount = 0; // 目前使用中的 landmarker 的 numPoses；0 ＝ 還沒建過任何一份
 let chosenPoseCount = 0;  // 系統控制 bar 選的「現場人數」；0 ＝ 還沒選 ＝ 不推論
-// 唯一一個「在飛」的建置：{ numPoses, promise }。同一個 numPoses 重複要求共用同一顆 promise；換成別的 numPoses 時舊的作廢（MediaPipe 沒有取消 API，只能在它 resolve 時 close 掉，見 requestLandmarker()）。
-// 只有一份在飛，用物件識別（pendingBuild !== build）判斷是否被取代。
-let pendingBuild = null;
+let lastRawCount = 0;     // 上一次推論的偵測筆數：小於 numPoses 時 MediaPipe 這一幀會重跑偵測器（pose_landmarker_graph.cc 的跳過條件），逐幀紀錄據此標記
+let cameraInfo = null;    // 鏡頭實際協商到的規格與可調範圍（__latency 用），見 describeCamera()
 
 // frameHandle：已排程的下一幀代號（rVFC 與 rAF 的 id 都 ≥ 1，0＝沒有排程中的回呼）。isLoopStopped：迴圈停止中（攝影機關閉、致命錯誤）；已排隊的回呼另外真的取消掉（stopFrameLoop），旗標只是第二道防線。
 let frameHandle = 0;
@@ -455,7 +463,8 @@ function renderSkeletonOverlay(activeTracks) {
   ctx2d.restore();
 }
 
-function processFrame() {
+// rVFC 回呼帶 (now, metadata)，rAF 降級路徑只有 now：metadata.captureTime＝攝影機拍下這張的時刻，用來量「拍下→送出」與「拍下→結果進主執行緒」。
+function processFrame(_now, metadata) {
   frameHandle = 0;           // 這一次回呼已經觸發，沒有排程中的了（startFrameLoop 據此決定要不要排新的）
   if (isLoopStopped) return; // 已停止：連已排隊的回呼也一併作廢（取消失敗時的第二道防線）
 
@@ -471,46 +480,80 @@ function processFrame() {
   // 單一幀的任何例外都不該讓整條追蹤迴圈永久卡死：吞下例外、跳過這一幀，下一幀繼續；連續失敗超過 FRAME_ERROR_THRESHOLD 幀才顯示錯誤畫面並停止。
   try {
     syncCanvasSize();
-
-    const nowMs = performance.now();
-
-    // ▶ MediaPipe 偵測（上限 currentPoseCount）。還沒選「現場人數」（chosenPoseCount 0）或模型切換中（poseLandmarker 為 null）就不推論；其餘管線照跑：
-    //   tracker.update([]) 讓舊 track 自然過期、心跳照送 presentSlots: []、攝影機畫面照畫（不凍結）。
-    let rawPoses = [], detectMs = 0;
-    if (poseLandmarker && chosenPoseCount) {
-      rawPoses = poseLandmarker.detectForVideo(video, nowMs)?.landmarks ?? [];
-      detectMs = performance.now() - nowMs;   // 推論在主執行緒同步跑完，這段時間鍵盤事件與排程 tick 都排在後面
+    const captureTime = metadata?.captureTime ?? null;
+    if (landmarkerReady && chosenPoseCount) {
+      // ▶ MediaPipe 偵測（上限 currentPoseCount）在 Worker：同一時間只送一張，結果回來才做追蹤／手勢／繪製（handlePoseResult）；等結果期間來的畫面只記最新一張
+      if (inFlight) pendingFrame = { captureTime };
+      else sendFrame(captureTime);
+    } else {
+      // ▶ 還沒選「現場人數」或模型還沒建好就不推論；其餘管線照跑：tracker.update([]) 讓舊 track 自然過期、心跳照送 presentSlots: []、攝影機畫面照畫（不凍結）。
+      const nowMs = performance.now();
+      runPipeline(nowMs, nowMs, [], 0, captureTime === null ? null : nowMs - captureTime, null, null);
     }
-
-    // ▶ 依位置將偵測結果匹配到已鎖定的槽位（並平滑），演算法見 tracking.js。buildDetection 對座標異常／不像人的偵測回傳 null 先濾掉；同一具身體的重複偵測由 tracker.update() 自己挑該留哪一筆。
-    const detections = rawPoses.map((lm) => buildDetection(lm)).filter(Boolean);
-
-    tracker.update(detections, nowMs);
-    const activeTracks = tracker.getActiveTracks();
-
-    // ▶ 手勢（gesture.js）：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector，另外回報這一幀真的在場的槽位；槽位數＝追蹤器目前的槽位數（＝現場人數）
-    const gesture = updateGestures(activeTracks, tracker.cfg.maxUsers, nowMs);
-    emitGesturePerformanceState(gesture, nowMs);
-
-    // ▶ WebGL 渲染攝影機畫面當背景
-    renderVideoGL();
-
-    // ▶ 2D 覆蓋層繪製骨架（漏偵測一兩幀的人用最後一次的骨架撐住，見 tracking.js 的 getDrawableTracks）
-    renderSkeletonOverlay(tracker.getDrawableTracks(nowMs));
-
-    recordFrame(nowMs, detectMs, rawPoses.length, detections, activeTracks, gesture.frame);
-    consecutiveFrameErrors = 0;
   } catch (err) {
-    consecutiveFrameErrors++;
-    console.error(`⚠️ 幀處理失敗（連續第 ${consecutiveFrameErrors} 次）：`, err);
-    if (consecutiveFrameErrors > FRAME_ERROR_THRESHOLD) {
-      stopFrameLoop(); // 停止排程下一幀，避免無意義地持續狂噴同一個錯誤
-      showError("姿勢追蹤發生持續性錯誤", "請重新整理頁面。若問題持續發生，請確認鏡頭或顯示卡驅動狀態。");
-      return;
-    }
+    frameFailed(err);
   }
 
   scheduleNextFrame();
+}
+
+function frameFailed(err) {
+  consecutiveFrameErrors++;
+  console.error(`⚠️ 幀處理失敗（連續第 ${consecutiveFrameErrors} 次）：`, err);
+  if (consecutiveFrameErrors > FRAME_ERROR_THRESHOLD) {
+    stopFrameLoop(); // 停止排程下一幀，避免無意義地持續狂噴同一個錯誤
+    showError("姿勢追蹤發生持續性錯誤", "請重新整理頁面。若問題持續發生，請確認鏡頭或顯示卡驅動狀態。");
+  }
+}
+
+// 把目前這一張畫面交給 Worker。ts＝送出時刻：detectForVideo 的時間戳（必須遞增），也是這張畫面在追蹤與手勢裡的時刻。
+function sendFrame(captureTime) {
+  const ts = performance.now();
+  pendingFrame = null;   // 取的是 video 當下最新的一張，等著的那張已經包含在內
+  inFlight = { ts, captureTime, captureLagMs: captureTime === null ? null : ts - captureTime, detectorRan: lastRawCount < currentPoseCount ? 1 : 0 };
+  createImageBitmap(video).then(
+    (bitmap) => {
+      if (isLoopStopped || !poseWorker) { bitmap.close(); inFlight = null; return; }
+      poseWorker.postMessage({ type: "detect", bitmap, ts }, [bitmap]);
+    },
+    (err) => { inFlight = null; frameFailed(err); },
+  );
+}
+
+function handlePoseResult({ ts, inferMs, landmarks }) {
+  const sent = inFlight;
+  inFlight = null;
+  if (!sent || sent.ts !== ts || isLoopStopped) return;   // 鏡頭關掉之後才回來的結果不用
+  const startMs = performance.now();
+  lastRawCount = landmarks.length;
+  try {
+    runPipeline(ts, startMs, landmarks, inferMs, sent.captureLagMs, sent.detectorRan, startMs - (sent.captureTime ?? ts));
+  } catch (err) {
+    frameFailed(err);
+  }
+  if (pendingFrame && !isLoopStopped) sendFrame(pendingFrame.captureTime);
+}
+
+// 偵測結果到了之後的管線。ts＝這張畫面的時刻（追蹤與手勢的時間基準），startMs＝主執行緒開始處理的時刻（逐幀紀錄的主執行緒耗時從這裡算）。
+function runPipeline(ts, startMs, rawPoses, detectMs, captureLagMs, detectorRan, resultLagMs) {
+  // ▶ 依位置將偵測結果匹配到已鎖定的槽位（並平滑），演算法見 tracking.js。buildDetection 對座標異常／不像人的偵測回傳 null 先濾掉；同一具身體的重複偵測由 tracker.update() 自己挑該留哪一筆。
+  const detections = rawPoses.map((lm) => buildDetection(lm)).filter(Boolean);
+
+  tracker.update(detections, ts);
+  const activeTracks = tracker.getActiveTracks();
+
+  // ▶ 手勢（gesture.js）：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector，另外回報這一幀真的在場的槽位；槽位數＝追蹤器目前的槽位數（＝現場人數）
+  const gesture = updateGestures(activeTracks, tracker.cfg.maxUsers, ts);
+  emitGesturePerformanceState(gesture, ts);
+
+  // ▶ WebGL 渲染攝影機畫面當背景
+  renderVideoGL();
+
+  // ▶ 2D 覆蓋層繪製骨架（漏偵測一兩幀的人用最後一次的骨架撐住，見 tracking.js 的 getDrawableTracks）
+  renderSkeletonOverlay(tracker.getDrawableTracks(ts));
+
+  recordFrame(ts, startMs, detectMs, rawPoses.length, detections, activeTracks, gesture.frame, captureLagMs, detectorRan, resultLagMs);
+  consecutiveFrameErrors = 0;
 }
 
 function scheduleNextFrame() {
@@ -523,6 +566,7 @@ function scheduleNextFrame() {
 // 停止追蹤迴圈（攝影機關閉、致命錯誤）。除了設旗標擋掉已排隊的回呼，也真的把它取消掉。
 function stopFrameLoop() {
   isLoopStopped = true;
+  pendingFrame = null;
   if (frameHandle) {
     if (useRVFC) video.cancelVideoFrameCallback(frameHandle);
     else cancelAnimationFrame(frameHandle);
@@ -602,10 +646,21 @@ async function requestCameraStream() {
   return stream;
 }
 
+// 鏡頭實際協商到的規格與可調範圍（__latency 用）：幀率偏低時分得出是鏡頭給得少還是推論跟不上；曝光欄位只有支援的瀏覽器／驅動才有（Firefox 沒有 getCapabilities）。
+function describeCamera(track) {
+  const s = track?.getSettings?.() ?? {};
+  const c = track?.getCapabilities?.() ?? {};
+  return {
+    設定: { 寬: s.width ?? null, 高: s.height ?? null, 幀率: s.frameRate ?? null, 曝光模式: s.exposureMode ?? null, 曝光時間: s.exposureTime ?? null },
+    可調範圍: { 幀率: c.frameRate ?? null, 曝光模式: c.exposureMode ?? null, 曝光時間: c.exposureTime ?? null },
+  };
+}
+
 // 把一條新串流接上 <video> 並等到第一幀可用。開機（initSystem）與執行期重開（startCamera）共用。
 async function attachCamera() {
   const stream = await openCamera();
   cameraStream = stream;
+  cameraInfo = describeCamera(stream.getVideoTracks()[0]);
   video.srcObject = stream;
 
   // 執行期攝影機中斷（USB 被拔、被其他應用程式搶走、驅動重置）會讓 track 觸發 ended，視為「鏡頭已關閉」：舞台提示＋按鈕變「開啟鏡頭」，按一下即重連。自己呼叫 track.stop() 依規格不會觸發 ended，但仍用串流身分擋掉舊串流遲來的事件。
@@ -673,62 +728,55 @@ function refreshStageHint() {
   stageHint.hidden = !text;
 }
 
-// 建好一份 landmarker 並回傳，不動使用中的 poseLandmarker（換手在 setPoseCount）；來源失敗才前進 poseModelIndex。
-async function loadPoseModel(numPoses) {
-  for (;;) {
-    const idx = poseModelIndex;
-    try {
-      return await PoseLandmarker.createFromOptions(visionFileset, {
-        // 不設 baseOptions.canvas：GPU delegate 官方文件說處理 GPU 時要綁，但那是把畫面交給 MediaPipe 用 GPU texture 處理的情境；我們只吃 landmark 座標，畫面渲染是另外管理的 WebGL context，兩邊搶同一個 canvas 反而衝突。
-        baseOptions: { modelAssetPath: POSE_MODEL_URLS[idx], delegate: "GPU" },
-        runningMode: "VIDEO",
-        numPoses,
-        minPoseDetectionConfidence: 0.5,
-        minPosePresenceConfidence: 0.5,
-        minTrackingConfidence: 0.5,
-        outputSegmentationMasks: false // 不需要分割遮罩，明寫掉而不是靠預設值
-      });
-    } catch (err) {
-      if (idx >= POSE_MODEL_URLS.length - 1) throw err; // 最後一個來源也失敗：真的失敗，往上拋
-      // 同時有兩個建置在飛、同一個來源都失敗時，只前進一次（poseModelIndex 沒變才前進），不會跳過本地
-      if (poseModelIndex === idx) {
-        console.warn(`姿勢模型載入失敗（${POSE_MODEL_URLS[idx]}），改用 ${POSE_MODEL_URLS[idx + 1]}`, err);
-        poseModelIndex = idx + 1;
-      }
+// 開機時載入姿勢推論的 Worker（module Worker 從 CDN 載 tasks-vision），收到 ready 才算就緒；Worker 檔或 CDN 載入失敗會觸發 error 事件。
+function startPoseWorker() {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(new URL("./poseWorker.js", import.meta.url), { type: "module" });
+    worker.onerror = (e) => reject(new Error(`姿勢推論 Worker 載入失敗${e.message ? `：${e.message}` : ""}`));
+    worker.onmessage = ({ data }) => {
+      if (data.type !== "ready") return;
+      worker.onmessage = onPoseWorkerMessage;
+      worker.onerror = onPoseWorkerError;
+      poseWorker = worker;
+      resolve();
+    };
+  });
+}
+
+function onPoseWorkerMessage({ data: msg }) {
+  if (msg.type === "result") {
+    handlePoseResult(msg);
+  } else if (msg.type === "detectFailed") {
+    inFlight = null;
+    frameFailed(new Error(msg.message));
+  } else if (msg.type === "configured" || msg.type === "configureFailed") {
+    const call = pendingCalls.get(msg.id);
+    pendingCalls.delete(msg.id);
+    if (msg.type === "configured") {
+      poseModelIndex = msg.modelIndex;
+      call?.resolve();
+    } else {
+      call?.reject(new Error(msg.message));
     }
   }
 }
 
-// 唯一的建置入口。回傳建好的 landmarker，或 null＝「等待期間被更新的請求取代，這次不算數」（不是錯誤，呼叫端不該顯示錯誤訊息）。
-// 合併：同一個 numPoses 在飛時共用同一顆 promise，不會建第二份。取代：不同 numPoses 進來時舊的建置沒有人「要」了，但 MediaPipe 沒有取消 API，底層 loadPoseModel() 仍會跑完，
-// 結果一出來發現被取代就直接 close 丟棄。所以使用者連續改變心意時（如 2→3 之後建置中途又選 4），短暫幾秒內可能有兩個 WASM／GPU 建置同時在跑——只是同一時間只有一個結果會被採用；
-// 這個重疊窗口短暫且會自我修正，跟拿掉常駐 4 份實例池（降低穩定狀態記憶體）的目標不衝突。
-function requestLandmarker(numPoses) {
-  if (pendingBuild && pendingBuild.numPoses === numPoses) {
-    return pendingBuild.promise;
-  }
-  abandonPendingBuild();
-  const build = { numPoses, promise: null };
-  build.promise = loadPoseModel(numPoses).then(
-    (landmarker) => {
-      if (pendingBuild !== build) { landmarker.close(); return null; } // 已被取代：建好就直接丟
-      pendingBuild = null;
-      return landmarker;
-    },
-    (err) => {
-      if (pendingBuild === build) pendingBuild = null;
-      throw err; // 真正的失敗照樣往上拋，由呼叫端決定要不要顯示錯誤
-    }
-  );
-  pendingBuild = build;
-  return build.promise;
+// Worker 執行中出現沒接住的錯誤：之後不一定還有結果回來（骨架會停在最後一張），當成持續性錯誤處理；等待中的換人數一併失敗。
+function onPoseWorkerError(e) {
+  console.error("⚠️ 姿勢推論 Worker 發生錯誤", e.message ?? e);
+  for (const call of pendingCalls.values()) call.reject(new Error("姿勢推論 Worker 發生錯誤"));
+  pendingCalls.clear();
+  stopFrameLoop();
+  showError("姿勢追蹤發生持續性錯誤", "請重新整理頁面。若問題持續發生，請確認鏡頭或顯示卡驅動狀態。");
 }
 
-// 舊的在飛建置沒人要了：清掉參照（它 resolve 時會走「已被取代」分支 close 掉）。額外掛 catch 吞掉可能的 rejection 純粹是多一層保險：目前設計下總有呼叫端在 await 它，不影響原呼叫端的錯誤處理。
-function abandonPendingBuild() {
-  const build = pendingBuild;
-  pendingBuild = null;
-  build?.promise.catch(() => {});
+let callSeq = 0;
+function callPoseWorker(msg) {
+  return new Promise((resolve, reject) => {
+    const id = ++callSeq;
+    pendingCalls.set(id, { resolve, reject });
+    poseWorker.postMessage({ ...msg, id });
+  });
 }
 
 async function initSystem() {
@@ -737,11 +785,9 @@ async function initSystem() {
     initWebGL();
 
     setStatus("正在載入 WASM 視覺模組⋯");
-    visionFileset = await FilesetResolver.forVisionTasks(
-      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/wasm"
-    );
+    await startPoseWorker();
 
-    // Pose landmarker 完全懶惰載入，開機不建：選人數之前 processFrame() 本來就不推論，開機搶建一份只會白白拖慢開機、多養一份常駐記憶體；真正共用的固定成本（WASM runtime）已在上一步載入完成。
+    // Pose landmarker 完全懶惰載入，開機不建：選人數之前 processFrame() 本來就不推論，開機搶建一份只會白白拖慢開機、多養一份常駐記憶體；開機只先載入 Worker 與 tasks-vision。
 
     setStatus("正在啟動鏡頭⋯");
     // 開機走的就是系統控制 bar 「開啟鏡頭」同一條路，只是失敗時這裡仍視為致命（error overlay）。
@@ -788,18 +834,19 @@ export async function setPoseCount(count) {
   if (!Number.isInteger(count) || count < 1 || count > CONFIG.maxUsers) {
     throw new Error(`現場人數必須是 1~${CONFIG.maxUsers} 的整數：${count}`);
   }
-  if (!visionFileset) throw new Error("視覺系統尚未就緒，無法設定現場人數");
+  if (!poseWorker) throw new Error("視覺系統尚未就緒，無法設定現場人數");
 
   // 已經是這個 numPoses（重選同一個值／失敗後重試）：不重建，只要把偵測武裝起來。
-  if (poseLandmarker && currentPoseCount === count) { applyPoseCount(count); return true; }
+  if (landmarkerReady && currentPoseCount === count) { applyPoseCount(count); return true; }
 
-  const landmarker = await requestLandmarker(count);
-  if (!landmarker) return false; // 被更新的請求取代，這次不算數（不是錯誤）
+  // 第一次在 Worker 裡建，之後原地 setOptions；Worker 依序處理，等待期間主執行緒照常、骨架停在上一張
+  const seq = ++configureSeq;
+  await callPoseWorker({ type: "configure", numPoses: count, modelUrls: POSE_MODEL_URLS.map((u) => new URL(u, document.baseURI).href) });
+  if (seq !== configureSeq) return false; // 被更新的請求取代，這次不算數（不是錯誤）
 
-  const stale = poseLandmarker;
-  poseLandmarker = landmarker;   // 等待期間每一幀都還在用舊人數那一份，畫面不會凍結
+  landmarkerReady = true;
   currentPoseCount = count;
-  stale?.close();                // 舊的立刻釋放——省記憶體的重點就在這一行
+  lastRawCount = 0;              // 換了設定就重新開始追蹤，第一幀一定跑偵測器
   applyPoseCount(count);
   return true;
 }
@@ -865,10 +912,8 @@ export function stopCamera() {
 window.addEventListener("beforeunload", () => {
   stopFrameLoop();
   cameraStream?.getTracks().forEach((t) => t.stop());
-  // 只剩兩份可能活著：目前使用中的，跟正在建置中還沒交棒的那份（如果有）。
-  poseLandmarker?.close();
-  poseLandmarker = null;
-  abandonPendingBuild(); // 清掉參照，它 resolve 時會自己走「已被取代」分支 close
+  poseWorker?.terminate();
+  poseWorker = null;
 
   if (gl) {
     gl.deleteTexture(glTexture);
