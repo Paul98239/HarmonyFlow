@@ -180,6 +180,8 @@ let lastProcessedVideoTime = -1; // 上一次真的送去推論的 video.current
 let currentPoseCount = 0; // 目前使用中的 landmarker 的 numPoses；0 ＝ 還沒建過任何一份
 let chosenPoseCount = 0;  // 系統控制 bar 選的「現場人數」；0 ＝ 還沒選 ＝ 不推論
 let lastRawCount = 0;     // 上一次推論的偵測筆數：小於 numPoses 時 MediaPipe 這一幀會重跑偵測器（pose_landmarker_graph.cc 的跳過條件），逐幀紀錄據此標記
+// 下一張送去推論的換成空白畫面（重置骨架 ID、鏡頭關掉後立起）：MediaPipe 追到的人數夠了就不再找人，一直跟著原本追到的人；空白畫面讓它這張追丟、下一張重跑偵測器，等同用手遮一下鏡頭
+let forgetTracking = false;
 let cameraInfo = null;    // 鏡頭實際協商到的規格與可調範圍（__latency 用），見 describeCamera()
 
 // frameHandle：已排程的下一幀代號（rVFC 與 rAF 的 id 都 ≥ 1，0＝沒有排程中的回呼）。isLoopStopped：迴圈停止中（攝影機關閉、致命錯誤）；已排隊的回呼另外真的取消掉（stopFrameLoop），旗標只是第二道防線。
@@ -511,7 +513,9 @@ function sendFrame(captureTime) {
   const ts = performance.now();
   pendingFrame = null;   // 取的是 video 當下最新的一張，等著的那張已經包含在內
   inFlight = { ts, captureTime, captureLagMs: captureTime === null ? null : ts - captureTime, detectorRan: lastRawCount < currentPoseCount ? 1 : 0 };
-  createImageBitmap(video).then(
+  const source = forgetTracking ? new ImageData(video.videoWidth || CONFIG.width, video.videoHeight || CONFIG.height) : video;
+  forgetTracking = false;
+  createImageBitmap(source).then(
     (bitmap) => {
       if (isLoopStopped || !poseWorker) { bitmap.close(); inFlight = null; return; }
       poseWorker.postMessage({ type: "detect", bitmap, ts }, [bitmap]);
@@ -676,7 +680,7 @@ async function attachCamera() {
 }
 
 // 收掉攝影機（按鈕關閉、ended、開啟失敗的收尾共用）。reason 是舞台提示要顯示的文字（""＝使用者主動關閉，顯示預設的「鏡頭已關閉」）。
-// 不呼叫 tracker.hardReset()：既有槽位維持原狀，重開後空著的槽位才會被新偵測到的人取用。
+// 不呼叫 tracker.hardReset()：既有槽位維持原狀，重開後空著的槽位才會被新偵測到的人取用；MediaPipe 的追蹤則在重開後第一張清掉（forgetTracking）。
 function detachCamera(reason) {
   stopFrameLoop();
   cameraStream?.getTracks().forEach((t) => t.stop());
@@ -688,6 +692,7 @@ function detachCamera(reason) {
   try { gl?.clear(gl.COLOR_BUFFER_BIT); } catch (e) { /* context 可能正在遺失 */ }
   ctx2d.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
   resetGestures();
+  forgetTracking = true;
   // 讓接收端立刻知道沒有人在場，不等它的斷訊看門狗。
   emitGesturePerformanceState(EMPTY_PERFORMANCE_STATE, performance.now());
 }
@@ -805,10 +810,11 @@ async function initSystem() {
   }
 }
 
-// 重置骨架 ID：釋放所有已鎖定的槽位與候選名單，讓下一幀重新鎖定
+// 重置骨架 ID：釋放所有已鎖定的槽位與候選名單，MediaPipe 也重新找人（forgetTracking），讓下一幀重新鎖定
 export function hardReset() {
   tracker.hardReset();
   resetGestures();
+  forgetTracking = true;
   emitGesturePerformanceState(EMPTY_PERFORMANCE_STATE, performance.now());
   ctx2d.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
 }
