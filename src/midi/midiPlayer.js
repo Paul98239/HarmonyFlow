@@ -123,6 +123,11 @@ export function triggerInput(input) {
   synth.scheduler.trigger(input);
 }
 
+// 在場名單（main.js 把揮手監聽收到的 presentSlots 接到這裡）：排程器記下揮手的人從什麼時候開始不在鏡頭裡，帶頭的人不在場時不等寬限就換人（見 scheduler.js 的 setPresence()）。
+export function setPresentSlots(slots) {
+  synth.scheduler.setPresence(slots, performance.now());
+}
+
 // 放開一個鍵（main.js 把鍵盤的 keyup 接到這裡）：輸入事件帶 key（keyboard.js 的 { slot, source, key, eventTimeMs, receivedMs }），收掉登記這個鍵的你的音（keyup 模式，見 scheduler.js 的 lift()）。
 export function liftInput(input) {
   synth.scheduler.lift(input);
@@ -148,17 +153,31 @@ export function playbackRate() {
   return synth.scheduler.playbackRate;
 }
 
+// 量測（同上）：合奏狀態（帶頭的人、名單、每位演奏者的狀態與相對時間 x），見 scheduler.js 的 inspect().performers。
+export function ensembleStats() {
+  const { ensemble, performers } = synth.scheduler.inspect();
+  const r = (x, d) => (Number.isFinite(x) ? Math.round(x * d) / d : x);
+  return {
+    帶頭: ensemble.leaderSlot,
+    名單: ensemble.roster,
+    演奏者: performers.map((p) => ({
+      槽位: p.slot, 來源: p.source, 狀態: p.status, 區間: p.zone, x拍: r(p.xBeats, 100), 速度: r(p.rate, 1000), 錯過: p.missed, 離上一下ms: r(p.sinceLastMs, 1),
+    })),
+  };
+}
+
 // 量測（同上）：AudioContext 回報的音訊輸出延遲，見 synth.js 的 audioLatencyInfo()。
 export function audioLatency() {
   return synth.audioLatencyInfo();
 }
 
-// 量測（同上）：錄音 v3，給 main.js 的 __pressLog 匯出做離線分析：歌、指派（Map 展開成 [partId, 槽位][] 才能轉 JSON）、每次按鍵嘗試（鍵、事件發生與程式收到的時刻、排程器時鐘、有沒有放行）、每次放開（lifts：鍵、時鐘、收了幾顆音）、
-// 事件串流（錨點、速度、每顆音實際發聲與收音的時刻…）與匯出時刻。
+// 量測（同上）：錄音 v4，給 main.js 的 __pressLog 匯出做離線分析：歌、指派（Map 展開成 [partId, 槽位][] 才能轉 JSON）、每次按鍵嘗試（鍵、事件發生與程式收到的時刻、排程器時鐘、
+// 有沒有放行與結果：放行／被擋／前奏・休止・超前預按／代打接手、有沒有跳到合奏位置）、每次放開（lifts：鍵、時鐘、收了幾顆音）、事件串流（錨點、速度、每顆音實際發聲與收音的時刻、
+// 換帶頭的人與演奏者狀態…）與匯出時刻。v4 比 v3 只多了欄位，重播工具兩版都讀。
 export function pressLog() {
   const { source, songTitle, assignments } = playerStore.state;
   return {
-    version: 3,
+    version: 4,
     song: { title: songTitle, source: source && { kind: source.kind, name: source.name, id: source.id ?? null } },
     assignments: [...assignments],
     presses: synth.scheduler.pressLog(),

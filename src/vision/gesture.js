@@ -32,21 +32,24 @@ export class ArcDetector {
     this._maxX = null;
     this.triggerSeq = 0;        // 每次有效拋物線的谷底事件 +1
     this.lastDepth = 0;         // 最近一次觸發的拋物線深度（肩寬單位），慣用手換手時比較用
+    this.troughMs = null;       // 目前最低點那一幀被拍下的時刻
+    this.lastTriggerTroughMs = null;   // 最近一次觸發的最低點時刻：揮手的「動作時刻」（排程器估速、比先後用）
     this._lastMs = null;
   }
 
   /**
    * 餵一幀資料。
    * @param {{point:{x,y}|null, shoulderWidth?:number}} frame  point＝手掌／手腕的合併座標
-   * @param {number} nowMs
-   * @returns {{triggerSeq:number}}
+   * @param {number} nowMs  處理這一幀的時刻（停滯判斷用）
+   * @param {number} [captureMs]  這一幀被攝影機拍下的時刻（記最低點用；沒有就是 nowMs）
+   * @returns {{triggerSeq:number, troughMs:number|null}} troughMs＝最近一次觸發的最低點時刻
    */
-  update(frame, nowMs) {
+  update(frame, nowMs, captureMs = nowMs) {
     const { point } = frame || {};
     if (!point || !Number.isFinite(point.x) || !Number.isFinite(point.y)) {
       this.peakY = this.troughY = null;
       this._lastMs = null;
-      return { triggerSeq: this.triggerSeq };
+      return { triggerSeq: this.triggerSeq, troughMs: this.lastTriggerTroughMs };
     }
 
     if (this._lastMs != null && nowMs - this._lastMs > this.cfg.staleMs) this.reset();
@@ -56,13 +59,14 @@ export class ArcDetector {
     const { x, y } = point;
 
     if (this.peakY === null) {
-      this.peakY = y; this.troughY = y;
+      this.peakY = y; this.troughY = y; this.troughMs = captureMs;
       this._minX = x; this._maxX = x;
-      return { triggerSeq: this.triggerSeq };
+      return { triggerSeq: this.triggerSeq, troughMs: this.lastTriggerTroughMs };
     }
 
     if (y >= this.troughY) {
       this.troughY = y;
+      this.troughMs = captureMs;
       if (x < this._minX) this._minX = x;
       if (x > this._maxX) this._maxX = x;
     } else if (y < this.troughY - this.cfg.reversalNoiseFloor * sw) {
@@ -71,15 +75,16 @@ export class ArcDetector {
       if (depth >= this.cfg.minDepthRatio * sw && xSpan >= this.cfg.minXSpanRatio * sw && y <= this.cfg.maxConfirmY) {
         this.triggerSeq++;
         this.lastDepth = depth / sw;
+        this.lastTriggerTroughMs = this.troughMs;
       }
-      this.peakY = y; this.troughY = y;
+      this.peakY = y; this.troughY = y; this.troughMs = captureMs;
       this._minX = x; this._maxX = x;
     } else {
       // 起點跟著更高的位置走，避免小雜訊被算進之後的深度
       if (y < this.peakY) this.peakY = y;
     }
 
-    return { triggerSeq: this.triggerSeq };
+    return { triggerSeq: this.triggerSeq, troughMs: this.lastTriggerTroughMs };
   }
 }
 
@@ -125,6 +130,7 @@ function ensureSlot(slot) {
   arcLastSeqBySlot[slot] = {
     left: 0, right: 0, combinedSeq: 0, lockedHand: null, lockedDepth: 0, lastTriggerMs: undefined,
     stillAnchor: null, stillSinceMs: undefined,
+    lastTroughMs: null,   // 最近一次觸發（鎖定的手）的最低點時刻；跟 combinedSeq 一樣不歸零，接收端在計數變動時讀
   };
   slotInactiveSinceMs[slot] = 0;
 }
@@ -142,15 +148,15 @@ const resetAllSlotDetectors = () => {
 };
 
 // 餵一個在場槽位的骨架給它那對 ArcDetector；回傳可見度、座標與肩寬，供 combineArcTriggers() 判斷鎖定的手該不該放開。
-function updateSlotArc(arcDet, track, nowMs) {
+function updateSlotArc(arcDet, track, nowMs, captureMs) {
   const sm = track.smoothed;
   const ls = sm[MP_LEFT_SHOULDER], rs = sm[MP_RIGHT_SHOULDER];
   const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
   const leftPoint = mergedHandPoint(sm, MP_LEFT_WRIST, MP_LEFT_HAND);
   const rightPoint = mergedHandPoint(sm, MP_RIGHT_WRIST, MP_RIGHT_HAND);
   return {
-    left: arcDet.left.update({ point: leftPoint, shoulderWidth }, nowMs),
-    right: arcDet.right.update({ point: rightPoint, shoulderWidth }, nowMs),
+    left: arcDet.left.update({ point: leftPoint, shoulderWidth }, nowMs, captureMs),
+    right: arcDet.right.update({ point: rightPoint, shoulderWidth }, nowMs, captureMs),
     leftDepth: arcDet.left.lastDepth,
     rightDepth: arcDet.right.lastDepth,
     leftVisible: !!leftPoint,
@@ -211,6 +217,7 @@ function combineArcTriggers(state, arc, nowMs) {
     || (state.lockedHand === "right" && rightChanged);
   if (triggered) {
     state.lastTriggerMs = nowMs;
+    state.lastTroughMs = (state.lockedHand === "left" ? left : right).troughMs ?? null;
     state.combinedSeq = (state.combinedSeq || 0) + 1;
   }
   return { triggerSeq: state.combinedSeq || 0 };
@@ -221,11 +228,14 @@ function combineArcTriggers(state, arc, nowMs) {
  * @param {{slot: number, smoothed: object[]}[]} activeTracks  追蹤層這一幀的在場名單（tracker.getActiveTracks()）
  * @param {number} slotCount  追蹤器目前的槽位數（＝現場人數）；送出去的 map 只帶這麼多個槽位
  * @param {number} nowMs
- * @returns {{ arcTriggerSeqBySlot: Object<number, number>, presentSlots: number[], frame: Array }} frame＝逐幀紀錄用（vision.js 的 __visionLog）：
+ * @param {number} [captureMs]  這一幀被攝影機拍下的時刻（沒有就是 nowMs）
+ * @returns {{ arcTriggerSeqBySlot: Object<number, number>, arcTroughMsBySlot: Object<number, number|null>, presentSlots: number[], frame: Array }}
+ *   arcTroughMsBySlot＝每個槽位最近一次觸發的最低點時刻（揮手的動作時刻）；frame＝逐幀紀錄用（vision.js 的 __visionLog）：
  *   在場槽位的 [ID, 肩寬, 左手 x, y, 右手 x, y, 鎖定的手, 累加計數]，手腕不可見時那隻手的座標是 null
  */
-export function updateGestures(activeTracks, slotCount, nowMs) {
+export function updateGestures(activeTracks, slotCount, nowMs, captureMs = nowMs) {
   const arcTriggerSeqBySlot = {};
+  const arcTroughMsBySlot = {};
   const presentSlots = [];
   const frame = [];
   // 攤成「槽位 → track」查表；只處理 slotCount 個槽位，送出去的 map 不該帶永遠是空的槽位
@@ -240,7 +250,7 @@ export function updateGestures(activeTracks, slotCount, nowMs) {
     if (track) {
       slotInactiveSinceMs[slot] = 0;
       presentSlots.push(slot + 1);
-      arc = updateSlotArc(arcDet, track, nowMs);
+      arc = updateSlotArc(arcDet, track, nowMs, captureMs);
     } else {
       // 不在場：兩隻手都餵「看不到」讓追蹤中斷；連續超過 SLOT_RELEASE_MS 才真的 reset（下次鎖進來從乾淨開始）。
       if (slotInactiveSinceMs[slot] === 0) slotInactiveSinceMs[slot] = nowMs;
@@ -258,12 +268,13 @@ export function updateGestures(activeTracks, slotCount, nowMs) {
     }
     const combinedArc = combineArcTriggers(arcLastSeqBySlot[slot], arc, nowMs);
     arcTriggerSeqBySlot[slot + 1] = combinedArc.triggerSeq;
+    arcTroughMsBySlot[slot + 1] = arcLastSeqBySlot[slot].lastTroughMs;
     if (track) {
       frame.push([slot + 1, arc.shoulderWidth, arc.leftPoint?.x ?? null, arc.leftPoint?.y ?? null, arc.rightPoint?.x ?? null, arc.rightPoint?.y ?? null,
         arcLastSeqBySlot[slot].lockedHand, combinedArc.triggerSeq]);
     }
   }
-  return { arcTriggerSeqBySlot, presentSlots, frame };
+  return { arcTriggerSeqBySlot, arcTroughMsBySlot, presentSlots, frame };
 }
 
 // 所有槽位的手勢狀態歸位；combinedSeq 不歸零（見 resetSlotDetectors）。

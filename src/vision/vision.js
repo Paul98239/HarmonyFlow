@@ -49,7 +49,7 @@ let tracker = new PersonTracker({ maxUsers: CONFIG.maxUsers });
 
 // 手勢（gesture.js 的 updateGestures()）：每幀算出「每個槽位（＝演奏者 ID）的拋物線觸發序號」＋「這一幀真的在場的槽位」，
 // 經 setPerformanceStateListener 註冊的回呼送出。main.js 註冊 input/gestureTrigger.js 的監聽，揮手與鍵盤並存。
-const EMPTY_PERFORMANCE_STATE = { arcTriggerSeqBySlot: {}, presentSlots: [] };
+const EMPTY_PERFORMANCE_STATE = { arcTriggerSeqBySlot: {}, arcTroughMsBySlot: {}, presentSlots: [] };
 
 let performanceStateListener = null;
 let lastSentState = null;
@@ -542,8 +542,9 @@ function runPipeline(ts, startMs, rawPoses, detectMs, captureLagMs, detectorRan,
   tracker.update(detections, ts);
   const activeTracks = tracker.getActiveTracks();
 
-  // ▶ 手勢（gesture.js）：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector，另外回報這一幀真的在場的槽位；槽位數＝追蹤器目前的槽位數（＝現場人數）
-  const gesture = updateGestures(activeTracks, tracker.cfg.maxUsers, ts);
+  // ▶ 手勢（gesture.js）：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector，另外回報這一幀真的在場的槽位；槽位數＝追蹤器目前的槽位數（＝現場人數）。
+  // 最低點的時刻用這張畫面被拍下的時刻（rVFC 的 captureTime；瀏覽器沒提供就用 ts）：揮手的動作時刻，排程器拿來估速、比先後
+  const gesture = updateGestures(activeTracks, tracker.cfg.maxUsers, ts, captureLagMs === null ? ts : ts - captureLagMs);
   emitGesturePerformanceState(gesture, ts);
 
   // ▶ WebGL 渲染攝影機畫面當背景

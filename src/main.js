@@ -18,6 +18,7 @@ window.__stats = () => {
     速度範圍: (({ lo, hi }) => ({ 下限: Math.round(lo * 1000) / 1000, 上限: Math.round(hi * 100) / 100 }))(midiPlayer.rateBounds()),
     電腦音遲到ms: midiPlayer.lateStats(),
     早按處理: midiPlayer.chaseStats(),
+    合奏: midiPlayer.ensembleStats(),
     按鍵事件等待ms: summarizeMs(keyWaits),
     音訊輸出: audio,
     估計按下到出聲ms: audioFixedMs === null ? null : { 固定音訊段ms: audioFixedMs, ...summarizeMs(keyWaits.map((x) => x + audioFixedMs)) },
@@ -90,7 +91,8 @@ async function bootSystem() {
 
   // 觸發來源：鍵盤（槽位 'kb'）與揮手（槽位 1~4＝演奏者 ID）並存，都進同一個入口 triggerInput
   startKeyboardTrigger(midiPlayer.triggerInput, midiPlayer.KEYBOARD_SLOT, midiPlayer.liftInput);
-  setPerformanceStateListener(createGestureTrigger(midiPlayer.triggerInput));
+  const onGesture = createGestureTrigger(midiPlayer.triggerInput);
+  setPerformanceStateListener((state) => { onGesture(state); midiPlayer.setPresentSlots(state.presentSlots); });
 
   // 視覺初始化失敗時錯誤畫面已經顯示，載入畫面不收、inert 也維持
   if (!visionOk) return;
