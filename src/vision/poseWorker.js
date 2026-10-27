@@ -1,8 +1,8 @@
-// 版本固定 1.1.0：bundle、loader JS、.wasm 三個檔必須同一版。不用 @latest：jsDelivr 邊緣節點曾同時回傳不同版本的 loader JS 與 .wasm
-// （2026-10-07 實測），載入時 assignWasmExports 讀到 undefined 而失敗。升級時這裡的 import 與 WASM_BASE 一起改。
-import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/vision_bundle.mjs";
+// 版本固定 1.1.1：bundle、loader JS、.wasm 三個檔必須同一版。不用 @latest：jsDelivr 邊緣節點曾同時回傳不同版本的 loader JS 與 .wasm
+// （2026-10-07 實測，正好是 1.1.0 發布隔天，各檔案的 @latest 快取換版時間不一致），載入時 assignWasmExports 讀到 undefined 而失敗。升級時這裡的 import 與 WASM_BASE 一起改。
+import { FilesetResolver, PoseLandmarker } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/vision_bundle.mjs";
 
-const WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.0/wasm";
+const WASM_BASE = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.1.1/wasm";
 const LANDMARKER_OPTIONS = {
   runningMode: "VIDEO",
   minPoseDetectionConfidence: 0.5,
