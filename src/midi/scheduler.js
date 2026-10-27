@@ -867,7 +867,8 @@ export class Scheduler {
     return false;
   }
 
-  // 重新挑帶頭的人：名單上第一位可以帶頭的（_isCandidate）。帶頭的人休止中時，只交給在他的進場音之前有要按的起音的人（規格「合奏」：彈長音跨過他整段休止的人
+  // 重新挑帶頭的人：名單上第一位可以帶頭的（_isCandidate）；現任出狀況時，正常的人也不能自己已經停住（_stallWhy）：還算正在彈、卻已過了自己寬限的人，交過去同一刻就停住，
+  // 帶頭會卡在他身上直到他不算正在彈（修正設計 §3.4）。帶頭的人休止中時，只交給在他的進場音之前有要按的起音的人（規格「合奏」：彈長音跨過他整段休止的人
   // 不用伴奏往前走，合奏照他的速度走到進場音等他）。沒有正常的人可以接、而現任出狀況又停住（或已經不在名單上）時，交給名單上第一位還在的人：出狀況但還在彈、
   // 沒有停住的，其次在自己休止裡的（使用者 2026-10-22 定；不然其他人的觸發都被休止符鎖、超前鎖吞掉，整首卡住），原帶頭的人交給第二段防呆。換候補在他剛出狀況的那一刻（呼叫端給了 reason）；
   // 之後每個 tick 重新檢查時，出狀況的現任（含候補自己又停住）要已經不算正在彈（離上一下超過 ENSEMBLE.ACTIVE_BEATS 拍、或不在鏡頭裡）才換，不然候補一停頓就換下一位。
@@ -875,7 +876,8 @@ export class Scheduler {
   _updateLeader(clock, reason = null, force = false, entering = null) {
     const E = this._ensemble, cur = E.leader, slots = this._roster.slots(), at = (s) => this._bySlot.get(s);
     const entry = cur?.status === 'ok' && this._isResting(cur) ? cur.plan.driverTicks[cur.cursor] : null;
-    const ok = (p) => this._isCandidate(p, cur, clock, entering) && (entry === null || (p.plan.driverTicks[p.groupEnd] ?? Infinity) < entry);
+    const ok = (p) => this._isCandidate(p, cur, clock, entering) && (cur?.status !== 'trouble' || p === cur || !this._stallWhy(p, clock))
+      && (entry === null || (p.plan.driverTicks[p.groupEnd] ?? Infinity) < entry);
     let slot = pickLeader(slots, (s) => ok(at(s)));
     const stall = cur?.status === 'trouble' ? this._stallWhy(cur, clock) : null;
     const gone = stall && (reason !== null || stall === 'absent' || clock - cur.lastTriggerMs > threshold(ENSEMBLE.ACTIVE_BEATS, ENSEMBLE.ACTIVE_MIN_MS, this._beatMsNow()));
