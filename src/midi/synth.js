@@ -110,10 +110,11 @@ const SOUNDFONT_URLS = [
 ];
 
 // spessasynth_lib 直接從 CDN 匯入（不經 import map）：jsDelivr 的 +esm 端點把 CJS/UMD 轉成瀏覽器能 import 的 ESM；AudioWorklet 處理器跟入口在同一個套件目錄，
-// 直接拼路徑（+esm 不是真實目錄，import.meta.resolve 推不出位置）。版本刻意綁 @latest：不手動維護版本號，代價是 jsDelivr 對 @latest 有快取
-// （瀏覽器端 7 天／邊緣節點 12 小時），版本可能無預警改變；它依賴的 spessasynth_core 本來就是 latest，兩層都是刻意浮動。
-const LIB_ESM_URL = `https://cdn.jsdelivr.net/npm/spessasynth_lib@latest/+esm`;
-const WORKLET_URL = `https://cdn.jsdelivr.net/npm/spessasynth_lib@latest/dist/spessasynth_processor.min.js`;
+// 直接拼路徑（+esm 不是真實目錄，import.meta.resolve 推不出位置）。版本固定 4.3.14（4.3 系列最後一版），兩個網址一起改：4.4.0 的 addNewChannel() 每個新 channel
+// 讓主執行緒丟 18 次 Uncaught TypeError（core 先 reset 新 channel 才發 channelAdded，2026-10-27 查證），而且 songChange 等 API 有破壞性改動。
+// 確切版本的 +esm 由 jsDelivr 第一次打包時固定相依版本（4.3.14 匯入 core 4.3.20），worklet 檔則包著作者打包時的 core。
+const LIB_ESM_URL = `https://cdn.jsdelivr.net/npm/spessasynth_lib@4.3.14/+esm`;
+const WORKLET_URL = `https://cdn.jsdelivr.net/npm/spessasynth_lib@4.3.14/dist/spessasynth_processor.min.js`;
 
 // WorkletSynthesizer 預設只建 16 個 channel（1 個 port）；聲部數超過時多出來的聲部分不到輸出 channel、整段靜音（國旗歌 24 個旋律聲部實測重現）。
 // 用 addNewChannel() 動態加開：模仿官方 Sequencer，開機先補到 DEFAULT_PORTS 個 port，歌曲需要更多時在 load() 依 portsNeeded() 補，只增不減。
