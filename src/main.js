@@ -27,7 +27,7 @@ window.__stats = () => {
 
 window.__pressLog = midiPlayer.pressLog;
 
-// copy(__visionLog(30))：最近 30 秒的逐幀紀錄（兩手手腕、偵測、鎖定的手、推論耗時）與追蹤層的鎖定／釋放事件，查手點互相干擾與多出來的 ID 用。
+// copy(__visionLog(30))：最近 30 秒的逐幀紀錄（兩手手腕、上半身節點的原始／world／平滑座標、偵測、鎖定的手、推論耗時）與追蹤層的鎖定／釋放事件，查手點互相干擾與多出來的 ID 用。
 window.__visionLog = visionLog;
 
 // 長任務（主執行緒連續忙 50ms 以上，這段時間按鍵與按鈕都沒反應）：[開始時刻, 長度]，__latency() 依時刻歸到當時的現場人數。Firefox 沒有這個 API，記 null。

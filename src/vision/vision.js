@@ -2,8 +2,8 @@
 
 import { PersonTracker, buildDetection } from "./tracking.js";
 import {
-  MP_LEFT_WRIST, MP_RIGHT_WRIST, MP_LEFT_ELBOW, MP_RIGHT_ELBOW, MP_LEFT_SHOULDER, MP_RIGHT_SHOULDER, MP_LEFT_HAND, MP_RIGHT_HAND,
-  mergedHandPoint, updateGestures, resetGestures, lockedHandOf,
+  MP_LEFT_WRIST, MP_RIGHT_WRIST, MP_LEFT_ELBOW, MP_RIGHT_ELBOW, MP_LEFT_SHOULDER, MP_RIGHT_SHOULDER,
+  updateGestures, resetGestures,
 } from "./gesture.js";
 
 const CONFIG = {
@@ -65,18 +65,42 @@ let frameLog = [];
 let trackerEvents = [];
 const r1 = (v) => Math.round(v * 10) / 10;
 const r3 = (v) => (v === null || v === undefined ? null : Math.round(v * 1000) / 1000);
+const r4 = (v) => (v === null || v === undefined ? null : Math.round(v * 10000) / 10000);
+// v4 的「節點」欄記的上半身節點：兩肩、兩肘、兩腕、手掌六點、兩髖（調過濾器與尺度用，見 test/tools/pose-filter-eval.mjs）
+const V4_JOINTS = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
+
+// MediaPipe 平滑用的物件尺度：33 個點外框的 (寬＋高) ÷ 2（landmarks_smoothing_calculator_utils.cc 的 GetObjectScale）
+function mediapipeObjectScale(lm) {
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of lm) {
+    if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+    if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+  }
+  return (maxX - minX + maxY - minY) / 2;
+}
+
+function jointRow(track) {
+  const { raw, rawWorld, smoothed } = track;
+  return [
+    track.slot + 1, r3(mediapipeObjectScale(raw)),
+    ...V4_JOINTS.flatMap((j) => [r3(raw[j].x), r3(raw[j].y), r3(raw[j].visibility)]),
+    ...V4_JOINTS.flatMap((j) => (rawWorld ? [r4(rawWorld[j].x), r4(rawWorld[j].y), r4(rawWorld[j].z)] : [null, null, null])),
+    ...V4_JOINTS.flatMap((j) => [r3(smoothed[j].x), r3(smoothed[j].y)]),
+  ];
+}
 
 function recordFrame(ts, startMs, detectMs, rawCount, detections, activeTracks, gestureRows, captureLagMs, detectorRan, resultLagMs) {
   const rawBySlot = new Map(activeTracks.map((t) => [t.slot + 1, t.raw]));
   const wrist = (raw, i) => (raw ? [r3(raw[i].x), r3(raw[i].y), r3(raw[i].visibility)] : [null, null, null]);
   frameLog.push([
     Math.round(ts), chosenPoseCount, rawCount, r1(detectMs), r1(performance.now() - startMs),
-    detections.map((d) => [r3(d.centroid.x), r3(d.centroid.y), r3(d.shoulderWidth), r3(d.meanVisibility), d.strictPlausible ? 1 : 0]),
+    detections.map((d) => [r3(d.centroid.x), r3(d.centroid.y), r3(d.scale), r3(d.meanVisibility), d.strictPlausible ? 1 : 0]),
     gestureRows.map(([id, sw, lx, ly, rx, ry, lock, seq]) => {
       const raw = rawBySlot.get(id);
       return [id, r3(sw), r3(lx), r3(ly), r3(rx), r3(ry), lock, seq, ...wrist(raw, MP_LEFT_WRIST), ...wrist(raw, MP_RIGHT_WRIST)];
     }),
     captureLagMs === null ? null : r1(captureLagMs), detectorRan, resultLagMs === null ? null : r1(resultLagMs),
+    activeTracks.map(jointRow),
   ]);
   if (frameLog.length > FRAME_LOG_MAX) frameLog.splice(0, frameLog.length - (FRAME_LOG_MAX - (FRAME_LOG_MAX >> 3)));
   trackerEvents.push(...tracker.drainEvents());
@@ -87,18 +111,20 @@ function recordFrame(ts, startMs, detectMs, rawCount, detections, activeTracks, 
 export function visionLog(seconds = 30) {
   const from = performance.now() - seconds * 1000;
   return {
-    version: 3,
+    version: 4,
     exportedAt: new Date().toISOString(),
     seconds,
     poseCount: chosenPoseCount,
     cameraOn: cameraState === "on",
+    video: { w: video.videoWidth || CONFIG.width, h: video.videoHeight || CONFIG.height },
     columns: {
       frame: ["t（送去推論的時刻；沒推論時是處理時刻；performance.now，ms）", "現場人數", "MediaPipe 偵測筆數", "推論ms（在 Worker）", "主執行緒處理ms",
-        "偵測[[肩中點 x, y, 肩寬, 平均可見度, 嚴格可信 0/1]]",
-        "追蹤[[ID, 肩寬, 左手 x, y, 右手 x, y（手腕不可見是 null）, 鎖定的手, 累加計數, 原始左腕 x, y, 可見度, 原始右腕 x, y, 可見度]]",
+        "偵測[[肩中點 x, y, 尺度（v3 以前是肩寬）, 平均可見度, 嚴格可信 0/1]]",
+        "追蹤[[ID, 尺度, 左手腕 x, y, 右手腕 x, y（平滑後，手腕不可見是 null；v3 以前是肩寬與手腕＋手掌合併點）, 鎖定的手, 累加計數, 原始左腕 x, y, 可見度, 原始右腕 x, y, 可見度]]",
         "拍下→送出ms（rVFC 的 captureTime；瀏覽器沒提供是 null）", "偵測器可能有跑（上一次偵測筆數 < numPoses 是 1，否則 0；沒推論是 null）",
-        "拍下→結果進主執行緒ms（沒有拍下時刻時從送出算起；沒推論是 null）"],
-      trackerEvent: "{ t, type: lock｜loss｜duplicate, slot（ID）；lock 另有 sw 肩寬、vis 平均可見度、strict }",
+        "拍下→結果進主執行緒ms（沒有拍下時刻時從送出算起；沒推論是 null）",
+        `節點[[ID, MediaPipe 物件尺度, 原始 x, y, 可見度 ×${V4_JOINTS.length} 點, world x, y, z（公尺）×${V4_JOINTS.length} 點, 平滑後 x, y ×${V4_JOINTS.length} 點]]，點依序是 ${V4_JOINTS.join(",")}`],
+      trackerEvent: "{ t, type: lock｜loss｜duplicate, slot（ID）；lock 另有 scale 尺度、vis 平均可見度、strict }",
     },
     frames: frameLog.filter((f) => f[0] >= from),
     trackerEvents: trackerEvents.filter((e) => e.t >= from),
@@ -308,10 +334,19 @@ function syncCanvasSize() {
   }
 }
 
-function renderVideoGL() {
+function uploadVideoTexture(source) {
   gl.activeTexture(gl.TEXTURE0);
   gl.bindTexture(gl.TEXTURE_2D, glTexture);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, source);
+}
+
+// source："sent"＝畫送出推論前已上傳的那一張（sendFrame）；"live"＝沒有推論時，上傳 <video> 當下這張再畫
+function renderVideoGL(source) {
+  if (source === "live") uploadVideoTexture(video);
+  else {
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, glTexture);
+  }
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
 }
 
@@ -334,15 +369,16 @@ function virtualChinPoint(lm, shoulderWidth) {
   };
 }
 
-// 精簡骨架只畫手勢相關的手臂鏈（肩-肘-手掌大點）＋臉部簡化輪廓，不畫全身連線（髖／膝／踝／腳掌沒有被任何手勢或播放邏輯讀取）。
-// 只到肘為止：肘→手掌大點那一段要連到合併後的座標，不是原始手腕點，兩者位置不同，用索引表連不出正確的線（會跟大點之間留一截空隙）。
+// 精簡骨架只畫手臂鏈（肩-肘-手腕-手掌）＋臉部簡化輪廓，不畫全身連線（髖／膝／踝／腳掌沒有被任何手勢或播放邏輯讀取）。
+// 手照 MediaPipe 原本的節點與連線（POSE_CONNECTIONS 的手部那幾條）：手腕、小指、食指、拇指各一點，兩隻手都畫。
 const ARM_CONNECTIONS = [
-  { start: MP_LEFT_SHOULDER, end: MP_LEFT_ELBOW },
-  { start: MP_RIGHT_SHOULDER, end: MP_RIGHT_ELBOW },
+  [MP_LEFT_SHOULDER, MP_LEFT_ELBOW], [MP_RIGHT_SHOULDER, MP_RIGHT_ELBOW],
+  [13, 15], [15, 17], [15, 19], [15, 21], [17, 19],
+  [14, 16], [16, 18], [16, 20], [16, 22], [18, 20],
 ];
+const ARM_JOINTS = [MP_LEFT_SHOULDER, MP_RIGHT_SHOULDER, MP_LEFT_ELBOW, MP_RIGHT_ELBOW, 15, 16, 17, 18, 19, 20, 21, 22];
 // 臉部只標關鍵五官：雙眼（2/5）、鼻子（0）各畫一個獨立節點、不連線；嘴巴兩節點（9/10）加上虛擬下巴節點（virtualChinPoint()）連成倒三角形。
 const MOUTH_PAIR = [9, 10];
-const HAND_DOT_RADIUS = JOINT_RADIUS * 2.2; // 手腕＋手掌合併後的大點，比一般關節明顯
 
 // 2D 覆蓋層繪製骨架：依鎖定槽位上色，同一人跨幀顏色不變。
 function renderSkeletonOverlay(activeTracks) {
@@ -363,32 +399,15 @@ function renderSkeletonOverlay(activeTracks) {
     const lm = track.smoothed;
     const ls = lm[MP_LEFT_SHOULDER], rs = lm[MP_RIGHT_SHOULDER];
     const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
-
-    // 只畫目前鎖定的那隻手（未鎖定時兩隻都畫）：另一隻閒置手消失，使用者才看得出系統現在認哪隻手（combineArcTriggers() 的自動鎖定慣用手）。
-    const lockedHand = lockedHandOf(track.slot);
-    const showLeftHand = lockedHand !== "right";
-    const showRightHand = lockedHand !== "left";
-    // 手腕＋手掌合併點要先算出來：肘→手掌那段連線與手掌大點都要用同一個座標，兩處對不齊就會看起來中間有空隙。
-    const leftHand = showLeftHand ? mergedHandPoint(lm, MP_LEFT_WRIST, MP_LEFT_HAND) : null;
-    const rightHand = showRightHand ? mergedHandPoint(lm, MP_RIGHT_WRIST, MP_RIGHT_HAND) : null;
     const neck = virtualNeckPoint(lm);
     const chin = virtualChinPoint(lm, shoulderWidth);
 
     const bones = new Path2D();
-    for (const c of ARM_CONNECTIONS) {
-      const p = lm[c.start], q = lm[c.end];
+    for (const [a, b] of ARM_CONNECTIONS) {
+      const p = lm[a], q = lm[b];
       if (!(p.visible ?? true) || !(q.visible ?? true)) continue;
       bones.moveTo(p.x * W, p.y * H);
       bones.lineTo(q.x * W, q.y * H);
-    }
-    const lElbow = lm[MP_LEFT_ELBOW], rElbow = lm[MP_RIGHT_ELBOW];
-    if (leftHand && (lElbow.visible ?? true)) {
-      bones.moveTo(lElbow.x * W, lElbow.y * H);
-      bones.lineTo(leftHand.x * W, leftHand.y * H);
-    }
-    if (rightHand && (rElbow.visible ?? true)) {
-      bones.moveTo(rElbow.x * W, rElbow.y * H);
-      bones.lineTo(rightHand.x * W, rightHand.y * H);
     }
     if (neck) {
       bones.moveTo(ls.x * W, ls.y * H); bones.lineTo(neck.x * W, neck.y * H);
@@ -404,7 +423,7 @@ function renderSkeletonOverlay(activeTracks) {
     ctx2d.lineWidth = BONE_WIDTH;
     ctx2d.stroke(bones);
 
-    // 關節點：肩／肘／脖子／下巴正常大小；雙眼與鼻子各畫一個獨立節點、不連線；手腕與手掌合併畫成一個較大的點（mergedHandPoint() 與手勢偵測共用，畫面跟手勢追蹤的點位一致）。
+    // 關節點：手臂鏈（含手腕與手掌三點）、脖子、下巴；雙眼與鼻子各畫一個獨立節點、不連線。
     const joints = new Path2D();
     const addJoint = (x, y, radius) => {
       // arc 從角度 0（圓的右端）起筆，先 moveTo 過去，否則會從上一個圓拉一條線過來
@@ -412,16 +431,13 @@ function renderSkeletonOverlay(activeTracks) {
       joints.arc(x, y, radius, 0, TAU);
     };
     // 0=鼻子、2=左眼中心、5=右眼中心、9/10=嘴角（見 MOUTH_PAIR）。
-    for (const i of [MP_LEFT_SHOULDER, MP_RIGHT_SHOULDER, MP_LEFT_ELBOW, MP_RIGHT_ELBOW,
-                      0, 2, 5, MOUTH_PAIR[0], MOUTH_PAIR[1]]) {
+    for (const i of [...ARM_JOINTS, 0, 2, 5, MOUTH_PAIR[0], MOUTH_PAIR[1]]) {
       const p = lm[i];
       if (!(p.visible ?? true)) continue;
       addJoint(p.x * W, p.y * H, JOINT_RADIUS);
     }
     if (neck) addJoint(neck.x * W, neck.y * H, JOINT_RADIUS);
     if (chin) addJoint(chin.x * W, chin.y * H, JOINT_RADIUS);
-    if (leftHand) addJoint(leftHand.x * W, leftHand.y * H, HAND_DOT_RADIUS);
-    if (rightHand) addJoint(rightHand.x * W, rightHand.y * H, HAND_DOT_RADIUS);
     ctx2d.fillStyle = color;
     ctx2d.fill(joints);
     ctx2d.lineWidth = 1;
@@ -490,7 +506,7 @@ function processFrame(_now, metadata) {
     } else {
       // ▶ 還沒選「現場人數」或模型還沒建好就不推論；其餘管線照跑：tracker.update([]) 讓舊 track 自然過期、心跳照送 presentSlots: []、攝影機畫面照畫（不凍結）。
       const nowMs = performance.now();
-      runPipeline(nowMs, nowMs, [], 0, captureTime === null ? null : nowMs - captureTime, null, null);
+      runPipeline(nowMs, nowMs, [], 0, captureTime === null ? null : nowMs - captureTime, null, null, [], "live");
     }
   } catch (err) {
     frameFailed(err);
@@ -515,23 +531,27 @@ function sendFrame(captureTime) {
   inFlight = { ts, captureTime, captureLagMs: captureTime === null ? null : ts - captureTime, detectorRan: lastRawCount < currentPoseCount ? 1 : 0 };
   const source = forgetTracking ? new ImageData(video.videoWidth || CONFIG.width, video.videoHeight || CONFIG.height) : video;
   forgetTracking = false;
+  const blank = source !== video;
   createImageBitmap(source).then(
     (bitmap) => {
       if (isLoopStopped || !poseWorker) { bitmap.close(); inFlight = null; return; }
+      // 背景要畫送去推論的這一張（結果回來時 renderVideoGL("sent")），骨架才跟畫面裡的手是同一個瞬間；bitmap 交給 Worker 之後就不能用，所以先上傳。
+      // 空白畫面（重置 ID、重開鏡頭）那一次改傳當下的畫面：貼圖裡可能還是關鏡頭之前的舊畫面；這一幀追蹤層沒有可畫的骨架，不會不同步
+      uploadVideoTexture(blank ? video : bitmap);
       poseWorker.postMessage({ type: "detect", bitmap, ts }, [bitmap]);
     },
     (err) => { inFlight = null; frameFailed(err); },
   );
 }
 
-function handlePoseResult({ ts, inferMs, landmarks }) {
+function handlePoseResult({ ts, inferMs, landmarks, worldLandmarks }) {
   const sent = inFlight;
   inFlight = null;
   if (!sent || sent.ts !== ts || isLoopStopped) return;   // 鏡頭關掉之後才回來的結果不用
   const startMs = performance.now();
   lastRawCount = landmarks.length;
   try {
-    runPipeline(ts, startMs, landmarks, inferMs, sent.captureLagMs, sent.detectorRan, startMs - (sent.captureTime ?? ts));
+    runPipeline(ts, startMs, landmarks, inferMs, sent.captureLagMs, sent.detectorRan, startMs - (sent.captureTime ?? ts), worldLandmarks);
   } catch (err) {
     frameFailed(err);
   }
@@ -539,9 +559,9 @@ function handlePoseResult({ ts, inferMs, landmarks }) {
 }
 
 // 偵測結果到了之後的管線。ts＝這張畫面的時刻（追蹤與手勢的時間基準），startMs＝主執行緒開始處理的時刻（逐幀紀錄的主執行緒耗時從這裡算）。
-function runPipeline(ts, startMs, rawPoses, detectMs, captureLagMs, detectorRan, resultLagMs) {
+function runPipeline(ts, startMs, rawPoses, detectMs, captureLagMs, detectorRan, resultLagMs, rawWorlds = [], videoSource = "sent") {
   // ▶ 依位置將偵測結果匹配到已鎖定的槽位（並平滑），演算法見 tracking.js。buildDetection 對座標異常／不像人的偵測回傳 null 先濾掉；同一具身體的重複偵測由 tracker.update() 自己挑該留哪一筆。
-  const detections = rawPoses.map((lm) => buildDetection(lm)).filter(Boolean);
+  const detections = rawPoses.map((lm, i) => buildDetection(lm, { world: rawWorlds[i] ?? null })).filter(Boolean);
 
   tracker.update(detections, ts);
   const activeTracks = tracker.getActiveTracks();
@@ -551,8 +571,8 @@ function runPipeline(ts, startMs, rawPoses, detectMs, captureLagMs, detectorRan,
   const gesture = updateGestures(activeTracks, tracker.cfg.maxUsers, ts, captureLagMs === null ? ts : ts - captureLagMs);
   emitGesturePerformanceState(gesture, ts);
 
-  // ▶ WebGL 渲染攝影機畫面當背景
-  renderVideoGL();
+  // ▶ WebGL 渲染攝影機畫面當背景：有推論時是送去推論的那一張，沒推論時是當下這張
+  renderVideoGL(videoSource);
 
   // ▶ 2D 覆蓋層繪製骨架（漏偵測一兩幀的人用最後一次的骨架撐住，見 tracking.js 的 getDrawableTracks）
   renderSkeletonOverlay(tracker.getDrawableTracks(ts));

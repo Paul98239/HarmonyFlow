@@ -1,13 +1,14 @@
 // gesture.js — 手勢：單手拋物線偵測（ArcDetector）、雙手合成與慣用手鎖定、各槽位的手勢狀態（updateGestures）。純離散觸發訊號，不輸出音量、不管速度。
-// 門檻以肩寬為距離單位、毫秒為時間單位，站遠站近、30fps 或 60fps 結果一致。
+// 門檻以這個人的尺度（tracking.js 的 track.scale，正面時約等於肩寬）為距離單位、毫秒為時間單位，站遠站近、30fps 或 60fps 結果一致。
+// 揮手現在先只看手腕；其他節點都在 track.smoothed 裡、經過同一套平滑，之後偵測別的動作時直接讀。
 
 export const DEFAULT_ARC_CONFIG = Object.freeze({
-  minShoulderWidth: 0.04,   // 肩寬的下限，避免遠處偵測到的極小肩寬把比值放大到離譜
+  minScale: 0.04,           // 尺度的下限，避免遠處偵測到的極小尺度把比值放大到離譜
   staleMs: 320,             // 距上一次餵值超過這麼久 → 視為剛回到鏡頭，這一段動作作廢重來
-  reversalNoiseFloor: 0.05, // Y 方向死區（肩寬單位）：從谷底回升要超過這個幅度才算「確認回升」
+  reversalNoiseFloor: 0.05, // Y 方向死區（尺度單位）：從谷底回升要超過這個幅度才算「確認回升」
   // 這兩個門檻比較嚴：每次判定成立都立刻前進一步、沒有緩衝空間，調嚴降低誤觸發
-  minDepthRatio: 0.15,      // 這段下沉至少要多深（肩寬單位）才算一次有效拋物線
-  minXSpanRatio: 0.18,      // 下沉期間至少要有這麼多橫向位移（肩寬單位），用來跟「純上下抖」區分開
+  minDepthRatio: 0.15,      // 這段下沉至少要多深（尺度單位）才算一次有效拋物線
+  minXSpanRatio: 0.18,      // 下沉期間至少要有這麼多橫向位移（尺度單位），用來跟「純上下抖」區分開
   // 確認那一幀的 y 上限（畫面下緣＝1）：手放到畫面外時模型仍會推估位置，往上飄一點就湊出假拋物線；0.05 的邊界留給谷底剛擦過下緣的真揮手。暫定值（2026-10-20 兩份遮手紀錄）
   maxConfirmY: 1.05,
 });
@@ -31,7 +32,7 @@ export class ArcDetector {
     this._minX = null;          // 下沉期間橫向位移範圍（用來跟「純上下抖」區分）
     this._maxX = null;
     this.triggerSeq = 0;        // 每次有效拋物線的谷底事件 +1
-    this.lastDepth = 0;         // 最近一次觸發的拋物線深度（肩寬單位），慣用手換手時比較用
+    this.lastDepth = 0;         // 最近一次觸發的拋物線深度（尺度單位），慣用手換手時比較用
     this.troughMs = null;       // 目前最低點那一幀被拍下的時刻
     this.lastTriggerTroughMs = null;   // 最近一次觸發的最低點時刻：揮手的「動作時刻」（排程器估速、比先後用）
     this._lastMs = null;
@@ -39,7 +40,7 @@ export class ArcDetector {
 
   /**
    * 餵一幀資料。
-   * @param {{point:{x,y}|null, shoulderWidth?:number}} frame  point＝手掌／手腕的合併座標
+   * @param {{point:{x,y}|null, scale?:number}} frame  point＝手腕座標，scale＝這個人的尺度
    * @param {number} nowMs  處理這一幀的時刻（停滯判斷用）
    * @param {number} [captureMs]  這一幀被攝影機拍下的時刻（記最低點用；沒有就是 nowMs）
    * @returns {{triggerSeq:number, troughMs:number|null}} troughMs＝最近一次觸發的最低點時刻
@@ -55,7 +56,7 @@ export class ArcDetector {
     if (this._lastMs != null && nowMs - this._lastMs > this.cfg.staleMs) this.reset();
     this._lastMs = nowMs;
 
-    const sw = Math.max(this.cfg.minShoulderWidth, frame.shoulderWidth || 0);
+    const sw = Math.max(this.cfg.minScale, frame.scale || 0);
     const { x, y } = point;
 
     if (this.peakY === null) {
@@ -92,25 +93,14 @@ export class ArcDetector {
 export const MP_LEFT_WRIST = 15, MP_RIGHT_WRIST = 16;
 export const MP_LEFT_ELBOW = 13, MP_RIGHT_ELBOW = 14;
 export const MP_LEFT_SHOULDER = 11, MP_RIGHT_SHOULDER = 12;
-// 手掌點（拇指／食指／小指）：跟手腕平均成「手掌＋手腕合併」的單一座標，手勢追蹤與骨架繪製的大點共用。
-export const MP_LEFT_HAND = [17, 19, 21], MP_RIGHT_HAND = [18, 20, 22];
 
-// 手腕＋手掌平均起來的合併座標；手腕本身不可見就視為這隻手不在畫面。
-export function mergedHandPoint(sm, wristIdx, handIdxs) {
-  const wrist = sm[wristIdx];
-  if (!wrist.visible) return null;
-  let sx = wrist.x, sy = wrist.y, n = 1;
-  for (const i of handIdxs) {
-    const p = sm[i];
-    if (p.visible) { sx += p.x; sy += p.y; n++; }
-  }
-  return { x: sx / n, y: sy / n };
-}
+// 揮手吃的點：手腕；不可見就視為這隻手不在畫面。
+const wristPoint = (sm, idx) => (sm[idx].visible ? { x: sm[idx].x, y: sm[idx].y } : null);
 
 // 慣用手鎖定的放開條件：HAND_LOCK_RELEASE_MS 是保險絲（停頓幾秒是正常演奏節奏，所以放寬）；真正負責換手的是 HAND_STILL_*：
 // 鎖定的手連續待在小範圍內就視為靜止——MediaPipe 對被遮擋的手常猜一個可見度還過得去的位置，光調可見度遲滯沒用。
 const HAND_LOCK_RELEASE_MS = 8000;
-// 肩寬單位，小於 minDepthRatio(0.15)：真正的拋物線手勢一定會讓手離開這個半徑，不會誤放開正在使用的手。
+// 尺度單位，小於 minDepthRatio(0.15)：真正的拋物線手勢一定會讓手離開這個半徑，不會誤放開正在使用的手。
 const HAND_STILL_RADIUS = 0.10;
 const HAND_STILL_MS = 700;       // 連續待在半徑內這麼久才放開鎖定
 const SLOT_RELEASE_MS = 1000;    // 槽位連續不在場這麼久才把偵測器整個 reset
@@ -147,21 +137,20 @@ const resetAllSlotDetectors = () => {
   }
 };
 
-// 餵一個在場槽位的骨架給它那對 ArcDetector；回傳可見度、座標與肩寬，供 combineArcTriggers() 判斷鎖定的手該不該放開。
+// 餵一個在場槽位的骨架給它那對 ArcDetector；回傳可見度、座標與尺度，供 combineArcTriggers() 判斷鎖定的手該不該放開。
 function updateSlotArc(arcDet, track, nowMs, captureMs) {
   const sm = track.smoothed;
-  const ls = sm[MP_LEFT_SHOULDER], rs = sm[MP_RIGHT_SHOULDER];
-  const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
-  const leftPoint = mergedHandPoint(sm, MP_LEFT_WRIST, MP_LEFT_HAND);
-  const rightPoint = mergedHandPoint(sm, MP_RIGHT_WRIST, MP_RIGHT_HAND);
+  const { scale } = track;
+  const leftPoint = wristPoint(sm, MP_LEFT_WRIST);
+  const rightPoint = wristPoint(sm, MP_RIGHT_WRIST);
   return {
-    left: arcDet.left.update({ point: leftPoint, shoulderWidth }, nowMs, captureMs),
-    right: arcDet.right.update({ point: rightPoint, shoulderWidth }, nowMs, captureMs),
+    left: arcDet.left.update({ point: leftPoint, scale }, nowMs, captureMs),
+    right: arcDet.right.update({ point: rightPoint, scale }, nowMs, captureMs),
     leftDepth: arcDet.left.lastDepth,
     rightDepth: arcDet.right.lastDepth,
     leftVisible: !!leftPoint,
     rightVisible: !!rightPoint,
-    leftPoint, rightPoint, shoulderWidth,
+    leftPoint, rightPoint, scale,
   };
 }
 
@@ -169,7 +158,7 @@ function updateSlotArc(arcDet, track, nowMs, captureMs) {
 // 換手：閒置手（例如打字的手在畫面下緣抖動）也可能先湊出一次淺的拋物線而被鎖到，所以另一隻手的拋物線夠深（LOCK_STEAL_RATIO）就把鎖定搶過去。
 // 放開條件：鎖定的手不可見、HAND_LOCK_RELEASE_MS 沒有新觸發、或 HAND_STILL_MS 幾乎沒在動。state 就是 arcLastSeqBySlot[slot]，逐幀被直接改動。
 function combineArcTriggers(state, arc, nowMs) {
-  const { left, right, leftVisible, rightVisible, leftPoint, rightPoint, shoulderWidth } = arc;
+  const { left, right, leftVisible, rightVisible, leftPoint, rightPoint, scale } = arc;
 
   if (state.lockedHand === "left" && !leftVisible) state.lockedHand = null;
   if (state.lockedHand === "right" && !rightVisible) state.lockedHand = null;
@@ -179,7 +168,7 @@ function combineArcTriggers(state, arc, nowMs) {
 
   if (state.lockedHand) {
     const point = state.lockedHand === "left" ? leftPoint : rightPoint;
-    const radius = HAND_STILL_RADIUS * Math.max(shoulderWidth || 0, 0.04);
+    const radius = HAND_STILL_RADIUS * Math.max(scale || 0, DEFAULT_ARC_CONFIG.minScale);
     const dist = point && state.stillAnchor ? Math.hypot(point.x - state.stillAnchor.x, point.y - state.stillAnchor.y) : Infinity;
     if (dist > radius) {
       state.stillAnchor = point;
@@ -225,13 +214,13 @@ function combineArcTriggers(state, arc, nowMs) {
 
 /**
  * 一幀的手勢：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector，回傳每個槽位的拋物線觸發累加計數與這一幀真的在場的槽位。
- * @param {{slot: number, smoothed: object[]}[]} activeTracks  追蹤層這一幀的在場名單（tracker.getActiveTracks()）
+ * @param {{slot: number, smoothed: object[], scale: number}[]} activeTracks  追蹤層這一幀的在場名單（tracker.getActiveTracks()）
  * @param {number} slotCount  追蹤器目前的槽位數（＝現場人數）；送出去的 map 只帶這麼多個槽位
  * @param {number} nowMs
  * @param {number} [captureMs]  這一幀被攝影機拍下的時刻（沒有就是 nowMs）
  * @returns {{ arcTriggerSeqBySlot: Object<number, number>, arcTroughMsBySlot: Object<number, number|null>, presentSlots: number[], frame: Array }}
  *   arcTroughMsBySlot＝每個槽位最近一次觸發的最低點時刻（揮手的動作時刻）；frame＝逐幀紀錄用（vision.js 的 __visionLog）：
- *   在場槽位的 [ID, 肩寬, 左手 x, y, 右手 x, y, 鎖定的手, 累加計數]，手腕不可見時那隻手的座標是 null
+ *   在場槽位的 [ID, 尺度, 左手腕 x, y, 右手腕 x, y, 鎖定的手, 累加計數]，手腕不可見時那隻手的座標是 null
  */
 export function updateGestures(activeTracks, slotCount, nowMs, captureMs = nowMs) {
   const arcTriggerSeqBySlot = {};
@@ -270,7 +259,7 @@ export function updateGestures(activeTracks, slotCount, nowMs, captureMs = nowMs
     arcTriggerSeqBySlot[slot + 1] = combinedArc.triggerSeq;
     arcTroughMsBySlot[slot + 1] = arcLastSeqBySlot[slot].lastTroughMs;
     if (track) {
-      frame.push([slot + 1, arc.shoulderWidth, arc.leftPoint?.x ?? null, arc.leftPoint?.y ?? null, arc.rightPoint?.x ?? null, arc.rightPoint?.y ?? null,
+      frame.push([slot + 1, arc.scale, arc.leftPoint?.x ?? null, arc.leftPoint?.y ?? null, arc.rightPoint?.x ?? null, arc.rightPoint?.y ?? null,
         arcLastSeqBySlot[slot].lockedHand, combinedArc.triggerSeq]);
     }
   }
@@ -283,5 +272,3 @@ export function resetGestures() {
   slotInactiveSinceMs.fill(0);
 }
 
-// 這個槽位目前鎖定的手（'left'｜'right'｜null）；骨架繪製只畫鎖定的那隻手。
-export const lockedHandOf = (slot) => arcLastSeqBySlot[slot]?.lockedHand ?? null;
