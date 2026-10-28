@@ -69,8 +69,8 @@ const r4 = (v) => (v === null || v === undefined ? null : Math.round(v * 10000) 
 // v4 的「節點」欄記的上半身節點：兩肩、兩肘、兩腕、手掌六點、兩髖（調過濾器與尺度用，見 test/tools/pose-filter-eval.mjs）
 const V4_JOINTS = [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
 
-// MediaPipe 平滑用的物件尺度：33 個點外框的 (寬＋高) ÷ 2（landmarks_smoothing_calculator_utils.cc 的 GetObjectScale）
-function mediapipeObjectScale(lm) {
+// 33 個點外框的 (寬＋高) ÷ 2（正規化座標），參考用：MediaPipe 的 pose 平滑不用它，用的是推論框（landmarks_smoothing_calculator.cc 的 OBJECT_SCALE_ROI），拿不到
+function landmarkBoxScale(lm) {
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
   for (const p of lm) {
     if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
@@ -82,7 +82,7 @@ function mediapipeObjectScale(lm) {
 function jointRow(track) {
   const { raw, rawWorld, smoothed } = track;
   return [
-    track.slot + 1, r3(mediapipeObjectScale(raw)),
+    track.slot + 1, r3(landmarkBoxScale(raw)),
     ...V4_JOINTS.flatMap((j) => [r3(raw[j].x), r3(raw[j].y), r3(raw[j].visibility)]),
     ...V4_JOINTS.flatMap((j) => (rawWorld ? [r4(rawWorld[j].x), r4(rawWorld[j].y), r4(rawWorld[j].z)] : [null, null, null])),
     ...V4_JOINTS.flatMap((j) => [r3(smoothed[j].x), r3(smoothed[j].y)]),
@@ -123,7 +123,7 @@ export function visionLog(seconds = 30) {
         "追蹤[[ID, 尺度, 左手腕 x, y, 右手腕 x, y（平滑後，手腕不可見是 null；v3 以前是肩寬與手腕＋手掌合併點）, 鎖定的手, 累加計數, 原始左腕 x, y, 可見度, 原始右腕 x, y, 可見度]]",
         "拍下→送出ms（rVFC 的 captureTime；瀏覽器沒提供是 null）", "偵測器可能有跑（上一次偵測筆數 < numPoses 是 1，否則 0；沒推論是 null）",
         "拍下→結果進主執行緒ms（沒有拍下時刻時從送出算起；沒推論是 null）",
-        `節點[[ID, MediaPipe 物件尺度, 原始 x, y, 可見度 ×${V4_JOINTS.length} 點, world x, y, z（公尺）×${V4_JOINTS.length} 點, 平滑後 x, y ×${V4_JOINTS.length} 點]]，點依序是 ${V4_JOINTS.join(",")}`],
+        `節點[[ID, 33 點外框尺度（參考用，不是 MediaPipe 平滑的尺度）, 原始 x, y, 可見度 ×${V4_JOINTS.length} 點, world x, y, z（公尺）×${V4_JOINTS.length} 點, 平滑後 x, y ×${V4_JOINTS.length} 點]]，點依序是 ${V4_JOINTS.join(",")}`],
       trackerEvent: "{ t, type: lock｜loss｜duplicate, slot（ID）；lock 另有 scale 尺度、vis 平均可見度、strict }",
     },
     frames: frameLog.filter((f) => f[0] >= from),
@@ -561,7 +561,8 @@ function handlePoseResult({ ts, inferMs, landmarks, worldLandmarks }) {
 // 偵測結果到了之後的管線。ts＝這張畫面的時刻（追蹤與手勢的時間基準），startMs＝主執行緒開始處理的時刻（逐幀紀錄的主執行緒耗時從這裡算）。
 function runPipeline(ts, startMs, rawPoses, detectMs, captureLagMs, detectorRan, resultLagMs, rawWorlds = [], videoSource = "sent") {
   // ▶ 依位置將偵測結果匹配到已鎖定的槽位（並平滑），演算法見 tracking.js。buildDetection 對座標異常／不像人的偵測回傳 null 先濾掉；同一具身體的重複偵測由 tracker.update() 自己挑該留哪一筆。
-  const detections = rawPoses.map((lm, i) => buildDetection(lm, { world: rawWorlds[i] ?? null })).filter(Boolean);
+  const aspect = (video.videoHeight || CONFIG.height) / (video.videoWidth || CONFIG.width);
+  const detections = rawPoses.map((lm, i) => buildDetection(lm, { world: rawWorlds[i] ?? null, aspect })).filter(Boolean);
 
   tracker.update(detections, ts);
   const activeTracks = tracker.getActiveTracks();

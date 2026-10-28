@@ -6,7 +6,7 @@ const round3 = (v) => Math.round(v * 1000) / 1000;
 export const DEFAULT_TRACKING_CONFIG = Object.freeze({
   maxUsers: 4,
 
-  // 以下「尺度」＝bodyScaleOf()：正面時約等於肩寬，側身時不縮（c 讓兩者在正面時相等），所以原本以肩寬訂的比例照用。
+  // 以下「尺度」＝bodyScaleOf()（以畫面寬為單位）：正面時就是肩寬，側身時不縮，所以原本以肩寬訂的比例照用。
   // 位置門檻＝max(gatePos, gatePosRatio × 這個人的尺度)：同一個動作站得近的人在正規化座標上走得比較遠；絕對值下限給遠處的小人。
   gatePos: 0.15,
   gatePosRatio: 0.45,
@@ -101,7 +101,8 @@ function shoulderVisibility(landmarks) {
 }
 
 // 由原始 landmark 建立一筆「偵測」：肩膀中點是位置匹配與「同一具身體」判定的唯一依據；回傳 null 代表數值異常、幾何不像真人、或可見度連寬鬆門檻都不到，呼叫端須過濾掉。
-export function buildDetection(landmarks, { cfg = DEFAULT_TRACKING_CONFIG, world = null } = {}) {
+// aspect＝畫面高 ÷ 寬：正規化座標的 y 乘它才跟 x 同一把尺（尺度與平滑的 y 速度用）。
+export function buildDetection(landmarks, { cfg = DEFAULT_TRACKING_CONFIG, world = null, aspect }) {
   const lShoulder = landmarks[11], rShoulder = landmarks[12];
   const lHip = landmarks[23], rHip = landmarks[24];
   if (![lShoulder, rShoulder, lHip, rHip].every(isFinitePoint)) return null;
@@ -121,11 +122,11 @@ export function buildDetection(landmarks, { cfg = DEFAULT_TRACKING_CONFIG, world
   const centroid = { x: shoulderMidX, y: shoulderMidY };
   // scale＝「這個人在畫面上有多大」（所有位置門檻、平滑速度與手勢門檻的單位），見 bodyScaleOf；
   // 它跟「離攝影機多近」正相關，候選新身分多於空槽位時優先鎖定最靠近鏡頭的人。
-  const scale = bodyScaleOf(landmarks, BODY_SCALE_TORSO_RATIO);
+  const scale = bodyScaleOf(landmarks, BODY_SCALE_TORSO_RATIO, aspect);
 
   // meanVisibility 給 dedupeDetections 在沒有既有 track 可對照時挑「比較可信的那一筆」用。
   // world＝同一筆偵測的 worldLandmarks（公尺、原點在兩髖中間），只給逐幀紀錄用
-  return { landmarks, world, centroid, scale, meanVisibility, strictPlausible };
+  return { landmarks, world, centroid, scale, aspect, meanVisibility, strictPlausible };
 }
 
 // 兩筆偵測／兩個 track 的肩膀中點距離。偵測與 track 都有 centroid 與 scale 欄位，
@@ -172,29 +173,43 @@ export function dedupeDetections(detections, cfg = DEFAULT_TRACKING_CONFIG, anch
   return kept;
 }
 
-// 尺度＝max(肩寬, c × 軀幹長)：側身時肩寬縮到接近 0，軀幹長（肩膀中點到髖中點）不縮；髖部看不到時只用肩寬。
-// c 暫定 0.8：成人肩寬約為肩到髖中點距離的 0.8（我的估計），待 v4 逐幀紀錄量（test/tools/pose-filter-eval.mjs 的 c）。
-export const BODY_SCALE_TORSO_RATIO = 0.8;
+// 尺度＝max(肩寬, c × 軀幹長)，以畫面寬為單位：側身時肩寬縮到接近 0，軀幹長（肩膀中點到髖中點）不縮；髖部看不到時只用肩寬。
+// 正規化座標的 x 以寬、y 以高為單位，y 先乘 aspect（＝高 ÷ 寬）：不換的話 16:9 畫面上直的軀幹長會多算 1.78 倍，正面站著的人尺度就變成肩寬的兩倍多。
+// c 暫定 0.6：MediaPipe 官方範例人像（正面站立）量到肩寬 ÷ 軀幹長 0.63，取略小的值讓正面時由肩寬決定（門檻維持原本以肩寬訂的意思）、
+// 側身時約為正面肩寬的 0.95；待 v4 逐幀紀錄量（test/tools/pose-filter-eval.mjs 的 c）。
+export const BODY_SCALE_TORSO_RATIO = 0.6;
 const HIP_VISIBILITY_MIN = 0.5;
 
-export function bodyScaleOf(landmarks, c) {
+export function bodyScaleOf(landmarks, c, aspect) {
   const ls = landmarks[11], rs = landmarks[12], lh = landmarks[23], rh = landmarks[24];
-  const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
+  const shoulderWidth = Math.hypot(ls.x - rs.x, (ls.y - rs.y) * aspect);
   if (!((lh.visibility ?? 0) >= HIP_VISIBILITY_MIN && (rh.visibility ?? 0) >= HIP_VISIBILITY_MIN)) return shoulderWidth;
-  const torso = Math.hypot((ls.x + rs.x - lh.x - rh.x) / 2, (ls.y + rs.y - lh.y - rh.y) / 2);
+  const torso = Math.hypot((ls.x + rs.x - lh.x - rh.x) / 2, ((ls.y + rs.y - lh.y - rh.y) / 2) * aspect);
   return Math.max(shoulderWidth, c * torso);
 }
 
 // One Euro（Casiez, Roussel, Vogel, CHI 2012, DOI 10.1145/2207676.2208639），照 MediaPipe 的 one_euro_filter.cc：
 // 速度＝(這一幀原始值 − 上一幀原始值) × valueScale ÷ dt，先以 dCutoff 低通；截止頻率＝minCutoff＋beta × |速度|；輸出＝以該截止頻率低通。
 // 一階低通的輸出永遠落在上一個輸出與這一幀輸入之間，不會過衝；時間戳沒有變新時原樣回傳輸入、不改狀態（MediaPipe 同）。
-// 參數暫定（10-28 在 v3 舊紀錄上量，量測表在 docs/superpowers/plans/2026-10-28-pose-filter-redesign.md；v4 紀錄來了重量）：
-//   single（人數 1，MediaPipe 已先平滑過）：照作者的順序掃，beta 0 時抖動 ≤ 1px 的最大 minCutoff，再取最快動作延遲 ≤ 10ms 的最小 beta。
-//   multi（人數 ≥ 2，MediaPipe 不平滑）：沒有資料，用跟 MediaPipe 單人同強度的值（minCutoff 0.05、beta 80 × k，k 暫定 0.36）。
-export const ONE_EURO_PARAMS = Object.freeze({
-  single: Object.freeze({ minCutoff: 2, beta: 20, dCutoff: 1 }),
-  multi: Object.freeze({ minCutoff: 0.05, beta: 29, dCutoff: 1 }),
+// 每個節點依序過 ONE_EURO_STAGES 的每一層（量測表在 docs/superpowers/plans/2026-10-28-pose-filter-redesign.md；v4 紀錄來了重量）：
+//   人數 1：MediaPipe 內建已先平滑一層（min_cutoff 0.05、beta 80，速度除以它的推論框尺度），我們再加 EXTRA 一層（內建之後近靜止時手腕仍抖 1～2px）。
+//     EXTRA 照作者的順序在 v3 舊紀錄上掃（beta 0 先定壓抖動的 minCutoff，再取最快動作延遲 ≤ 10ms 的最小 beta，同一把尺重掃 9.8ms）；
+//     舊紀錄是彈奏中錄的、量不出真的靜止抖動，minCutoff 等 v4 的靜止紀錄再定。
+//   人數 ≥ 2：MediaPipe 不平滑；先用 MEDIAPIPE_EQUIVALENT 補上它那一層，再接同一個 EXTRA，兩種人數的骨架一樣穩、一樣跟手。
+//     MediaPipe 的速度除以推論框尺度（pose_landmarks_detector_graph.cc 把下一幀的推論框接到平滑的 OBJECT_SCALE_ROI，(寬＋高) ÷ 2，像素），
+//     我們除以 track.scale（肩寬），所以 beta＝80 ÷（推論框是幾個肩寬）。2026-10-28 實測（test/tools/mp-smoothing-scale/）：官方範例人像在無頭 Chromium 裡等速平移，
+//     人數 2 的原始輸出過這一層、跟人數 1 的真平滑逐幀比，移動中的平均落後量在 6.2（15～240px/s）、6.5（10～30px/s）個肩寬時一致；取 6，偏差 < 0.07px。
+const MP_ROI_SHOULDERS = 6;
+const MEDIAPIPE_EQUIVALENT = Object.freeze({ minCutoff: 0.05, beta: 80 / MP_ROI_SHOULDERS, dCutoff: 1 });
+const EXTRA = Object.freeze({ minCutoff: 2, beta: 20, dCutoff: 1 });
+export const ONE_EURO_STAGES = Object.freeze({
+  single: Object.freeze([EXTRA]),
+  multi: Object.freeze([MEDIAPIPE_EQUIVALENT, EXTRA]),
 });
+
+// MediaPipe 人數 1 時先把每個節點的可見度低通一次（pose_landmarks_detector_graph.cc 的 SmoothLandmarksVisibility，low_pass_filter_alpha 0.1），人數 ≥ 2 沒有；
+// 追蹤層在人數 ≥ 2 時補上同一次低通，再做自己的 EMA 與遲滯（visibilityEmaAlpha），兩種人數的節點一樣不閃
+const MEDIAPIPE_VISIBILITY_ALPHA = 0.1;
 
 const oneEuroAlpha = (cutoff, dtS) => 1 / (1 + 1 / (2 * Math.PI * cutoff * dtS));
 
@@ -311,8 +326,8 @@ export class PersonTracker {
 
   _createTrack(slot, det, nowMs) {
     const n = det.landmarks.length;
-    // 人數 1 時 MediaPipe 已先平滑過一層，人數 ≥ 2 時沒有（參考文件第 6 點），兩邊各一組參數（ONE_EURO_PARAMS）
-    const params = this.cfg.maxUsers === 1 ? ONE_EURO_PARAMS.single : ONE_EURO_PARAMS.multi;
+    // 人數 1 時 MediaPipe 已先平滑過一層，人數 ≥ 2 時沒有（參考文件第 6 點），兩邊各一串（ONE_EURO_STAGES）
+    const stages = this.cfg.maxUsers === 1 ? ONE_EURO_STAGES.single : ONE_EURO_STAGES.multi;
     const track = {
       slot,
       id: slot + 1, // ID 恆等於槽位編號（1~maxUsers），純粹是顯示提示，不做身分認回
@@ -321,9 +336,11 @@ export class PersonTracker {
       scale: det.scale,
       lockedAtMs: nowMs,     // 鎖定時刻；兩個槽位落在同一具身體上時，用它決定誰比較新
       duplicateSinceMs: 0,   // 與另一個槽位重疊的起算時刻（0 ＝ 目前沒有重疊）
-      // 只濾 x／y：整個專案沒有任何地方讀 z
-      filtersX: Array.from({ length: n }, () => new OneEuroFilter(params)),
-      filtersY: Array.from({ length: n }, () => new OneEuroFilter(params)),
+      // 只濾 x／y：整個專案沒有任何地方讀 z。每個節點一串（每層一個 OneEuroFilter）
+      filtersX: Array.from({ length: n }, () => stages.map((s) => new OneEuroFilter(s))),
+      filtersY: Array.from({ length: n }, () => stages.map((s) => new OneEuroFilter(s))),
+      // 人數 ≥ 2 才有：補上 MediaPipe 單人時對可見度做的那一次低通（見 MEDIAPIPE_VISIBILITY_ALPHA）的狀態，每個節點一個
+      visLowPass: this.cfg.maxUsers === 1 ? null : det.landmarks.map((p) => p.visibility ?? 1),
       smoothed: det.landmarks.map((p) => ({ ...p })),
       missCount: 0,       // 0 ＝這一幀真的匹配到偵測（getActiveTracks 據此決定是否繪製）
       lastSeenMs: nowMs   // 最後一次匹配到的時間；釋放槽位與漏配寬限期都以此為準
@@ -341,18 +358,21 @@ export class PersonTracker {
     track.raw = det.landmarks;   // 這一幀沒平滑的原始 landmark（開發用的逐幀紀錄讀它）
     track.rawWorld = det.world;
     track.scale += (det.scale - track.scale) * scaleEmaAlpha;
-    const valueScale = 1 / track.scale;   // One Euro 的速度以「這個人的尺度／秒」計，遠近一致
+    // One Euro 的速度以「這個人的尺度／秒」計，遠近一致；y 的位移先乘 aspect 換成跟 x 同一把尺（MediaPipe 平滑前也先換成像素）
+    const vsX = 1 / track.scale, vsY = det.aspect / track.scale;
+    const chain = (filters, v, vs) => { for (const f of filters) v = f.filter(v, nowMs, vs); return v; };
 
     // 上一幀的結果當作可見度 EMA 與遲滯的狀態來源（第一幀 prev 是 _createTrack 複製的原始 landmarks，沒有 visible 欄位，退回用 onGate 判定初始狀態）
-    const prev = track.smoothed;
+    const prev = track.smoothed, lowPass = track.visLowPass;
     track.smoothed = det.landmarks.map((p, i) => {
-      const rawVis = p.visibility ?? 1;
+      let rawVis = p.visibility ?? 1;
+      if (lowPass) rawVis = lowPass[i] += (rawVis - lowPass[i]) * MEDIAPIPE_VISIBILITY_ALPHA;
       const prevVis = prev[i]?.visibility ?? rawVis;
       const visibility = prevVis + (rawVis - prevVis) * visibilityEmaAlpha;
       const wasVisible = prev[i]?.visible ?? (visibility >= visibilityOnGate);
       return {
-        x: track.filtersX[i].filter(p.x, nowMs, valueScale),
-        y: track.filtersY[i].filter(p.y, nowMs, valueScale),
+        x: chain(track.filtersX[i], p.x, vsX),
+        y: chain(track.filtersY[i], p.y, vsY),
         visibility,
         // 遲滯：已顯示的關節要跌破 offGate 才隱藏，已隱藏的要跨過 onGate 才顯示
         visible: wasVisible ? visibility > visibilityOffGate : visibility >= visibilityOnGate
