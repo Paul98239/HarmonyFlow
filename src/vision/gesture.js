@@ -5,9 +5,11 @@
 export const DEFAULT_ARC_CONFIG = Object.freeze({
   minScale: 0.04,           // 尺度的下限，避免遠處偵測到的極小尺度把比值放大到離譜
   staleMs: 320,             // 距上一次餵值超過這麼久 → 視為剛回到鏡頭，這一段動作作廢重來
-  reversalNoiseFloor: 0.05, // Y 方向死區（尺度單位）：從谷底回升要超過這個幅度才算「確認回升」
+  // 深度與死區：y 差先乘 aspect 再除以尺度。這兩個值原本（0.05、0.15）是在「y 以畫面高為單位、尺度以畫面寬為單位」的混合單位下訂的，
+  // 2026-10-28 換成同一把尺時乘上 16:9 的 0.5625，16:9 下觸發不變
+  reversalNoiseFloor: 0.028, // Y 方向死區（尺度單位）：從谷底回升要超過這個幅度才算「確認回升」
   // 這兩個門檻比較嚴：每次判定成立都立刻前進一步、沒有緩衝空間，調嚴降低誤觸發
-  minDepthRatio: 0.15,      // 這段下沉至少要多深（尺度單位）才算一次有效拋物線
+  minDepthRatio: 0.084,      // 這段下沉至少要多深（尺度單位）才算一次有效拋物線
   minXSpanRatio: 0.18,      // 下沉期間至少要有這麼多橫向位移（尺度單位），用來跟「純上下抖」區分開
   // 確認那一幀的 y 上限（畫面下緣＝1）：手放到畫面外時模型仍會推估位置，往上飄一點就湊出假拋物線；0.05 的邊界留給谷底剛擦過下緣的真揮手。暫定值（2026-10-20 兩份遮手紀錄）
   maxConfirmY: 1.05,
@@ -40,7 +42,7 @@ export class ArcDetector {
 
   /**
    * 餵一幀資料。
-   * @param {{point:{x,y}|null, scale?:number}} frame  point＝手腕座標，scale＝這個人的尺度
+   * @param {{point:{x,y}|null, scale?:number, aspect:number}} frame  point＝手腕座標，scale＝這個人的尺度，aspect＝畫面高 ÷ 寬（y 差乘它才跟尺度同一把尺）
    * @param {number} nowMs  處理這一幀的時刻（停滯判斷用）
    * @param {number} [captureMs]  這一幀被攝影機拍下的時刻（記最低點用；沒有就是 nowMs）
    * @returns {{triggerSeq:number, troughMs:number|null}} troughMs＝最近一次觸發的最低點時刻
@@ -57,6 +59,7 @@ export class ArcDetector {
     this._lastMs = nowMs;
 
     const sw = Math.max(this.cfg.minScale, frame.scale || 0);
+    const { aspect } = frame;
     const { x, y } = point;
 
     if (this.peakY === null) {
@@ -70,8 +73,8 @@ export class ArcDetector {
       this.troughMs = captureMs;
       if (x < this._minX) this._minX = x;
       if (x > this._maxX) this._maxX = x;
-    } else if (y < this.troughY - this.cfg.reversalNoiseFloor * sw) {
-      const depth = this.troughY - this.peakY;
+    } else if ((this.troughY - y) * aspect > this.cfg.reversalNoiseFloor * sw) {
+      const depth = (this.troughY - this.peakY) * aspect;
       const xSpan = this._maxX - this._minX;
       if (depth >= this.cfg.minDepthRatio * sw && xSpan >= this.cfg.minXSpanRatio * sw && y <= this.cfg.maxConfirmY) {
         this.triggerSeq++;
@@ -100,11 +103,12 @@ const wristPoint = (sm, idx) => (sm[idx].visible ? { x: sm[idx].x, y: sm[idx].y 
 // 慣用手鎖定的放開條件：HAND_LOCK_RELEASE_MS 是保險絲（停頓幾秒是正常演奏節奏，所以放寬）；真正負責換手的是 HAND_STILL_*：
 // 鎖定的手連續待在小範圍內就視為靜止——MediaPipe 對被遮擋的手常猜一個可見度還過得去的位置，光調可見度遲滯沒用。
 const HAND_LOCK_RELEASE_MS = 8000;
-// 尺度單位，小於 minDepthRatio(0.15)：真正的拋物線手勢一定會讓手離開這個半徑，不會誤放開正在使用的手。
+// 尺度單位，小於 minXSpanRatio(0.18)：真正的拋物線下沉期間至少橫移 0.18，一定會讓手離開這個半徑，不會誤放開正在使用的手。
+// 刻意留在混合單位（y 沒乘 aspect，直的方向實際只有 0.056）：換成同一把尺會讓鎖定比較容易放開，2026-10-26 的逐幀紀錄重播時打字的手因此搶到鎖定；拿掉單手鎖定時整段刪除。
 const HAND_STILL_RADIUS = 0.10;
 const HAND_STILL_MS = 700;       // 連續待在半徑內這麼久才放開鎖定
 const SLOT_RELEASE_MS = 1000;    // 槽位連續不在場這麼久才把偵測器整個 reset
-// 換手：另一隻手的拋物線深度達到鎖定手近期深度（EMA）的這麼多倍就改鎖它。暫定值：2026-10-20 兩份遮手紀錄，揮的手深度中位數 1.84／2.2 肩寬，打字的手 0.47／0.61
+// 換手：另一隻手的拋物線深度達到鎖定手近期深度（EMA）的這麼多倍就改鎖它。暫定值：2026-10-20 兩份遮手紀錄，揮的手深度中位數 1.84／2.2 肩寬，打字的手 0.47／0.61（10-28 換算前的混合單位；這裡只比兩手的比值，換算不影響）
 const LOCK_STEAL_RATIO = 2;
 const LOCK_DEPTH_EMA_ALPHA = 0.5; // 用 EMA 而不是最後一次的深度：揮的手偶爾一下很淺（實測最淺 0.17），門檻不該跟著掉到讓閒置手搶走
 
@@ -140,12 +144,12 @@ const resetAllSlotDetectors = () => {
 // 餵一個在場槽位的骨架給它那對 ArcDetector；回傳可見度、座標與尺度，供 combineArcTriggers() 判斷鎖定的手該不該放開。
 function updateSlotArc(arcDet, track, nowMs, captureMs) {
   const sm = track.smoothed;
-  const { scale } = track;
+  const { scale, aspect } = track;
   const leftPoint = wristPoint(sm, MP_LEFT_WRIST);
   const rightPoint = wristPoint(sm, MP_RIGHT_WRIST);
   return {
-    left: arcDet.left.update({ point: leftPoint, scale }, nowMs, captureMs),
-    right: arcDet.right.update({ point: rightPoint, scale }, nowMs, captureMs),
+    left: arcDet.left.update({ point: leftPoint, scale, aspect }, nowMs, captureMs),
+    right: arcDet.right.update({ point: rightPoint, scale, aspect }, nowMs, captureMs),
     leftDepth: arcDet.left.lastDepth,
     rightDepth: arcDet.right.lastDepth,
     leftVisible: !!leftPoint,

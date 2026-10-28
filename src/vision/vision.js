@@ -39,8 +39,9 @@ const POSE_COLORS = ["#00FFFF", "#FF6B6B", "#51CF66", "#FFD43B"]; // 4 人的代
 const BONE_WIDTH = 2;      // 骨架連線寬度（px）
 const JOINT_RADIUS = 2;    // 關節圓點半徑（px）
 const TAU = Math.PI * 2;
-// 嘴巴中點正下方的虛擬「下巴」節點偏移量：以肩寬為單位（同 ArcDetector 門檻、ID 標籤字級的慣例），人離鏡頭遠近不同時比例才一致
-const CHIN_OFFSET_RATIO = 0.18;
+// 嘴巴中點正下方的虛擬「下巴」節點偏移量：以肩寬為單位（同 ArcDetector 門檻、ID 標籤字級的慣例），人離鏡頭遠近不同時比例才一致。
+// 原本 0.18 是在混合單位下訂的（肩寬以畫面寬、往下的距離以畫面高為單位），2026-10-28 換成同一把尺時乘上 16:9 的 0.5625，畫出來的位置不變
+const CHIN_OFFSET_RATIO = 0.10;
 
 const FRAME_ERROR_THRESHOLD = 90; // 連續幾幀處理失敗才判定為持續性錯誤並顯示錯誤畫面（約 1.5~3 秒）
 
@@ -368,13 +369,13 @@ function virtualNeckPoint(lm) {
   return { x: (ls.x + rs.x) / 2, y: (ls.y + rs.y) / 2 };
 }
 
-// 嘴巴兩節點中點下方的虛擬「下巴」節點，供骨架畫成倒三角形（見 renderSkeletonOverlay()）。
-function virtualChinPoint(lm, shoulderWidth) {
+// 嘴巴兩節點中點下方的虛擬「下巴」節點，供骨架畫成倒三角形（見 renderSkeletonOverlay()）。shoulderWidth 以畫面寬為單位，往下的距離除以 aspect 換回以畫面高為單位。
+function virtualChinPoint(lm, shoulderWidth, aspect) {
   const left = lm[9], right = lm[10];
   if (!(left.visible ?? true) || !(right.visible ?? true)) return null;
   return {
     x: (left.x + right.x) / 2,
-    y: (left.y + right.y) / 2 + CHIN_OFFSET_RATIO * shoulderWidth,
+    y: (left.y + right.y) / 2 + CHIN_OFFSET_RATIO * shoulderWidth / aspect,
   };
 }
 
@@ -407,9 +408,9 @@ function renderSkeletonOverlay(activeTracks) {
     // 低可見度（遮擋/猜測）的關節不繪製。visible 由 tracking.js 算好（可見度先 EMA 平滑、再套遲滯門檻），這裡不自己比門檻，否則邊緣關節會逐幀閃爍。骨架累積成 Path2D 後一次畫完，不用 DrawingUtils 逐條逐點畫。
     const lm = track.smoothed;
     const ls = lm[MP_LEFT_SHOULDER], rs = lm[MP_RIGHT_SHOULDER];
-    const shoulderWidth = Math.hypot(ls.x - rs.x, ls.y - rs.y);
+    const shoulderWidth = Math.hypot(ls.x - rs.x, (ls.y - rs.y) * track.aspect);
     const neck = virtualNeckPoint(lm);
-    const chin = virtualChinPoint(lm, shoulderWidth);
+    const chin = virtualChinPoint(lm, shoulderWidth, track.aspect);
 
     const bones = new Path2D();
     for (const [a, b] of ARM_CONNECTIONS) {

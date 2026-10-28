@@ -71,11 +71,11 @@ function isFinitePoint(p) { return !!p && Number.isFinite(p.x) && Number.isFinit
 
 // 非人物體防呆：過濾 MediaPipe 對背景圖案／假人模型等非人物件誤判出的姿勢。
 // 幾何上像不像一個人：肩寬在合理範圍、髖部可信時肩膀要在髖部上方。這是硬拒絕。
-function hasHumanGeometry(landmarks, cfg) {
+function hasHumanGeometry(landmarks, cfg, aspect) {
   const lS = landmarks[11], rS = landmarks[12];
   const lH = landmarks[23], rH = landmarks[24];
 
-  const shoulderWidth = Math.hypot(lS.x - rS.x, lS.y - rS.y);
+  const shoulderWidth = Math.hypot(lS.x - rS.x, (lS.y - rS.y) * aspect);
   if (shoulderWidth < cfg.minShoulderWidth || shoulderWidth > cfg.maxShoulderWidth) return false;
 
   // 坐姿或下半身被裁切時髖部可見度本來就會偏低，所以只在髖部可信時才檢查「肩膀應在髖部上方」。
@@ -101,12 +101,12 @@ function shoulderVisibility(landmarks) {
 }
 
 // 由原始 landmark 建立一筆「偵測」：肩膀中點是位置匹配與「同一具身體」判定的唯一依據；回傳 null 代表數值異常、幾何不像真人、或可見度連寬鬆門檻都不到，呼叫端須過濾掉。
-// aspect＝畫面高 ÷ 寬：正規化座標的 y 乘它才跟 x 同一把尺（尺度與平滑的 y 速度用）。
+// aspect＝畫面高 ÷ 寬：正規化座標的 y 乘它才跟 x 同一把尺（尺度、距離、平滑的 y 速度、手勢的深度都用；track 與候選人也帶著它）。
 export function buildDetection(landmarks, { cfg = DEFAULT_TRACKING_CONFIG, world = null, aspect }) {
   const lShoulder = landmarks[11], rShoulder = landmarks[12];
   const lHip = landmarks[23], rHip = landmarks[24];
   if (![lShoulder, rShoulder, lHip, rHip].every(isFinitePoint)) return null;
-  if (!hasHumanGeometry(landmarks, cfg)) return null;
+  if (!hasHumanGeometry(landmarks, cfg, aspect)) return null;
 
   // 可見度分兩級：連寬鬆門檻都不到的直接丟掉；過寬鬆但不過嚴格的偵測可以延續已經在追蹤
   // 的人，但不能拿來鎖定新 ID（strictPlausible = false，_updatePendingCandidates 據此過濾）。
@@ -129,10 +129,10 @@ export function buildDetection(landmarks, { cfg = DEFAULT_TRACKING_CONFIG, world
   return { landmarks, world, centroid, scale, aspect, meanVisibility, strictPlausible };
 }
 
-// 兩筆偵測／兩個 track 的肩膀中點距離。偵測與 track 都有 centroid 與 scale 欄位，
-// 所以下面這幾個函式對兩種物件通用。
+// 兩筆偵測／兩個 track／候選人的肩膀中點距離（y 乘 aspect，跟尺度同一把尺）。三種物件都有 centroid、scale、aspect 欄位，
+// 所以下面這幾個函式對它們通用。
 function centroidDistance(a, b) {
-  return Math.hypot(a.centroid.x - b.centroid.x, a.centroid.y - b.centroid.y);
+  return Math.hypot(a.centroid.x - b.centroid.x, (a.centroid.y - b.centroid.y) * a.aspect);
 }
 
 // 「同一具身體」的半徑：max(絕對值, 比例 × 較小的尺度)。拿不到尺度時退回純絕對值。
@@ -334,6 +334,7 @@ export class PersonTracker {
       centroid: { ...det.centroid },
       // 這個人在畫面上的尺度（bodyScaleOf），位置門檻、平滑的速度與手勢門檻都以它為單位；在 _updateTrack 裡以 EMA 更新。
       scale: det.scale,
+      aspect: det.aspect,
       lockedAtMs: nowMs,     // 鎖定時刻；兩個槽位落在同一具身體上時，用它決定誰比較新
       duplicateSinceMs: 0,   // 與另一個槽位重疊的起算時刻（0 ＝ 目前沒有重疊）
       // 只濾 x／y：整個專案沒有任何地方讀 z。每個節點一串（每層一個 OneEuroFilter）
@@ -355,7 +356,8 @@ export class PersonTracker {
     track.missCount = 0;
     track.lastSeenMs = nowMs;
     track.centroid = det.centroid;
-    track.raw = det.landmarks;   // 這一幀沒平滑的原始 landmark（開發用的逐幀紀錄讀它）
+    track.aspect = det.aspect;
+    track.raw = det.landmarks;  // 這一幀沒平滑的原始 landmark（開發用的逐幀紀錄讀它）
     track.rawWorld = det.world;
     track.scale += (det.scale - track.scale) * scaleEmaAlpha;
     // One Euro 的速度以「這個人的尺度／秒」計，遠近一致；y 的位移先乘 aspect 換成跟 x 同一把尺（MediaPipe 平滑前也先換成像素）
@@ -413,6 +415,7 @@ export class PersonTracker {
         usedPending.add(bestIdx);
         const p = this.pending[bestIdx];
         p.centroid = det.centroid;
+        p.aspect = det.aspect;
         p.det = det;
         p.lastSeenMs = nowMs;
         p.matchedThisFrame = true;
@@ -420,6 +423,7 @@ export class PersonTracker {
       } else {
         nextPending.push({
           centroid: det.centroid,
+          aspect: det.aspect,
           det,
           // 以「持續出現多久」判定可否鎖定。
           firstSeenMs: nowMs,
