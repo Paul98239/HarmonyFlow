@@ -2,7 +2,7 @@
 
 import * as midiPlayer from './midi/midiPlayer.js';
 import { initUi, setLoadingStatus, dismissLoading, showError } from './ui.js';
-import { startVision, setPoseCountListener, setPerformanceStateListener, warmPoseModel, visionLog, visionFrameStats, getCameraInfo } from './vision/vision.js';
+import { startVision, setPoseCountListener, setPerformanceStateListener, warmPoseModel, visionLog, visionFrameStats, getCameraInfo, setFrameLogRecording, clearFrameLog } from './vision/vision.js';
 import { startKeyboardTrigger, getInputDelays } from './input/keyboard.js';
 import { createGestureTrigger } from './input/gestureTrigger.js';
 import { summarizeMs } from './midi/tempo.js';
@@ -27,7 +27,8 @@ window.__stats = () => {
 
 window.__pressLog = midiPlayer.pressLog;
 
-// copy(__visionLog(30))：最近 30 秒的逐幀紀錄（兩手手腕、上半身節點的原始／world／平滑座標、偵測、鎖定的手、推論耗時）與追蹤層的鎖定／釋放事件，查手點互相干擾與多出來的 ID 用。
+// copy(__visionLog())：這一段演奏（從頭播起，暫停與曲終不記）的逐幀紀錄（兩手手腕、上半身節點的原始／world／平滑座標與 presence、偵測、鎖定的手、推論耗時）與追蹤層的鎖定／釋放事件，
+// 查手點互相干擾與多出來的 ID 用；__visionLog(15) 只取最後 15 秒。先按 ❚❚ 再切 DevTools 打指令，打字的那段就不會記進去。
 window.__visionLog = visionLog;
 
 // 長任務（主執行緒連續忙 50ms 以上，這段時間按鍵與按鈕都沒反應）：[開始時刻, 長度]，__latency() 依時刻歸到當時的現場人數。Firefox 沒有這個 API，記 null。
@@ -42,7 +43,7 @@ if (longTasks) {
 // __latency()：不同「現場人數」下的推論與主執行緒負擔。每個人數一組：推論（detectForVideo，在 Worker）耗時與佔 Worker 的比例、偵測器有跑／只追蹤分開的推論耗時、
 // 主執行緒處理每幀的耗時與佔比、攝影機拍下→送出、拍下→結果進主執行緒、長任務、排程 tick 的實際間隔（超過 LOOKAHEAD_MS 的次數越多，電腦音越可能來不及提早帶時間戳送進 worklet）；
 // 鏡頭規格與音訊輸出那一段（輸出延遲、worklet 渲染區塊）跟人數無關，各附一份。
-// 流程：選人數 → 開鏡頭、播放彈 20～30 秒 → 換下一個人數，最後 copy(__latency())。排程 tick 只在播放中記錄。
+// 流程：選人數 → 開鏡頭、播放彈 20～30 秒 → 換下一個人數（同一段演奏裡換：從頭播會清空逐幀紀錄），最後 copy(__latency())。排程 tick 與逐幀紀錄都只在播放中記錄。
 window.__latency = () => {
   const { byCount, segments } = visionFrameStats();
   const ticks = midiPlayer.tickIntervals();
@@ -82,6 +83,14 @@ async function bootSystem() {
   // 播放器由這裡交給 ui.js；畫面先同步接好，開機期間 #app-shell 是 inert
   initUi(midiPlayer);
   setPoseCountListener(midiPlayer.setPlayerCount);
+  // 逐幀紀錄跟著演奏走：從頭播時清空（跟按鍵錄音同一個起點），只在演奏模式播放中記
+  midiPlayer.setPlaybackRestartListener(clearFrameLog);
+  let recording = false;
+  midiPlayer.playerStore.addEventListener('change', () => {
+    const { transport, mode } = midiPlayer.playerStore.state;
+    const on = transport === 'playing' && mode === 'perform';
+    if (on !== recording) setFrameLogRecording(recording = on);
+  });
 
   // 視覺與音源並行，兩邊都就緒才收起載入畫面，避免「看得到骨架、按播放卻沒聲音」的空窗期
   const [visionOk, midiOk] = await Promise.all([

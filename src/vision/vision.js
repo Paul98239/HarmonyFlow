@@ -59,10 +59,12 @@ const EMIT_HEARTBEAT_MS = 100;
 
 // 逐幀紀錄（開發用）：console 的 copy(__visionLog()) 匯出。遮住一隻手時手點互相干擾、選的人數比現場人數多時多出來的幽靈 ID，都要有逐幀的原始資料才查得出來；
 // 也是不同現場人數下主執行緒負擔（推論與整幀耗時）的來源，見 main.js 的 __latency()。每幀一列；滿了一次丟最舊的八分之一，免得每筆 shift()。
+// 只記演奏中（main.js 依播放狀態切 setFrameLogRecording）：停下來切 DevTools 打指令時鏡頭拍到的打字的手不會混進紀錄。
 const FRAME_LOG_MAX = 20000;       // 30fps 約 11 分鐘
 const TRACKER_EVENT_LOG_MAX = 3000;
 let frameLog = [];
 let trackerEvents = [];
+let frameLogRecording = false;
 const r1 = (v) => Math.round(v * 10) / 10;
 const r3 = (v) => (v === null || v === undefined ? null : Math.round(v * 1000) / 1000);
 const r4 = (v) => (v === null || v === undefined ? null : Math.round(v * 10000) / 10000);
@@ -86,10 +88,13 @@ function jointRow(track) {
     ...V4_JOINTS.flatMap((j) => [r3(raw[j].x), r3(raw[j].y), r3(raw[j].visibility)]),
     ...V4_JOINTS.flatMap((j) => (rawWorld ? [r4(rawWorld[j].x), r4(rawWorld[j].y), r4(rawWorld[j].z)] : [null, null, null])),
     ...V4_JOINTS.flatMap((j) => [r3(smoothed[j].x), r3(smoothed[j].y)]),
+    ...V4_JOINTS.map((j) => r3(raw[j].presence)),
   ];
 }
 
 function recordFrame(ts, startMs, detectMs, rawCount, detections, activeTracks, gestureRows, captureLagMs, detectorRan, resultLagMs) {
+  const events = tracker.drainEvents();   // 不記的時候也要取走，不然追蹤層的事件一直累積
+  if (!frameLogRecording) return;
   const rawBySlot = new Map(activeTracks.map((t) => [t.slot + 1, t.raw]));
   const wrist = (raw, i) => (raw ? [r3(raw[i].x), r3(raw[i].y), r3(raw[i].visibility)] : [null, null, null]);
   frameLog.push([
@@ -103,15 +108,19 @@ function recordFrame(ts, startMs, detectMs, rawCount, detections, activeTracks, 
     activeTracks.map(jointRow),
   ]);
   if (frameLog.length > FRAME_LOG_MAX) frameLog.splice(0, frameLog.length - (FRAME_LOG_MAX - (FRAME_LOG_MAX >> 3)));
-  trackerEvents.push(...tracker.drainEvents());
+  trackerEvents.push(...events);
   if (trackerEvents.length > TRACKER_EVENT_LOG_MAX) trackerEvents.splice(0, trackerEvents.length - (TRACKER_EVENT_LOG_MAX - (TRACKER_EVENT_LOG_MAX >> 3)));
 }
 
-// 匯出最近 seconds 秒的逐幀紀錄與追蹤層事件；欄位說明附在資料裡。
-export function visionLog(seconds = 30) {
-  const from = performance.now() - seconds * 1000;
+// 播放中才記（暫停、曲終、試聽不記）；clearFrameLog() 在從頭開始播時清空，跟按鍵錄音同一個起點
+export function setFrameLogRecording(on) { frameLogRecording = on; }
+export function clearFrameLog() { frameLog = []; trackerEvents = []; }
+
+// 匯出這一段演奏的逐幀紀錄與追蹤層事件（seconds 有給就只取最後一幀往回 seconds 秒）；欄位說明附在資料裡。
+export function visionLog(seconds = null) {
+  const from = seconds === null ? -Infinity : (frameLog.at(-1)?.[0] ?? 0) - seconds * 1000;
   return {
-    version: 4,
+    version: 5,
     exportedAt: new Date().toISOString(),
     seconds,
     poseCount: chosenPoseCount,
@@ -123,7 +132,7 @@ export function visionLog(seconds = 30) {
         "追蹤[[ID, 尺度, 左手腕 x, y, 右手腕 x, y（平滑後，手腕不可見是 null；v3 以前是肩寬與手腕＋手掌合併點）, 鎖定的手, 累加計數, 原始左腕 x, y, 可見度, 原始右腕 x, y, 可見度]]",
         "拍下→送出ms（rVFC 的 captureTime；瀏覽器沒提供是 null）", "偵測器可能有跑（上一次偵測筆數 < numPoses 是 1，否則 0；沒推論是 null）",
         "拍下→結果進主執行緒ms（沒有拍下時刻時從送出算起；沒推論是 null）",
-        `節點[[ID, 33 點外框尺度（參考用，不是 MediaPipe 平滑的尺度）, 原始 x, y, 可見度 ×${V4_JOINTS.length} 點, world x, y, z（公尺）×${V4_JOINTS.length} 點, 平滑後 x, y ×${V4_JOINTS.length} 點]]，點依序是 ${V4_JOINTS.join(",")}`],
+        `節點[[ID, 33 點外框尺度（參考用，不是 MediaPipe 平滑的尺度）, 原始 x, y, 可見度 ×${V4_JOINTS.length} 點, world x, y, z（公尺）×${V4_JOINTS.length} 點, 平滑後 x, y ×${V4_JOINTS.length} 點, 原始 presence ×${V4_JOINTS.length} 點（v5 起；在畫面範圍內的機率，模型沒給是 null）]]，點依序是 ${V4_JOINTS.join(",")}`],
       trackerEvent: "{ t, type: lock｜loss｜duplicate, slot（ID）；lock 另有 scale 尺度、vis 平均可見度、strict }",
     },
     frames: frameLog.filter((f) => f[0] >= from),

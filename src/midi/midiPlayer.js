@@ -267,6 +267,10 @@ function clearSource() {
 const buildPlaybackSignature = (source) =>
   `${sourceIdentity(source)}::${selectionSignature(playerStore.state.score, playerStore.state.assignments)}`;
 
+// 從頭開始播（按鍵錄音跟著清空）時通知 main.js，讓逐幀紀錄跟按鍵錄音同一個起點。
+let playbackRestartListener = null;
+export function setPlaybackRestartListener(fn) { playbackRestartListener = fn; }
+
 // 頂端 pill 的 ▶／↻ 走到這裡（本地／雲端共用）。fromStart＝重播鍵：不管播到哪都從頭來。
 async function playCurrentSource({ fromStart = false } = {}) {
   const s = playerStore.state;
@@ -282,6 +286,7 @@ async function playCurrentSource({ fromStart = false } = {}) {
   let loadingIndicatorTimer = null;
   try {
     const signature = buildPlaybackSignature(s.source);
+    if (signature !== lastPlayedSignature || fromStart || s.finished) playbackRestartListener?.();
     if (signature === lastPlayedSignature) {
       // 引擎裡就是這份組合：重播鍵、或播完後按 ▶ 從頭來（scheduler.js 的 restart()），其餘只是續播
       await (fromStart || s.finished ? synth.restart() : synth.play());
