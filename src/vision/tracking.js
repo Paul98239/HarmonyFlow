@@ -21,7 +21,7 @@ export const DEFAULT_TRACKING_CONFIG = Object.freeze({
   // 沒辦法用公式算準，需照實機測試繼續調。
   ambiguityFloorRatio: 0.4,
 
-  // 「同一具身體」的判準（dedupe／幽靈抑制／硬保險三處共用，見 isSameBody）：
+  // 「同一具身體」的判準（dedupe／幽靈抑制／配對讓先鎖定的先挑／硬保險四處共用，見 isSameBody）：
   // 兩筆偵測（或兩個槽位）的肩膀中點距離 < max(sameBodyDist, sameBodyRatio × 較小的尺度) 就視為同一具身體：兩個真人的肩膀中點不可能靠到半個肩寬以內，
   // 而幽靈（MediaPipe 對同一具身體多吐一組骨架）是同一對肩膀、中點幾乎重合。取較小的尺度：站在使用者正後方、看起來比較小的第二個人，才不會被近處那個人的尺度吞掉。
   sameBodyDist: 0.03,
@@ -491,12 +491,14 @@ export class PersonTracker {
 
     this.tracks.forEach((track, slot) => {
       if (!track) return;
+      // 跟一個先鎖定的槽位是同一具身體（偏離肩膀的幽靈曾被鎖成 ID、又疊回真人）就讓它先挑：只比成本的話，偵測離後鎖那個的舊位置比較近就被它搶走，真人換成幽靈的 ID；而後鎖那個在漏配時不算 live，硬保險也收不到
+      const yields = this.tracks.some((o) => o && o.lockedAtMs < track.lockedAtMs && isSameBody(o, track, this.cfg));
       detections.forEach((det, di) => {
         const cost = this._trackDetectionCost(track, det, nowMs);
-        if (cost !== Infinity) candidates.push({ slot, di, cost });
+        if (cost !== Infinity) candidates.push({ slot, di, cost, yields });
       });
     });
-    candidates.sort((a, b) => a.cost - b.cost);
+    candidates.sort((a, b) => (a.yields - b.yields) || (a.cost - b.cost));
 
     for (const { slot, di } of candidates) {
       if (usedSlot.has(slot) || usedDetIdx.has(di)) continue;
