@@ -27,7 +27,7 @@ window.__stats = () => {
 
 window.__pressLog = midiPlayer.pressLog;
 
-// copy(__visionLog())：這一段演奏（從頭播起，暫停與曲終不記）的逐幀紀錄（兩手手腕、上半身節點的原始／world／平滑座標與 presence、偵測、鎖定的手、推論耗時）與追蹤層的鎖定／釋放事件，
+// copy(__visionLog())：這一段演奏（從頭播起，暫停與曲終不記）的逐幀紀錄（兩手手腕、脖子以下節點的原始／world／平滑座標與 presence、偵測、鎖定的手、推論耗時）與追蹤層的鎖定／釋放事件，
 // 查手點互相干擾與多出來的 ID 用；__visionLog(15) 只取最後 15 秒。先按 ❚❚ 再切 DevTools 打指令，打字的那段就不會記進去。
 window.__visionLog = visionLog;
 
