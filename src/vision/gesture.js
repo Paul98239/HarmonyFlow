@@ -1,4 +1,4 @@
-// gesture.js — 手勢：單手拋物線偵測（ArcDetector）、雙手合成與慣用手鎖定、各槽位的手勢狀態（updateGestures）。純離散觸發訊號，不輸出音量、不管速度。
+// gesture.js — 手勢：單手拋物線偵測（ArcDetector）、雙手合成（兩手各自判、同一下只算一次）、各槽位的手勢狀態（updateGestures）。純離散觸發訊號，不輸出音量、不管速度。
 // 門檻以這個人的尺度（tracking.js 的 track.scale，正面時約等於肩寬）為距離單位、毫秒為時間單位，站遠站近、30fps 或 60fps 結果一致。
 // 揮手現在先只看手腕；其他節點都在 track.smoothed 裡、經過同一套平滑，之後偵測別的動作時直接讀。
 
@@ -13,13 +13,16 @@ export const DEFAULT_ARC_CONFIG = Object.freeze({
   minXSpanRatio: 0.18,      // 下沉期間至少要有這麼多橫向位移（尺度單位），用來跟「純上下抖」區分開
   // 確認那一幀的 y 上限（畫面下緣＝1）：手放到畫面外時模型仍會推估位置，往上飄一點就湊出假拋物線；0.05 的邊界留給谷底剛擦過下緣的真揮手。暫定值（2026-10-20 兩份遮手紀錄）
   maxConfirmY: 1.05,
+  // 一次揮手只算一下（修正設計 §3.3）：觸發之後手要回升到「這次谷底往上 rearmRiseRatio × 這次深度」以上，下一次觸發才算；三份逐幀紀錄訂的（修正設計第 5 節）
+  rearmRiseRatio: 0.5,
 });
 
 /**
  * 拋物線手勢：手同時有橫向位移＋垂直先下沉（image y 變大）再回升；不看肩膀高度、不限開口大小與左右方向，只認這個相對形狀。
  * 單一狀態機逐幀更新起點 peak（Y 最小值）與最低點 trough（Y 最大值）：
  *  - Y 持續變大：延伸 trough，累積下沉期間的橫向位移範圍。
- *  - Y 從 trough 回升超過死區（確認反轉）：下沉結束，深度與橫向位移都達標、且確認這一幀手還在畫面裡（y ≤ maxConfirmY）就 triggerSeq +1；不論達不達標都以目前位置當新起點。
+ *  - Y 從 trough 回升超過死區（確認反轉）：下沉結束，深度與橫向位移都達標、確認這一幀手還在畫面裡（y ≤ maxConfirmY）、而且已經上膛就 triggerSeq +1；不論達不達標都以目前位置當新起點。
+ *  - 上膛：觸發後要先回升過上膛線（rearmRiseRatio）才能再觸發；沒上膛時形狀照樣追蹤，只是不觸發。
  *  - 手不在畫面：中斷追蹤，等手回來重新認一次。
  */
 export class ArcDetector {
@@ -34,7 +37,7 @@ export class ArcDetector {
     this._minX = null;          // 下沉期間橫向位移範圍（用來跟「純上下抖」區分）
     this._maxX = null;
     this.triggerSeq = 0;        // 每次有效拋物線的谷底事件 +1
-    this.lastDepth = 0;         // 最近一次觸發的拋物線深度（尺度單位），慣用手換手時比較用
+    this.rearmY = null;         // 上一次觸發後要回升到的高度（y ≤ 它才上膛）；null＝已上膛
     this.troughMs = null;       // 目前最低點那一幀被拍下的時刻
     this.lastTriggerTroughMs = null;   // 最近一次觸發的最低點時刻：揮手的「動作時刻」（排程器估速、比先後用）
     this._lastMs = null;
@@ -68,6 +71,8 @@ export class ArcDetector {
       return { triggerSeq: this.triggerSeq, troughMs: this.lastTriggerTroughMs };
     }
 
+    if (this.rearmY !== null && y <= this.rearmY) this.rearmY = null;
+
     if (y >= this.troughY) {
       this.troughY = y;
       this.troughMs = captureMs;
@@ -76,10 +81,10 @@ export class ArcDetector {
     } else if ((this.troughY - y) * aspect > this.cfg.reversalNoiseFloor * sw) {
       const depth = (this.troughY - this.peakY) * aspect;
       const xSpan = this._maxX - this._minX;
-      if (depth >= this.cfg.minDepthRatio * sw && xSpan >= this.cfg.minXSpanRatio * sw && y <= this.cfg.maxConfirmY) {
+      if (this.rearmY === null && depth >= this.cfg.minDepthRatio * sw && xSpan >= this.cfg.minXSpanRatio * sw && y <= this.cfg.maxConfirmY) {
         this.triggerSeq++;
-        this.lastDepth = depth / sw;
         this.lastTriggerTroughMs = this.troughMs;
+        this.rearmY = this.troughY - this.cfg.rearmRiseRatio * (this.troughY - this.peakY);
       }
       this.peakY = y; this.troughY = y; this.troughMs = captureMs;
       this._minX = x; this._maxX = x;
@@ -100,17 +105,10 @@ export const MP_LEFT_SHOULDER = 11, MP_RIGHT_SHOULDER = 12;
 // 揮手吃的點：手腕；不可見就視為這隻手不在畫面。
 const wristPoint = (sm, idx) => (sm[idx].visible ? { x: sm[idx].x, y: sm[idx].y } : null);
 
-// 慣用手鎖定的放開條件：HAND_LOCK_RELEASE_MS 是保險絲（停頓幾秒是正常演奏節奏，所以放寬）；真正負責換手的是 HAND_STILL_*：
-// 鎖定的手連續待在小範圍內就視為靜止——MediaPipe 對被遮擋的手常猜一個可見度還過得去的位置，光調可見度遲滯沒用。
-const HAND_LOCK_RELEASE_MS = 8000;
-// 尺度單位，小於 minXSpanRatio(0.18)：真正的拋物線下沉期間至少橫移 0.18，一定會讓手離開這個半徑，不會誤放開正在使用的手。
-// 刻意留在混合單位（y 沒乘 aspect，直的方向實際只有 0.056）：換成同一把尺會讓鎖定比較容易放開，2026-10-26 的逐幀紀錄重播時打字的手因此搶到鎖定；拿掉單手鎖定時整段刪除。
-const HAND_STILL_RADIUS = 0.10;
-const HAND_STILL_MS = 700;       // 連續待在半徑內這麼久才放開鎖定
+// 同一個人另一隻手的谷底跟上一次算數的觸發相差不到這麼久，算同一下（兩手一起揮）。2026-10-29 三段紀錄：一起揮的時間差 49／53 下 ≤ 143ms；
+// 輪流揮除了換手那一刻（兩手都在動）都 ≥ 240ms，150～240ms 之間沒有任何一下（報告 6.9）
+const TWO_HAND_MERGE_MS = 200;
 const SLOT_RELEASE_MS = 1000;    // 槽位連續不在場這麼久才把偵測器整個 reset
-// 換手：另一隻手的拋物線深度達到鎖定手近期深度（EMA）的這麼多倍就改鎖它。暫定值：2026-10-20 兩份遮手紀錄，揮的手深度中位數 1.84／2.2 肩寬，打字的手 0.47／0.61（10-28 換算前的混合單位；這裡只比兩手的比值，換算不影響）
-const LOCK_STEAL_RATIO = 2;
-const LOCK_DEPTH_EMA_ALPHA = 0.5; // 用 EMA 而不是最後一次的深度：揮的手偶爾一下很淺（實測最淺 0.17），門檻不該跟著掉到讓閒置手搶走
 
 // 各槽位（＝演奏者 ID − 1）的狀態在第一次用到時才建立（ensureSlot），這裡不必知道槽位上限。
 const arcDetectors = [];
@@ -122,9 +120,10 @@ function ensureSlot(slot) {
   if (arcDetectors[slot]) return;
   arcDetectors[slot] = { left: new ArcDetector(), right: new ArcDetector() };
   arcLastSeqBySlot[slot] = {
-    left: 0, right: 0, combinedSeq: 0, lockedHand: null, lockedDepth: 0, lastTriggerMs: undefined,
-    stillAnchor: null, stillSinceMs: undefined,
-    lastTroughMs: null,   // 最近一次觸發（鎖定的手）的最低點時刻；跟 combinedSeq 一樣不歸零，接收端在計數變動時讀
+    left: 0, right: 0, combinedSeq: 0,
+    lastHand: null,       // 上一次算數的觸發是哪隻手（兩手合併用）
+    firedHand: null,      // 這一幀算數的觸發是哪隻手（'left'／'right'／'both'，沒有是 null；逐幀紀錄用）
+    lastTroughMs: null,   // 最近一次算數的觸發的最低點時刻；跟 combinedSeq 一樣不歸零，接收端在計數變動時讀
   };
   slotInactiveSinceMs[slot] = 0;
 }
@@ -132,8 +131,7 @@ function ensureSlot(slot) {
 const resetSlotDetectors = (arcSlot, lastSeq) => {
   arcSlot.left.reset(); arcSlot.right.reset();
   lastSeq.left = 0; lastSeq.right = 0;
-  lastSeq.lockedHand = null; lastSeq.lockedDepth = 0; lastSeq.lastTriggerMs = undefined;
-  lastSeq.stillAnchor = null; lastSeq.stillSinceMs = undefined;
+  lastSeq.lastHand = null; lastSeq.firedHand = null;
 };
 const resetAllSlotDetectors = () => {
   for (let slot = 0; slot < arcDetectors.length; slot++) {
@@ -141,7 +139,7 @@ const resetAllSlotDetectors = () => {
   }
 };
 
-// 餵一個在場槽位的骨架給它那對 ArcDetector；回傳可見度、座標與尺度，供 combineArcTriggers() 判斷鎖定的手該不該放開。
+// 餵一個在場槽位的骨架給它那對 ArcDetector；座標與尺度給逐幀紀錄。
 function updateSlotArc(arcDet, track, nowMs, captureMs) {
   const sm = track.smoothed;
   const { scale, aspect } = track;
@@ -150,67 +148,28 @@ function updateSlotArc(arcDet, track, nowMs, captureMs) {
   return {
     left: arcDet.left.update({ point: leftPoint, scale, aspect }, nowMs, captureMs),
     right: arcDet.right.update({ point: rightPoint, scale, aspect }, nowMs, captureMs),
-    leftDepth: arcDet.left.lastDepth,
-    rightDepth: arcDet.right.lastDepth,
-    leftVisible: !!leftPoint,
-    rightVisible: !!rightPoint,
     leftPoint, rightPoint, scale,
   };
 }
 
-// 合成雙手結果並「自動鎖定慣用手」：哪隻手先做出有效拋物線就鎖定它、之後只認那隻手——避免閒置手被模型猜出位置、在畫面上飄移湊出假拋物線而誤觸發。
-// 換手：閒置手（例如打字的手在畫面下緣抖動）也可能先湊出一次淺的拋物線而被鎖到，所以另一隻手的拋物線夠深（LOCK_STEAL_RATIO）就把鎖定搶過去。
-// 放開條件：鎖定的手不可見、HAND_LOCK_RELEASE_MS 沒有新觸發、或 HAND_STILL_MS 幾乎沒在動。state 就是 arcLastSeqBySlot[slot]，逐幀被直接改動。
-function combineArcTriggers(state, arc, nowMs) {
-  const { left, right, leftVisible, rightVisible, leftPoint, rightPoint, scale } = arc;
-
-  if (state.lockedHand === "left" && !leftVisible) state.lockedHand = null;
-  if (state.lockedHand === "right" && !rightVisible) state.lockedHand = null;
-  if (state.lockedHand && nowMs - (state.lastTriggerMs ?? nowMs) > HAND_LOCK_RELEASE_MS) {
-    state.lockedHand = null;
-  }
-
-  if (state.lockedHand) {
-    const point = state.lockedHand === "left" ? leftPoint : rightPoint;
-    const radius = HAND_STILL_RADIUS * Math.max(scale || 0, DEFAULT_ARC_CONFIG.minScale);
-    const dist = point && state.stillAnchor ? Math.hypot(point.x - state.stillAnchor.x, point.y - state.stillAnchor.y) : Infinity;
-    if (dist > radius) {
-      state.stillAnchor = point;
-      state.stillSinceMs = nowMs;
-    } else if (nowMs - state.stillSinceMs > HAND_STILL_MS) {
-      state.lockedHand = null;
-    }
-  } else {
-    state.stillAnchor = null;
-  }
-
+// 合成雙手：兩隻手各自判，任一隻觸發就算一下；同一幀兩隻都觸發、或另一隻手的谷底跟上一次算數的觸發相差不到 TWO_HAND_MERGE_MS，算同一下。
+// 動作時刻取先到的那個谷底。state 就是 arcLastSeqBySlot[slot]，逐幀被直接改動。
+function combineArcTriggers(state, arc) {
+  const { left, right } = arc;
   // 只認增加：ArcDetector 停滯（超過 staleMs 沒餵值）重設時 triggerSeq 會歸零，用 !== 會把歸零當成一次新揮手
-  const leftChanged = left.triggerSeq > state.left;
-  const rightChanged = right.triggerSeq > state.right;
+  const fired = ['left', 'right'].filter((h) => arc[h].triggerSeq > state[h]);
   state.left = left.triggerSeq;
   state.right = right.triggerSeq;
+  state.firedHand = null;
+  if (!fired.length) return { triggerSeq: state.combinedSeq || 0 };
 
-  const changed = { left: leftChanged, right: rightChanged };
-  const depth = { left: arc.leftDepth, right: arc.rightDepth };
-  if (!state.lockedHand) {
-    if (leftChanged) state.lockedHand = "left";
-    else if (rightChanged) state.lockedHand = "right";
-    if (state.lockedHand) state.lockedDepth = depth[state.lockedHand];
-  } else {
-    const other = state.lockedHand === "left" ? "right" : "left";
-    if (changed[other] && depth[other] >= LOCK_STEAL_RATIO * state.lockedDepth) {
-      state.lockedHand = other;
-      state.lockedDepth = depth[other];
-    } else if (changed[state.lockedHand]) {
-      state.lockedDepth += LOCK_DEPTH_EMA_ALPHA * (depth[state.lockedHand] - state.lockedDepth);
-    }
-  }
-
-  const triggered = (state.lockedHand === "left" && leftChanged)
-    || (state.lockedHand === "right" && rightChanged);
-  if (triggered) {
-    state.lastTriggerMs = nowMs;
-    state.lastTroughMs = (state.lockedHand === "left" ? left : right).troughMs ?? null;
+  const troughMs = Math.min(...fired.map((h) => arc[h].troughMs));
+  const mergedWithLast = fired.length === 1 && state.lastHand !== null && state.lastHand !== fired[0]
+    && Math.abs(troughMs - state.lastTroughMs) < TWO_HAND_MERGE_MS;
+  if (!mergedWithLast) {
+    state.firedHand = fired.length === 2 ? 'both' : fired[0];
+    state.lastHand = fired.length === 2 ? null : fired[0];   // 兩隻都用掉了，下一下不管哪隻手都是新的一下
+    state.lastTroughMs = troughMs;
     state.combinedSeq = (state.combinedSeq || 0) + 1;
   }
   return { triggerSeq: state.combinedSeq || 0 };
@@ -224,7 +183,7 @@ function combineArcTriggers(state, arc, nowMs) {
  * @param {number} [captureMs]  這一幀被攝影機拍下的時刻（沒有就是 nowMs）
  * @returns {{ arcTriggerSeqBySlot: Object<number, number>, arcTroughMsBySlot: Object<number, number|null>, presentSlots: number[], frame: Array }}
  *   arcTroughMsBySlot＝每個槽位最近一次觸發的最低點時刻（揮手的動作時刻）；frame＝逐幀紀錄用（vision.js 的 __visionLog）：
- *   在場槽位的 [ID, 尺度, 左手腕 x, y, 右手腕 x, y, 鎖定的手, 累加計數]，手腕不可見時那隻手的座標是 null
+ *   在場槽位的 [ID, 尺度, 左手腕 x, y, 右手腕 x, y, 這一幀算數的觸發是哪隻手（'left'／'right'／'both'／null）, 累加計數]，手腕不可見時那隻手的座標是 null
  */
 export function updateGestures(activeTracks, slotCount, nowMs, captureMs = nowMs) {
   const arcTriggerSeqBySlot = {};
@@ -249,22 +208,20 @@ export function updateGestures(activeTracks, slotCount, nowMs, captureMs = nowMs
       if (slotInactiveSinceMs[slot] === 0) slotInactiveSinceMs[slot] = nowMs;
       if (nowMs - slotInactiveSinceMs[slot] > SLOT_RELEASE_MS) {
         resetSlotDetectors(arcDet, arcLastSeqBySlot[slot]);
-        arc = { left: { triggerSeq: 0 }, right: { triggerSeq: 0 }, leftVisible: false, rightVisible: false };
+        arc = { left: { triggerSeq: 0 }, right: { triggerSeq: 0 } };
       } else {
         arc = {
           left: arcDet.left.update({ point: null }, nowMs),
           right: arcDet.right.update({ point: null }, nowMs),
-          leftVisible: false,
-          rightVisible: false,
         };
       }
     }
-    const combinedArc = combineArcTriggers(arcLastSeqBySlot[slot], arc, nowMs);
+    const combinedArc = combineArcTriggers(arcLastSeqBySlot[slot], arc);
     arcTriggerSeqBySlot[slot + 1] = combinedArc.triggerSeq;
     arcTroughMsBySlot[slot + 1] = arcLastSeqBySlot[slot].lastTroughMs;
     if (track) {
       frame.push([slot + 1, arc.scale, arc.leftPoint?.x ?? null, arc.leftPoint?.y ?? null, arc.rightPoint?.x ?? null, arc.rightPoint?.y ?? null,
-        arcLastSeqBySlot[slot].lockedHand, combinedArc.triggerSeq]);
+        arcLastSeqBySlot[slot].firedHand, combinedArc.triggerSeq]);
     }
   }
   return { arcTriggerSeqBySlot, arcTroughMsBySlot, presentSlots, frame };

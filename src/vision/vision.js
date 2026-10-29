@@ -122,7 +122,7 @@ export function clearFrameLog() { frameLog = []; trackerEvents = []; }
 export function visionLog(seconds = null) {
   const from = seconds === null ? -Infinity : (frameLog.at(-1)?.[0] ?? 0) - seconds * 1000;
   return {
-    version: 6,
+    version: 7,
     exportedAt: new Date().toISOString(),
     seconds,
     poseCount: chosenPoseCount,
@@ -131,7 +131,7 @@ export function visionLog(seconds = null) {
     columns: {
       frame: ["t（送去推論的時刻；沒推論時是處理時刻；performance.now，ms）", "現場人數", "MediaPipe 偵測筆數", "推論ms（在 Worker）", "主執行緒處理ms",
         "偵測[[肩中點 x, y, 尺度（v3 以前是肩寬）, 平均可見度, 嚴格可信 0/1]]",
-        "追蹤[[ID, 尺度, 左手腕 x, y, 右手腕 x, y（平滑後，手腕不可見是 null；v3 以前是肩寬與手腕＋手掌合併點）, 鎖定的手, 累加計數, 原始左腕 x, y, 可見度, 原始右腕 x, y, 可見度]]",
+        "追蹤[[ID, 尺度, 左手腕 x, y, 右手腕 x, y（平滑後，手腕不可見是 null；v3 以前是肩寬與手腕＋手掌合併點）, 這一幀算數的觸發是哪隻手（left／right／both／null；v6 以前是鎖定的手）, 累加計數, 原始左腕 x, y, 可見度, 原始右腕 x, y, 可見度]]",
         "拍下→送出ms（rVFC 的 captureTime；瀏覽器沒提供是 null）", "偵測器可能有跑（上一次偵測筆數 < numPoses 是 1，否則 0；沒推論是 null）",
         "拍下→結果進主執行緒ms（沒有拍下時刻時從送出算起；沒推論是 null）",
         `節點[[ID, 33 點外框尺度（參考用，不是 MediaPipe 平滑的尺度）, 原始 x, y, 可見度 ×${LOG_JOINTS.length} 點, world x, y, z（公尺）×${LOG_JOINTS.length} 點, 平滑後 x, y ×${LOG_JOINTS.length} 點, 原始 presence ×${LOG_JOINTS.length} 點（v5 起；在畫面範圍內的機率，模型沒給是 null）]]，點依序是 ${LOG_JOINTS.join(",")}（v6 起；v4／v5 是 11～24）`],
