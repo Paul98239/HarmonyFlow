@@ -165,6 +165,10 @@ export async function initEngine() {
   if (initPromise) return initPromise;
 
   initPromise = (async () => {
+    // 第一個音色庫來源跟 lib、worklet 同時發出，立刻接手 index.html 的 preload：排在它們下載完之後的話，CDN 慢到 load 事件後約 4 秒，
+    // Chrome 就判定 preload 沒用到而在 console 警告（lib 載入失敗時也一樣）
+    const firstSoundFont = fetch(SOUNDFONT_URLS[0]);
+    firstSoundFont.catch(() => {}); // 失敗由下面依序試來源時處理並 warn；這裡只防 lib 先失敗、沒人 await 時變成 unhandled rejection
     try {
       const { WorkletSynthesizer, Sequencer } = await import(/* @vite-ignore */ LIB_ESM_URL);
       if (!WorkletSynthesizer) throw new Error('缺少必要匯出');
@@ -200,7 +204,7 @@ export async function initEngine() {
       let lastErr;
       for (const url of SOUNDFONT_URLS) {
         try {
-          const res = await fetch(url);
+          const res = await (url === SOUNDFONT_URLS[0] ? firstSoundFont : fetch(url));
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const sfBuf = await res.arrayBuffer();
           // addSoundBank 可能把 ArrayBuffer transfer 進 worklet 而 detach，所以先複製一份給第二個合成器
