@@ -1,6 +1,6 @@
 # HarmonyFlow
 
-瀏覽器端的 MIDI 演奏應用：觸發來源（電腦鍵盤文字鍵（四排字元鍵＋空白鍵）＝分譜下拉的「PC 鍵盤手」；攝影機 → MediaPipe 姿勢追蹤＋拋物線揮手＝「演奏者 1～4」，兩者並存）每觸發一次，就放行你的聲部的下一個起音，音在觸發的當下立刻發聲；一個演奏者可以同時控制多個聲部。沒被你控制的聲部由電腦輔助、不用按，跟著你的位置與速度走（依你最近的按鍵估速度），與你的起音同一個 tick 的電腦音跟你的音同刻發聲；音長依你的速度等比例縮放（結尾接著或橫跨你下一個起音的音會 loop 到你按下去；你早按時電腦聲部不會往前跳）。任何一首歌（含單聲部）都能指派，播放中改指派會從目前位置接續。另有「試聽」鈕，用官方 SpessaSynth Sequencer 播同一份 MIDI 讓你用耳朵對照。純原生 JavaScript（ES module），沒有 build step、沒有後端、沒有 Node 工具鏈。
+瀏覽器端的 MIDI 演奏應用：觸發來源（電腦鍵盤文字鍵（四排字元鍵＋空白鍵）＝分譜下拉的「PC 鍵盤手」；攝影機 → MediaPipe 姿勢追蹤＋拋物線揮手＝「演奏者 1～4」，兩者並存）每觸發一次，就放行你的聲部的下一個起音，音在觸發的當下立刻發聲；一個演奏者可以同時控制多個聲部。沒被你控制的聲部由電腦輔助、不用按，跟著你的位置與速度走（依你最近的按鍵估速度），與你的起音同一個 tick 的電腦音跟你的音同刻發聲；音長依你的速度等比例縮放（結尾接著或橫跨你下一個起音的音會 loop 到你按下去；你早按時電腦聲部不會往前跳）。多人時每位演奏者推自己的聲部，電腦聲部跟著帶頭的人走（帶頭的人停手時換人帶頭）。任何一首歌（含單聲部）都能指派，播放中改指派會從目前位置接續。另有「試聽」鈕，用官方 SpessaSynth Sequencer 播同一份 MIDI 讓你用耳朵對照。純原生 JavaScript（ES module），沒有 build step、沒有後端、沒有 Node 工具鏈。
 
 ## 需求
 
@@ -16,7 +16,7 @@ clone 下來直接用 VS Code 的 Live Server（ritwickdey.liveserver）開：�
 ```
 index.html        唯一進入點；完整的靜態 UI markup 都在這裡（HTML-first），preload／modulepreload 也在這裡
 src/
-  main.js         組裝（composition root）：initUi(midiPlayer)、接 vision → 播放器的人數監聽與鍵盤、揮手 → 播放器的觸發、並行推進兩條啟動軌道；開發用 __stats／__pressLog
+  main.js         組裝（composition root）：initUi(midiPlayer)、接 vision → 播放器的人數監聽與鍵盤、揮手 → 播放器的觸發、並行推進兩條啟動軌道；開發用 __stats／__pressLog／__visionLog／__latency
   ui.js           UI 外殼：Store（EventTarget 狀態容器）＋ rafThrottle、uiStore、載入／錯誤遮罩＋inert、--ui-fs、
                   系統控制列、面板開合、事件代理、render 排程
   input/          觸發來源（日後併入的肢體動作 js 也放這裡）
@@ -26,7 +26,7 @@ src/
     vision.js     攝影機、WebGL 視訊與骨架繪製、姿勢模型生命週期；逐幀呼叫追蹤與手勢，送出手勢狀態
     poseWorker.js 姿勢推論 Worker：載入 tasks-vision、建 PoseLandmarker、收畫面回關節點（推論不佔主執行緒）
     tracking.js   多人槽位追蹤與平滑
-    gesture.js    手勢：單手拋物線偵測、雙手合成與慣用手鎖定、各槽位的手勢狀態
+    gesture.js    手勢：單手拋物線偵測、雙手合成（兩手各自判、同一下只算一次）、各槽位的手勢狀態
   midi/           MIDI 解析、演奏引擎、播放器
     midiFile.js   SMF 位元組 → 軌與事件
     timeline.js   速度表、tick ↔ 秒、拍號調號、小節拍格線
@@ -45,8 +45,8 @@ src/
 
 ## 第三方套件
 
-`@mediapipe/tasks-vision`（`src/vision/poseWorker.js`）與 `spessasynth_lib`（`src/midi/synth.js`）都直接寫死完整 CDN 網址（jsDelivr）匯入，`tasks-vision` 固定 `@1.1.0`、`spessasynth_lib` 綁 `@latest`；沒有 import map、JS 套件沒有本地副本。
+`@mediapipe/tasks-vision`（`src/vision/poseWorker.js`）與 `spessasynth_lib`（`src/midi/synth.js`）都直接寫死完整 CDN 網址（jsDelivr）匯入，`tasks-vision` 固定 `@1.1.1`（bundle、loader、`.wasm` 必須同版）、`spessasynth_lib` 固定 `@4.3.14`；沒有 import map、JS 套件沒有本地副本。
 
 ## 文件
 
-[`CLAUDE.md`](./CLAUDE.md)：怎麼跑、架構、慣例與禁止事項（給 Claude Code 也給人看）。
+設計規格、開發指引（`CLAUDE.md`、`docs/`）與測試（`test/`）只留在開發者本機，不進 git。
