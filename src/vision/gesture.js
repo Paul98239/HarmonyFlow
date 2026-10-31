@@ -15,14 +15,18 @@ export const DEFAULT_ARC_CONFIG = Object.freeze({
   maxConfirmY: 1.05,
   // 一次揮手只算一下（修正設計 §3.3）：觸發之後手要回升到「這次谷底往上 rearmRiseRatio × 這次深度」以上，下一次觸發才算；三份逐幀紀錄訂的（修正設計第 5 節）
   rearmRiseRatio: 0.5,
+  // 起點那一幀手腕 presence（MediaPipe：點在畫面範圍內的機率）的下限：手在畫面外時模型猜出來的點也會湊出拋物線，真的揮手從畫面裡開始。
+  // 2026-10-30 畫面下緣紀錄：擋掉搬筆電時被猜在畫面外的 4 下，代價是手超出畫面側邊的 2 下；0.5 擋到的搬筆電一樣是 4 下，側邊與近距的揮手多擋約 7 下（子專案 1 檢查報告 6.14）
+  minStartPresence: 0.3,
 });
 
 /**
  * 拋物線手勢：手同時有橫向位移＋垂直先下沉（image y 變大）再回升；不看肩膀高度、不限開口大小與左右方向，只認這個相對形狀。
  * 單一狀態機逐幀更新起點 peak（Y 最小值）與最低點 trough（Y 最大值）：
  *  - Y 持續變大：延伸 trough，累積下沉期間的橫向位移範圍。
- *  - Y 從 trough 回升超過死區（確認反轉）：下沉結束，深度與橫向位移都達標、確認這一幀手還在畫面裡（y ≤ maxConfirmY）、而且已經上膛就 triggerSeq +1；不論達不達標都以目前位置當新起點。
- *  - 上膛：觸發後要先回升過上膛線（rearmRiseRatio）才能再觸發；沒上膛時形狀照樣追蹤，只是不觸發。
+ *  - Y 從 trough 回升超過死區（確認反轉）：下沉結束，深度與橫向位移都達標、確認這一幀手還在畫面裡（y ≤ maxConfirmY）、起點那一幀的手腕在畫面範圍內（presence ≥ minStartPresence）、
+ *    而且已經上膛就 triggerSeq +1；不論達不達標都以目前位置當新起點。
+ *  - 上膛：觸發後要先回升過上膛線（rearmRiseRatio）才能再觸發；沒上膛時形狀照樣追蹤，下沉至少跟上一次觸發一樣深才算（上膛線是固定高度，手從高處換到低處揮會永遠回不去）。
  *  - 手不在畫面：中斷追蹤，等手回來重新認一次。
  */
 export class ArcDetector {
@@ -33,11 +37,13 @@ export class ArcDetector {
 
   reset() {
     this.peakY = null;          // 這一段動作目前的起點高度（Y 最小值）
+    this.peakPresence = null;   // 起點那一幀的手腕 presence（沒有＝不擋）
     this.troughY = null;        // 這一段動作目前已知的最低點（Y 最大值）
     this._minX = null;          // 下沉期間橫向位移範圍（用來跟「純上下抖」區分）
     this._maxX = null;
     this.triggerSeq = 0;        // 每次有效拋物線的谷底事件 +1
     this.rearmY = null;         // 上一次觸發後要回升到的高度（y ≤ 它才上膛）；null＝已上膛
+    this.lastDepthY = null;     // 上一次觸發的下沉深度（y 差）：沒上膛時至少要這麼深才算
     this.troughMs = null;       // 目前最低點那一幀被拍下的時刻
     this.lastTriggerTroughMs = null;   // 最近一次觸發的最低點時刻：揮手的「動作時刻」（排程器估速、比先後用）
     this._lastMs = null;
@@ -45,7 +51,8 @@ export class ArcDetector {
 
   /**
    * 餵一幀資料。
-   * @param {{point:{x,y}|null, scale?:number, aspect:number}} frame  point＝手腕座標，scale＝這個人的尺度，aspect＝畫面高 ÷ 寬（y 差乘它才跟尺度同一把尺）
+   * @param {{point:{x,y,presence?}|null, scale?:number, aspect:number}} frame  point＝手腕座標（presence＝MediaPipe 原始的在畫面範圍內機率，沒有就不擋），
+   *   scale＝這個人的尺度，aspect＝畫面高 ÷ 寬（y 差乘它才跟尺度同一把尺）
    * @param {number} nowMs  處理這一幀的時刻（停滯判斷用）
    * @param {number} [captureMs]  這一幀被攝影機拍下的時刻（記最低點用；沒有就是 nowMs）
    * @returns {{triggerSeq:number, troughMs:number|null}} troughMs＝最近一次觸發的最低點時刻
@@ -64,9 +71,10 @@ export class ArcDetector {
     const sw = Math.max(this.cfg.minScale, frame.scale || 0);
     const { aspect } = frame;
     const { x, y } = point;
+    const presence = point.presence ?? null;
 
     if (this.peakY === null) {
-      this.peakY = y; this.troughY = y; this.troughMs = captureMs;
+      this.peakY = y; this.peakPresence = presence; this.troughY = y; this.troughMs = captureMs;
       this._minX = x; this._maxX = x;
       return { triggerSeq: this.triggerSeq, troughMs: this.lastTriggerTroughMs };
     }
@@ -81,16 +89,20 @@ export class ArcDetector {
     } else if ((this.troughY - y) * aspect > this.cfg.reversalNoiseFloor * sw) {
       const depth = (this.troughY - this.peakY) * aspect;
       const xSpan = this._maxX - this._minX;
-      if (this.rearmY === null && depth >= this.cfg.minDepthRatio * sw && xSpan >= this.cfg.minXSpanRatio * sw && y <= this.cfg.maxConfirmY) {
+      const shapeOk = depth >= this.cfg.minDepthRatio * sw && xSpan >= this.cfg.minXSpanRatio * sw && y <= this.cfg.maxConfirmY;
+      const armed = this.rearmY === null || this.troughY - this.peakY >= this.lastDepthY;
+      const startInFrame = this.peakPresence === null || this.peakPresence >= this.cfg.minStartPresence;
+      if (shapeOk && armed && startInFrame) {
         this.triggerSeq++;
         this.lastTriggerTroughMs = this.troughMs;
-        this.rearmY = this.troughY - this.cfg.rearmRiseRatio * (this.troughY - this.peakY);
+        this.lastDepthY = this.troughY - this.peakY;
+        this.rearmY = this.troughY - this.cfg.rearmRiseRatio * this.lastDepthY;
       }
-      this.peakY = y; this.troughY = y; this.troughMs = captureMs;
+      this.peakY = y; this.peakPresence = presence; this.troughY = y; this.troughMs = captureMs;
       this._minX = x; this._maxX = x;
     } else {
       // 起點跟著更高的位置走，避免小雜訊被算進之後的深度
-      if (y < this.peakY) this.peakY = y;
+      if (y < this.peakY) { this.peakY = y; this.peakPresence = presence; }
     }
 
     return { triggerSeq: this.triggerSeq, troughMs: this.lastTriggerTroughMs };
@@ -102,8 +114,11 @@ export const MP_LEFT_WRIST = 15, MP_RIGHT_WRIST = 16;
 export const MP_LEFT_ELBOW = 13, MP_RIGHT_ELBOW = 14;
 export const MP_LEFT_SHOULDER = 11, MP_RIGHT_SHOULDER = 12;
 
-// 揮手吃的點：手腕；不可見就視為這隻手不在畫面。
-const wristPoint = (sm, idx) => (sm[idx].visible ? { x: sm[idx].x, y: sm[idx].y } : null);
+// 揮手吃的點：手腕；不可見就視為這隻手不在畫面。presence 取這一幀沒平滑的原始值（平滑層不帶它）。
+const wristPoint = (track, idx) => {
+  const p = track.smoothed[idx];
+  return p.visible ? { x: p.x, y: p.y, presence: track.raw?.[idx]?.presence } : null;
+};
 
 // 同一個人另一隻手的谷底跟上一次算數的觸發相差不到這麼久，算同一下（兩手一起揮）。2026-10-29 三段紀錄：一起揮的時間差 49／53 下 ≤ 143ms；
 // 輪流揮除了換手那一刻（兩手都在動）都 ≥ 240ms，150～240ms 之間沒有任何一下（報告 6.9）
@@ -141,10 +156,9 @@ const resetAllSlotDetectors = () => {
 
 // 餵一個在場槽位的骨架給它那對 ArcDetector；座標與尺度給逐幀紀錄。
 function updateSlotArc(arcDet, track, nowMs, captureMs) {
-  const sm = track.smoothed;
   const { scale, aspect } = track;
-  const leftPoint = wristPoint(sm, MP_LEFT_WRIST);
-  const rightPoint = wristPoint(sm, MP_RIGHT_WRIST);
+  const leftPoint = wristPoint(track, MP_LEFT_WRIST);
+  const rightPoint = wristPoint(track, MP_RIGHT_WRIST);
   return {
     left: arcDet.left.update({ point: leftPoint, scale, aspect }, nowMs, captureMs),
     right: arcDet.right.update({ point: rightPoint, scale, aspect }, nowMs, captureMs),
@@ -177,7 +191,7 @@ function combineArcTriggers(state, arc) {
 
 /**
  * 一幀的手勢：每個槽位（＝演奏者 ID）左右手各一個 ArcDetector，回傳每個槽位的拋物線觸發累加計數與這一幀真的在場的槽位。
- * @param {{slot: number, smoothed: object[], scale: number}[]} activeTracks  追蹤層這一幀的在場名單（tracker.getActiveTracks()）
+ * @param {{slot: number, smoothed: object[], raw?: object[], scale: number}[]} activeTracks  追蹤層這一幀的在場名單（tracker.getActiveTracks()；raw 只讀手腕的 presence）
  * @param {number} slotCount  追蹤器目前的槽位數（＝現場人數）；送出去的 map 只帶這麼多個槽位
  * @param {number} nowMs
  * @param {number} [captureMs]  這一幀被攝影機拍下的時刻（沒有就是 nowMs）
