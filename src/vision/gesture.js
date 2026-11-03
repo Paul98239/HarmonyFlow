@@ -20,6 +20,15 @@ export const DEFAULT_ARC_CONFIG = Object.freeze({
   outOfFramePendingMs: 1500,
   // 一次揮手只算一下（修正設計 §3.3）：觸發之後手要回升到「這次谷底往上 rearmRiseRatio × 這次深度」以上，下一次觸發才算；三份逐幀紀錄訂的（修正設計第 5 節）
   rearmRiseRatio: 0.5,
+  // 深揮之後換到低處揮（D16）：上膛線停在高處碰不到、又沒有一下更深，會一直不觸發。所以谷底距上一次觸發 ≥ rearmAfterMs、
+  // 深度 ≥ rearmDepthFactor × 這隻手最近 rearmDepthHistory 下觸發深度的中位數（夾在 [rearmDepthMin, rearmDepthMax] 尺度；不到 3 下用 rearmDepthFallback）也算上膛。
+  // 同一次揮手的第二下距上一下 60～390ms；沒在揮的手小晃 0.09～0.24 尺度。開發者一人的紀錄掃出來的值，揮幅小的人靠下限（子專案 1 檢查報告 6.17）
+  rearmAfterMs: 600,
+  rearmDepthFactor: 0.5,
+  rearmDepthMin: 0.3,
+  rearmDepthMax: 0.7,
+  rearmDepthFallback: 0.4,
+  rearmDepthHistory: 8,
   // 起點那一幀手腕 presence（MediaPipe：點在畫面範圍內的機率）的下限：手在畫面外時模型猜出來的點也會湊出拋物線，真的揮手從畫面裡開始。
   // 2026-10-30 畫面下緣紀錄：擋掉搬筆電時被猜在畫面外的 4 下，代價是手超出畫面側邊的 2 下；0.5 擋到的搬筆電一樣是 4 下，側邊與近距的揮手多擋約 7 下（子專案 1 檢查報告 6.14）
   minStartPresence: 0.3,
@@ -33,7 +42,7 @@ export const DEFAULT_ARC_CONFIG = Object.freeze({
  *    而且已經上膛就 triggerSeq +1；不論達不達標都以目前位置當新起點。
  *  - 確認這一幀手在畫面下緣外（y > maxConfirmY）：起點在畫面裡、其他條件都達標就先待定，手真的回來（回升夠多或回到畫面裡）才觸發，動作時刻仍是谷底；
  *    放下的手之後不會回升那麼多，待定逾時、手不見或停滯重來就作廢。
- *  - 上膛：觸發後要先回升過上膛線（rearmRiseRatio）才能再觸發；沒上膛時形狀照樣追蹤，下沉至少跟上一次觸發一樣深才算（上膛線是固定高度，手從高處換到低處揮會永遠回不去）。
+ *  - 上膛：觸發後要先回升過上膛線（rearmRiseRatio）才能再觸發；沒上膛時形狀照樣追蹤，下沉至少跟上一次觸發一樣深才算（上膛線是固定高度，手從高處換到低處揮會永遠回不去），或距上一次觸發夠久、深度達到跟著這隻手揮幅走的門檻（深揮之後換到低處揮）。
  *  - 手不在畫面：中斷追蹤，等手回來重新認一次。
  */
 export class ArcDetector {
@@ -51,17 +60,28 @@ export class ArcDetector {
     this.triggerSeq = 0;        // 每次有效拋物線的谷底事件 +1
     this.rearmY = null;         // 上一次觸發後要回升到的高度（y ≤ 它才上膛）；null＝已上膛
     this.lastDepthY = null;     // 上一次觸發的下沉深度（y 差）：沒上膛時至少要這麼深才算
+    this.recentDepths = [];     // 最近幾次觸發的下沉深度（尺度）：靠時間上膛時的深度門檻
     this.troughMs = null;       // 目前最低點那一幀被拍下的時刻
     this.lastTriggerTroughMs = null;   // 最近一次觸發的最低點時刻：揮手的「動作時刻」（排程器估速、比先後用）
-    this.pending = null;        // 谷底在畫面下緣外、等手回來的拋物線 {troughY, troughMs, depthY, sinceMs}
+    this.pending = null;        // 谷底在畫面下緣外、等手回來的拋物線 {troughY, troughMs, depthY, depthRatio, sinceMs}
     this._lastMs = null;
   }
 
-  _fire(troughY, troughMs, depthY) {
+  _fire(troughY, troughMs, depthY, depthRatio) {
     this.triggerSeq++;
     this.lastTriggerTroughMs = troughMs;
     this.lastDepthY = depthY;
     this.rearmY = troughY - this.cfg.rearmRiseRatio * depthY;
+    this.recentDepths.push(depthRatio);
+    if (this.recentDepths.length > this.cfg.rearmDepthHistory) this.recentDepths.shift();
+  }
+
+  // 靠時間上膛時這一下至少要多深（尺度）
+  _timedRearmDepthRatio() {
+    const c = this.cfg, d = this.recentDepths;
+    if (d.length < 3) return c.rearmDepthFallback;
+    const s = [...d].sort((a, b) => a - b);
+    return Math.min(c.rearmDepthMax, Math.max(c.rearmDepthMin, c.rearmDepthFactor * s[s.length >> 1]));
   }
 
   /**
@@ -92,7 +112,7 @@ export class ArcDetector {
     const p = this.pending;
     if (p) {
       if ((p.troughY - y) * aspect >= this.cfg.outOfFrameRiseRatio * sw || y <= this.cfg.maxConfirmY) {
-        this._fire(p.troughY, p.troughMs, p.depthY);
+        this._fire(p.troughY, p.troughMs, p.depthY, p.depthRatio);
         this.pending = null;
       } else if (captureMs - p.sinceMs > this.cfg.outOfFramePendingMs) {
         this.pending = null;
@@ -116,11 +136,14 @@ export class ArcDetector {
       const depth = (this.troughY - this.peakY) * aspect;
       const xSpan = this._maxX - this._minX;
       const shapeOk = depth >= this.cfg.minDepthRatio * sw && xSpan >= this.cfg.minXSpanRatio * sw;
-      const armed = this.rearmY === null || this.troughY - this.peakY >= this.lastDepthY;
+      const timedRearm = this.lastTriggerTroughMs !== null && this.troughMs - this.lastTriggerTroughMs >= this.cfg.rearmAfterMs
+        && depth >= this._timedRearmDepthRatio() * sw;
+      const armed = this.rearmY === null || this.troughY - this.peakY >= this.lastDepthY || timedRearm;
       const startInFrame = this.peakPresence === null || this.peakPresence >= this.cfg.minStartPresence;
       if (shapeOk && armed && startInFrame) {
-        if (y <= this.cfg.maxConfirmY) this._fire(this.troughY, this.troughMs, this.troughY - this.peakY);
-        else if (this.peakY <= 1) this.pending = { troughY: this.troughY, troughMs: this.troughMs, depthY: this.troughY - this.peakY, sinceMs: captureMs };
+        const depthY = this.troughY - this.peakY, depthRatio = depth / sw;
+        if (y <= this.cfg.maxConfirmY) this._fire(this.troughY, this.troughMs, depthY, depthRatio);
+        else if (this.peakY <= 1) this.pending = { troughY: this.troughY, troughMs: this.troughMs, depthY, depthRatio, sinceMs: captureMs };
       }
       this.peakY = y; this.peakPresence = presence; this.troughY = y; this.troughMs = captureMs;
       this._minX = x; this._maxX = x;
