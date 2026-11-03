@@ -220,10 +220,9 @@ function setNoSource() {
   clearScore();
 }
 
-// 本地檔案：選取＝載入（解析＋更新狀態），不自動播放。file 為 null ＝ 取消選檔。
+// 本地檔案：選取＝載入（解析＋更新狀態），不自動播放。
 async function selectLocalFile(file) {
   const token = beginSourceChange();
-  if (!file) { setNoSource(); return; }
   if (!/\.(mid|midi)$/i.test(file.name)) {
     setNoSource();
     playerStore.set({ notice: `檔案格式不支援：${file.name}` });
@@ -252,14 +251,10 @@ async function selectCloudSong(id, name) {
   } catch (err) {
     console.error('❌ 雲端曲目下載失敗', err);
     if (isStale(token)) return; // 舊請求的失敗訊息不該蓋掉新選擇的歌名
+    // 下拉退回 placeholder：停在這首的話，原生 <select> 重選同一項不會觸發 change，就沒辦法重試
+    setLibrary({ selectedId: '' });
     playerStore.set({ transport: 'idle', notice: '雲端下載失敗' });
   }
-}
-
-// 曲庫下拉退回「請選擇歌曲」。
-function clearSource() {
-  beginSourceChange();
-  setNoSource();
 }
 
 // 「目前引擎裡在播的到底是什麼」的簽章：來源身分 + 分譜／指派狀態。兩者都相同才能直接續播，
@@ -603,18 +598,20 @@ function renderTopProgress({ player }) {
 }
 
 // 雲端曲庫（分類下拉／關鍵字搜尋／歌曲下拉）：資料來自 midiApi.js；搜尋狀態放 playerStore.library，兩個下拉的 option 只在 items／categories 參照變了才重建。分類集合跨搜尋累積（曲庫的分類端點可能失敗，搜尋結果裡的分類也要收）。
-// 選到一首就下載＋解析（selectCloudSong），不啟動播放；退回「請選擇歌曲」就清掉來源。
-const SEARCH_DEBOUNCE_MS = 300;
-
+// 伺服器只篩類別，關鍵字在這裡篩：曲庫的 q 會比對描述、id、上傳時間等看不到的欄位（2026-11-03 實測 q=z 命中 73 首、歌名或作曲者有 z 的只有 2 首），
+// 單一字元幾乎全中；也不轉全形、不拆空白。這裡只比對下拉上看得到的「歌名 - 作曲者」，看到的就是比對到的。
+// 選到一首就下載＋解析（selectCloudSong），不啟動播放。第一項「請選擇歌曲」是提示：只在關著的下拉顯示、展開的清單裡沒有它、不能選（能選的話誤點就把歌卸載了）；換歌直接選別首。
 const categoryEl = document.getElementById('midiCategory');
 const queryEl = document.getElementById('midiSongQuery');
 const songSelectEl = document.getElementById('midiSongSelect');
 const songMirrorEl = document.getElementById('midiSongMirror');
+const currentSongOpt = new Option('', '');   // 「目前：歌名」，由 renderLibraryPicker() 插在第一項後面或拿掉
 
 const categorySet = new Set();
-let requestToken = 0;     // 搜尋的請求代號：晚回來的舊結果不能蓋掉新的
-let lastQueryStr = null;  // 上一次真的送出去的「關鍵字_分類」，一樣就不重打
-let debounceTimer = null;
+let requestToken = 0;          // 抓清單的請求代號：晚回來的舊結果不能蓋掉新的
+let fetchedItems = [];         // 目前類別的整份清單（關鍵字從這裡篩）
+let fetchedCategory = null;    // fetchedItems 屬於哪個類別；null＝還沒抓、上次失敗或要重抓
+let inflightCategory = null;   // 正在抓的類別：抓的期間打字不重複送請求，回來時用最新的關鍵字篩
 
 const library = () => playerStore.state.library;
 const setLibrary = (patch) => playerStore.set({ library: { ...library(), ...patch } });
@@ -624,49 +621,51 @@ function mergeCategories(categories) {
   setLibrary({ categories: [...categorySet].sort((a, b) => a.localeCompare(b, 'zh-Hant')) });
 }
 
+// 全形轉半形（NFKC：輸入法全形模式打的 ｃａｎｏｎ 也找得到 Canon）、不分大小寫；關鍵字用空白分成幾個詞，每個詞都要出現（順序不拘）
+const foldText = (s) => s.normalize('NFKC').toLowerCase();
+function applyQuery() {
+  const words = foldText(library().query).split(/\s+/).filter(Boolean);
+  const items = words.length
+    ? fetchedItems.filter((item) => { const label = foldText(songLabel(item)); return words.every((w) => label.includes(w)); })
+    : fetchedItems;
+  setLibrary({ items, status: items.length ? 'ready' : 'empty' });
+}
+
 async function search() {
-  const query = library().query.trim();
   const category = library().category.trim();
-  const queryStr = `${query}_${category}`;
-  if (lastQueryStr === queryStr) return;
-  lastQueryStr = queryStr;
+  if (fetchedCategory === category) { applyQuery(); return; }
+  if (inflightCategory === category) return;
+  inflightCategory = category;
   const token = ++requestToken;
 
   setLibrary({ status: 'searching', items: [] });
   try {
-    const { items, categories } = await searchSongs({ query, category });
+    const { items, categories } = await searchSongs({ query: '', category });
     if (token !== requestToken) return;
     mergeCategories(categories);
-    setLibrary({ items, status: items.length ? 'ready' : 'empty' });
+    fetchedItems = items;
+    fetchedCategory = category;
+    applyQuery();
   } catch (error) {
     if (token !== requestToken) return;
-    // 還原查詢快取，否則重打一模一樣的關鍵字會被 lastQueryStr 判定為「跟上次一樣」而無法重試。
-    lastQueryStr = null;
+    fetchedCategory = null;   // 下次搜尋（打字、換類別、關面板）就重試
     setLibrary({ items: [], status: 'error' });
     console.error('❌ [搜尋 MIDI 歌曲清單失敗]', error);
+  } finally {
+    if (token === requestToken) inflightCategory = null;
   }
-}
-
-function scheduleSearch() {
-  clearTimeout(debounceTimer);
-  debounceTimer = setTimeout(search, SEARCH_DEBOUNCE_MS);
 }
 
 const libraryFields = {
   'category': (el) => {
-    // 換分類時關鍵字與已選歌曲都清空，直接重搜不等去抖。selectedId 一定要在這裡歸零：留著舊值的話，renderLibraryPicker() 寫回 songSelectEl.value 時新清單沒有這個 value，
-    // 瀏覽器會把下拉判成沒有任何選項被選取（selectedIndex = -1、框顯示空白，不會退回 placeholder）；切回原類別時舊值又重新出現而悄悄復原成上次的歌。
-    setLibrary({ category: el.value, query: '', selectedId: '' });
-    lastQueryStr = null;
+    // 換分類時保留關鍵字（類別內找不到時改選全部類別，不必重打）；已選的歌（selectedId）不動，它跟著來源走，在不在新清單裡由 renderLibraryPicker() 處理。
+    setLibrary({ category: el.value });
     search();
   },
   'song': (el) => {
-    if (el.selectedIndex <= 0) {
-      setLibrary({ selectedId: '' });
-      clearSource();
-      return;
-    }
     const id = el.value;
+    // 「目前：歌名」那一項（目前的歌被篩掉時才有）：跳回目前的歌＝搜尋條件歸位讓它回到清單裡，不重新下載
+    if (id === library().selectedId) { clearLibraryFilters(); return; }
     const name = el.options[el.selectedIndex].text;
     setLibrary({ selectedId: id });
     selectCloudSong(id, name);
@@ -674,16 +673,25 @@ const libraryFields = {
 };
 
 const libraryInputs = {
-  'song-query': (el) => {
+  // 每打一個字就在本地重篩（不經網路，不用去抖）。注音等輸入法組字中只記字、不篩（組字中的符號一定找不到，會閃「找不到」）；ui.js 在 compositionend 再送一次這個 handler。
+  // 組字中也要寫進 store：render 會把 store 的關鍵字寫回搜尋框，不寫的話其他狀態一更新就把組字中的文字蓋掉
+  'song-query': (el, e) => {
     setLibrary({ query: el.value });
-    scheduleSearch();
+    if (!e.isComposing) search();
   },
 };
 
-// 本地選檔時呼叫：關鍵字／分類清空、下拉回 placeholder，並重新搜尋（走去抖）
+// 搜尋條件歸位（全部類別、沒有關鍵字）並重抓清單（順便拿到曲庫新上傳的歌）；已選的歌跟著來源走，不在這裡動。選歌面板關掉時 ui.js 也呼叫它，下次打開下拉顯示的是目前載入的歌。
+export function clearLibraryFilters() {
+  setLibrary({ query: '', category: '' });
+  fetchedCategory = null;
+  search();
+}
+
+// 本地選檔時呼叫：搜尋條件歸位、下拉回 placeholder
 function resetLibraryPicker() {
-  setLibrary({ query: '', category: '', selectedId: '' });
-  scheduleSearch();
+  setLibrary({ selectedId: '' });
+  clearLibraryFilters();
 }
 
 function mountLibraryPicker() {
@@ -691,13 +699,16 @@ function mountLibraryPicker() {
   fetchCategories().then(mergeCategories).finally(search);
 }
 
-const PLACEHOLDER = {
-  idle: '請選擇歌曲',
-  searching: '搜尋中...',
-  ready: '請選擇歌曲',
-  empty: '找不到符合條件的歌曲',
-  error: 'API 讀取失敗',
-};
+// 歌曲下拉第一項（value ''）的文字：清單裡沒有已選的歌時它就是下拉顯示的那一項；有結果時帶符合條件的首數
+function placeholderText(lib) {
+  switch (lib.status) {
+    case 'searching': return '搜尋中...';
+    case 'error': return 'API 讀取失敗';
+    case 'empty': return lib.category ? `在「${lib.category}」找不到，可改選全部類別` : '找不到符合條件的歌曲';
+    case 'ready': return `請選擇歌曲（${lib.items.length} 首）`;
+    default: return '請選擇歌曲';
+  }
+}
 function songLabel(item) {
   const composer = item.composer ? ` - ${item.composer}` : '';
   return `${item.title || '未命名歌曲'}${composer}`;
@@ -718,13 +729,35 @@ function renderLibraryPicker({ player }) {
   if (lib.items !== renderedItems || lib.status !== renderedStatus) {
     renderedItems = lib.items;
     renderedStatus = lib.status;
-    songSelectEl.replaceChildren(
-      new Option(PLACEHOLDER[lib.status], ''),
-      ...lib.items.map((item) => new Option(songLabel(item), String(item.id))),
-    );
+    // 關著時顯示、展開的清單裡不出現（hidden）：只 disabled 的話，展開那一刻它是被選的那項、會反白，看起來能選，滑鼠一移開又變灰點不了
+    const placeholderOpt = new Option('', '');
+    placeholderOpt.disabled = true;
+    placeholderOpt.hidden = true;
+    songSelectEl.replaceChildren(placeholderOpt, ...lib.items.map((item) => new Option(songLabel(item), String(item.id))));
+  }
+  const placeholder = placeholderText(lib);
+  if (songSelectEl.options[0].text !== placeholder) songSelectEl.options[0].text = placeholder;
+  // 目前的雲端歌被類別／關鍵字篩掉時，清單第一個可選的項目是「目前：歌名」，點它就跳回來（見 'song' handler）；在清單裡時不加，免得重複
+  const inList = lib.items.some((item) => String(item.id) === lib.selectedId);
+  const showCurrent = !!lib.selectedId && !inList && lib.status === 'ready';
+  if (showCurrent) {
+    const text = `目前：${player.songTitle}`;
+    if (currentSongOpt.text !== text) currentSongOpt.text = text;
+    if (currentSongOpt.value !== lib.selectedId) currentSongOpt.value = lib.selectedId;
+    if (songSelectEl.options[1] !== currentSongOpt) songSelectEl.options[0].after(currentSongOpt);
+  } else if (currentSongOpt.parentNode) {
+    currentSongOpt.remove();
   }
   songSelectEl.disabled = lib.status !== 'ready';
-  if (songSelectEl.value !== lib.selectedId) songSelectEl.value = lib.selectedId;
+  // 已選的歌不在目前清單（換類別、打字搜尋、搜尋中、失敗）就顯示 placeholder：把清單裡沒有的 value 寫進原生 <select>，
+  // 瀏覽器會判成沒有任何選項被選取（selectedIndex −1、框空白），「找不到符合條件的歌曲」這類提示就不見了
+  // placeholder 是 disabled：清單裡只有它（搜尋中、找不到）時瀏覽器不會自動選它（selectedIndex −1），而這時 value 讀起來也是 ''，
+  // 所以用 selectedIndex 判斷、直接設（程式設定可以選到 disabled 的項目）
+  if (inList) {
+    if (songSelectEl.value !== lib.selectedId) songSelectEl.value = lib.selectedId;
+  } else if (songSelectEl.selectedIndex !== 0) {
+    songSelectEl.selectedIndex = 0;
+  }
   // 鏡像文字＝下拉目前顯示的那一項（placeholder 也算）：原生下拉關著時會把超出的歌名截斷，改由上面這層跑馬燈顯示
   const shown = songSelectEl.selectedOptions[0]?.text ?? '';
   setMarqueeText(songMirrorEl, shown, songSelectEl.selectedIndex > 0 ? shown : '');
@@ -741,9 +774,12 @@ const partRowTemplate = document.getElementById('tpl-part-row');
 
 const songPanelFields = {
   // 本地檔案：選取＝載入，不自動播放；曲庫的搜尋與下拉同時歸零。
+  // 沒有檔案＝在對話框按了取消（有的瀏覽器會清空 input 並送 change）：不動目前的歌
   'local-file': (el) => {
+    const file = el.files[0];
+    if (!file) return;
     resetLibraryPicker();
-    selectLocalFile(el.files[0] || null);
+    selectLocalFile(file);
   },
   'part-assign': (el) => assignPart(el.dataset.partId, el.value),
 };

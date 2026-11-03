@@ -215,12 +215,18 @@ const PANELS = {
   song: { trigger: document.getElementById('song-toggle'), panel: document.getElementById('panel-song') },
 };
 
+// 選歌面板關掉時搜尋條件歸位：沒刪的關鍵字不會在下次打開時把目前載入的歌篩掉、讓下拉一直顯示「請選擇歌曲」
+function setOpenPanel(name) {
+  if (uiStore.state.openPanel === 'song' && name !== 'song') playerModule.clearLibraryFilters();
+  uiStore.set({ openPanel: name });
+}
+
 const popupActions = {
   'toggle-panel': (el) => {
     const name = el.dataset.panel;
-    uiStore.set({ openPanel: uiStore.state.openPanel === name ? null : name });
+    setOpenPanel(uiStore.state.openPanel === name ? null : name);
   },
-  'close-panel': () => uiStore.set({ openPanel: null }),
+  'close-panel': () => setOpenPanel(null),
 };
 
 function renderPopupPanels({ ui }) {
@@ -250,6 +256,8 @@ function mountDelegation() {
   stack.addEventListener('click', dispatch(actions, 'data-action'));
   stack.addEventListener('change', dispatch(fields, 'data-field'));
   stack.addEventListener('input', dispatch(inputs, 'data-field'));
+  // 輸入法組字結束：Chrome 組字中最後一個 input 事件還帶 isComposing，結束後不會再補一個 input，要靠這裡把定稿的文字交給同一個 handler
+  stack.addEventListener('compositionend', dispatch(inputs, 'data-field'));
 }
 
 let playerModule = null;
